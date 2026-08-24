@@ -5,7 +5,14 @@
 
 import type { AdtClient, SourceReadResult } from '../adt/client.js';
 import { decodeKtdText } from '../adt/ddic-xml.js';
-import { type EnhancementAnchor, parseEnhancementAnchors, resolveAnchorFeedTargets } from '../adt/enhancements.js';
+import {
+  type EnhancementAnchor,
+  type EnhancementExitType,
+  enhancementIncludeName,
+  parseEnhancementAnchors,
+  parseEnhancementMethodExits,
+  resolveAnchorFeedTargets,
+} from '../adt/enhancements.js';
 import { extractUnknownColumn, formatUnknownColumnHint, isNotFoundError } from '../adt/errors.js';
 import { mapSapReleaseToAbaplintVersion } from '../adt/features.js';
 import { type FmParameter, type FmParameterKind, parseFmSignature } from '../adt/fm-signature.js';
@@ -813,7 +820,7 @@ async function withEnhancementSource(
   client: AdtClient,
   name: string,
   info: EnhancementImplementationInfo,
-): Promise<EnhancementImplementationInfo & { anchors?: EnhancementAnchor[]; sourceHint?: string }> {
+): Promise<EnhancementImplementationInfo & { toolType?: string; anchors?: EnhancementAnchor[]; sourceHint?: string }> {
   // 7.58+ names the enhanced object in the payload. 7.50 serves no usable payload at all, so the
   // hook locations come from ENHINCINX — behind the same free-SQL gate as the TRAN program lookup.
   const fromPayload = info.enhancedObject?.uri
@@ -850,10 +857,27 @@ async function withEnhancementSource(
     }
   }
 
-  const anchorInfo = anchors.length > 0 ? { anchors } : {};
-  if (plugins.length > 0) return { ...info, ...anchorInfo, sourceCodePlugins: plugins };
+  // Class anchors carry no coding, but their exit type decides how critical they are: an
+  // overwrite REPLACES the SAP implementation, a pre/post exit only runs around it.
+  let enriched = anchors;
+  if (anchors.some((a) => a.kind === 'class' && a.method)) {
+    const exits = await resolveClassMethodExits(client, name);
+    if (exits.size > 0) {
+      enriched = anchors.map((a) => {
+        const exitType = a.method ? exits.get(a.method.toUpperCase()) : undefined;
+        return exitType ? { ...a, exitType } : a;
+      });
+    }
+  }
+
+  const toolType = await resolveEnhancementToolType(client, name);
+  const extra = {
+    ...(toolType ? { toolType } : {}),
+    ...(enriched.length > 0 ? { anchors: enriched } : {}),
+  };
+  if (plugins.length > 0) return { ...info, ...extra, sourceCodePlugins: plugins };
   // No coding: say why, because "no sourceCodePlugins" alone is ambiguous.
-  return { ...info, ...anchorInfo, sourceHint: enhancementSourceHint(anchors, targets.length) };
+  return { ...info, ...extra, sourceHint: enhancementSourceHint(enriched, targets.length) };
 }
 
 /** Explain an empty coding result — the three reasons differ in what the caller should do next. */
@@ -893,7 +917,7 @@ async function resolveEnhancementAnchors(client: AdtClient, name: string): Promi
   try {
     const safeName = name.toUpperCase().replace(/[^A-Z0-9_/]/g, '');
     const data = await client.runQuery(
-      `SELECT ENHNAME, PROGRAMNAME, ENHMODE, FULL_NAME FROM ENHINCINX WHERE ENHNAME = '${safeName}'`,
+      `SELECT ENHNAME, PROGRAMNAME, ENHMODE, METHOD, FULL_NAME FROM ENHINCINX WHERE ENHNAME = '${safeName}'`,
       50,
     );
     return parseEnhancementAnchors(data.rows);
@@ -904,4 +928,59 @@ async function resolveEnhancementAnchors(client: AdtClient, name: string): Promi
     });
     return [];
   }
+}
+
+/**
+ * The enhancement's tool type (HOOK_IMPL, CLASENH, BADI_IMPL, …) from ENHHEADER.
+ *
+ * It is what decides whether coding is reachable at all: a HOOK_IMPL's plug-ins live in the
+ * enhanced object's source and are served by the enhancement feed, a CLASENH's methods live in a
+ * generated include that ADT refuses on 7.50. Returning it saves callers from inferring the
+ * difference out of an absent `sourceCodePlugins`.
+ */
+async function resolveEnhancementToolType(client: AdtClient, name: string): Promise<string | undefined> {
+  if (!isOperationAllowed(client.safety, OperationType.FreeSQL)) return undefined;
+  try {
+    const safeName = name.toUpperCase().replace(/[^A-Z0-9_/]/g, '');
+    const data = await client.runQuery(
+      `SELECT ENHNAME, ENHTOOLTYPE FROM ENHHEADER WHERE ENHNAME = '${safeName}' AND VERSION = 'A'`,
+      1,
+    );
+    const toolType = String(data.rows[0]?.ENHTOOLTYPE ?? '').trim();
+    return toolType || undefined;
+  } catch (err) {
+    logger.debug('ENHHEADER tool-type lookup failed', {
+      enhancement: name,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return undefined;
+  }
+}
+
+/**
+ * Exit types (pre / post / overwrite) of a class enhancement's methods.
+ *
+ * SAP writes the type into the generated method NAME and nowhere else, so the only source is the
+ * enhancement's declaration include. ADT refuses that include on NW 7.50 (500 "could not be
+ * successfully read"); the attempt is one GET and stays best effort, so releases whose ADT does
+ * serve it get the exit types for free while 7.50 keeps the explanatory hint.
+ */
+async function resolveClassMethodExits(client: AdtClient, name: string): Promise<Map<string, EnhancementExitType>> {
+  const exits = new Map<string, EnhancementExitType>();
+  for (const part of [0, 1] as const) {
+    try {
+      const include = await client.getInclude(enhancementIncludeName(name, part));
+      for (const exit of parseEnhancementMethodExits(include.source)) {
+        if (!exits.has(exit.method)) exits.set(exit.method, exit.exitType);
+      }
+      if (exits.size > 0) return exits;
+    } catch (err) {
+      logger.debug('Enhancement declaration include unavailable', {
+        enhancement: name,
+        include: enhancementIncludeName(name, part),
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+  return exits;
 }

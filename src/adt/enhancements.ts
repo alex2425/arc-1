@@ -368,6 +368,11 @@ export interface EnhancementAnchor {
   class?: string;
   /** Enhanced method, when the anchor names one. */
   method?: string;
+  /**
+   * pre / post / overwrite, read from the generated method name in the enhancement include.
+   * Only present where that include is servable — see resolveClassMethodExits.
+   */
+  exitType?: EnhancementExitType;
   /** Interface the method belongs to, for interface-method anchors. */
   interface?: string;
   /** Declaration section (PUBLIC/PROTECTED/PRIVATE/…) for anchors that name no method. */
@@ -619,4 +624,58 @@ export async function readEnhancementImplementation(
 export async function readEnhancementSpot(http: AdtHttpClient, name: string): Promise<EnhancementSpotInfo> {
   const { body, uri } = await fetchEnhancementObject(http, name, ENHS_COLLECTIONS);
   return { ...parseEnhancementSpot(body), uri };
+}
+
+// ─── Class-enhancement method exits ─────────────────────────────────────────────────
+
+/**
+ * Name of the generated include that holds an enhancement declarations.
+ *
+ * The enhancement name padded to 30 characters with = , then E (declarations) or EIMP
+ * (implementations). The padding is exact: one character short and ADT answers 404 instead of
+ * the 500 its reader gives for the real name, which reads like a wrong URL rather than a refusal.
+ */
+export function enhancementIncludeName(enhancement: string, part: 0 | 1 = 0): string {
+  const padded = enhancement.toUpperCase().padEnd(30, String.fromCharCode(61));
+  return part === 0 ? padded + String.fromCharCode(69) : padded + String.fromCharCode(69, 73, 77, 80);
+}
+
+/** How a class-enhancement method relates to the method it enhances. */
+export type EnhancementExitType = 'pre' | 'post' | 'overwrite';
+
+/** One generated exit method of a class enhancement. */
+export interface EnhancementMethodExit {
+  /** Enhanced method, without any interface prefix (SAP drops it in the generated name). */
+  method: string;
+  enhancement: string;
+  exitType: EnhancementExitType;
+}
+
+const EXIT_PREFIX: Record<string, EnhancementExitType> = { IPR: 'pre', IPO: 'post', IOW: 'overwrite' };
+
+/**
+ * Read the exit type of class-enhancement methods out of the generated include.
+ *
+ * SAP encodes it in the method NAME and nowhere else — not in SEOCOMPO, TMDIR, ENHA_TMDIR,
+ * ENHCROSS or ENHINCINX (all verified empty for these methods):
+ *
+ *   METHOD ipr_<enhancement>~<method>.   pre-exit
+ *   METHOD ipo_<enhancement>~<method>.   post-exit
+ *   METHOD iow_<enhancement>~<method>.   overwrite-exit  (replaces the SAP implementation)
+ *
+ * Scans tokens rather than statements so the same parser serves the declaration include (method
+ * headers) and the implementation include (METHOD … ENDMETHOD bodies).
+ */
+export function parseEnhancementMethodExits(source: string): EnhancementMethodExit[] {
+  const seen = new Map<string, EnhancementMethodExit>();
+  // Word boundary: a method that merely CONTAINS the prefix must not be read as an exit.
+  for (const match of source.matchAll(/\b(IPR|IPO|IOW)_([A-Z0-9_/]+)~([A-Z0-9_/]+)/gi)) {
+    const exitType = EXIT_PREFIX[(match[1] ?? '').toUpperCase()];
+    const enhancement = (match[2] ?? '').toUpperCase();
+    const method = (match[3] ?? '').toUpperCase();
+    if (!exitType || !method) continue;
+    const key = method + '|' + exitType;
+    if (!seen.has(key)) seen.set(key, { method, enhancement, exitType });
+  }
+  return [...seen.values()];
 }

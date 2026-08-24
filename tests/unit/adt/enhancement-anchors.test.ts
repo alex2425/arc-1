@@ -6,8 +6,10 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   anchorFeedTargets,
+  enhancementIncludeName,
   feedTargetFromSourceUri,
   parseEnhancementAnchors,
+  parseEnhancementMethodExits,
   parseSubroutineNodes,
   resolveAnchorFeedTargets,
 } from '../../../src/adt/enhancements.js';
@@ -259,5 +261,51 @@ describe('resolveAnchorFeedTargets', () => {
         context: '/sap/bc/adt/programs/programs/sapfp51t',
       },
     ]);
+  });
+});
+
+describe('enhancementIncludeName', () => {
+  it('pads the enhancement name to 30 characters, then E / EIMP', () => {
+    // Live-verified: with the exact name ADT answers 500 (its reader refuses), one '=' short it
+    // answers 404 — which reads like a wrong URL and sent an earlier investigation down a hole.
+    expect(enhancementIncludeName('ZENH_CLASS_DEMO')).toBe('ZENH_CLASS_DEMO===============E');
+    expect(enhancementIncludeName('ZENH_CLASS_DEMO', 1)).toBe('ZENH_CLASS_DEMO===============EIMP');
+    expect(enhancementIncludeName('zenh_class_demo')).toHaveLength(31);
+  });
+});
+
+describe('parseEnhancementMethodExits', () => {
+  it('reads the exit type out of the generated method name', () => {
+    // SAP encodes pre/post/overwrite ONLY in the name; the declaration include holds the headers.
+    const source = [
+      'CLASS zenh_class_demo DEFINITION.',
+      '  METHODS ipr_zenh_class_demo~enrich_request.',
+      '  METHODS ipo_zenh_class_demo~build_response.',
+      '  METHODS iow_zenh_class_demo~changeset_process.',
+      'ENDCLASS.',
+    ].join(String.fromCharCode(10));
+
+    expect(parseEnhancementMethodExits(source)).toEqual([
+      { method: 'ENRICH_REQUEST', enhancement: 'ZENH_CLASS_DEMO', exitType: 'pre' },
+      { method: 'BUILD_RESPONSE', enhancement: 'ZENH_CLASS_DEMO', exitType: 'post' },
+      { method: 'CHANGESET_PROCESS', enhancement: 'ZENH_CLASS_DEMO', exitType: 'overwrite' },
+    ]);
+  });
+
+  it('also reads implementation bodies and de-duplicates', () => {
+    const source = [
+      'METHOD iow_zenh_class_demo~changeset_process.',
+      '  " the interface prefix is dropped in the generated name',
+      'ENDMETHOD.',
+      'METHOD iow_zenh_class_demo~changeset_process.',
+      'ENDMETHOD.',
+    ].join(String.fromCharCode(10));
+    expect(parseEnhancementMethodExits(source)).toEqual([
+      { method: 'CHANGESET_PROCESS', enhancement: 'ZENH_CLASS_DEMO', exitType: 'overwrite' },
+    ]);
+  });
+
+  it('ignores source without generated exit methods', () => {
+    expect(parseEnhancementMethodExits('METHOD changeset_process. ENDMETHOD.')).toEqual([]);
   });
 });
