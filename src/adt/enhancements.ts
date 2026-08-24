@@ -632,8 +632,11 @@ export async function readEnhancementSpot(http: AdtHttpClient, name: string): Pr
  * Name of the generated include that holds an enhancement declarations.
  *
  * The enhancement name padded to 30 characters with = , then E (declarations) or EIMP
- * (implementations). The padding is exact: one character short and ADT answers 404 instead of
- * the 500 its reader gives for the real name, which reads like a wrong URL rather than a refusal.
+ * (implementations) — confirmed against REPOSRC, which lists exactly these names.
+ *
+ * The ADT include reader refuses them with 500 "could not be successfully read" on NW 7.50, and
+ * refuses a deliberately mis-padded name with 500 as well: the status does NOT distinguish a
+ * wrong name from a refused one, so never read it as "URL correct". REPOSRC is the authority.
  */
 export function enhancementIncludeName(enhancement: string, part: 0 | 1 = 0): string {
   const padded = enhancement.toUpperCase().padEnd(30, String.fromCharCode(61));

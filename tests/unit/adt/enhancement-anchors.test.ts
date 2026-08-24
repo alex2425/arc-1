@@ -266,8 +266,9 @@ describe('resolveAnchorFeedTargets', () => {
 
 describe('enhancementIncludeName', () => {
   it('pads the enhancement name to 30 characters, then E / EIMP', () => {
-    // Live-verified: with the exact name ADT answers 500 (its reader refuses), one '=' short it
-    // answers 404 — which reads like a wrong URL and sent an earlier investigation down a hole.
+    // The 30-character padding is confirmed against REPOSRC, which lists exactly these names.
+    // ADT's include reader answers 500 for the correct name AND for a mis-padded one, so the
+    // status cannot be used to check the name — only REPOSRC can.
     expect(enhancementIncludeName('ZENH_CLASS_DEMO')).toBe('ZENH_CLASS_DEMO===============E');
     expect(enhancementIncludeName('ZENH_CLASS_DEMO', 1)).toBe('ZENH_CLASS_DEMO===============EIMP');
     expect(enhancementIncludeName('zenh_class_demo')).toHaveLength(31);

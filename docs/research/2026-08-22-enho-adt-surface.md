@@ -212,9 +212,11 @@ GENERATED method name inside the enhancement include — `IPR_<enh>~<method>` pr
 | `ENHCROSS` — columns `METHTYPE`, `METHOD_NAME`, `INT_NAME`, `ENHHOOKTYPE`, exactly the right shape | **empty system-wide** |
 | `ENHA_TMDIR`, `SEOCOMPO`, `TMDIR`, `ENHINCINX~OVERWRITE` | empty / not applicable |
 
-Note the padding rule, which cost one earlier probe: the include is the enhancement name padded to
-**30** characters with `=`, then `E` (declarations) or `EIMP` (implementations). One `=` short and
-ADT answers 404 instead of 500, which reads like "wrong URL" rather than "reader refuses".
+The include name is the enhancement padded to **30** characters with `=`, then `E` (declarations)
+or `EIMP` (implementations) — take it from `REPOSRC`, which lists it verbatim, and never from the
+HTTP status: the reader answers 500 for the correct name and for a deliberately mis-padded one
+alike. An earlier note in this file claimed a mis-padded name gives 404; that was a comparison of
+two different objects on two different request paths and is wrong.
 
 `ENHINCINX~METHOD = 'X'` is the only field that varies between method anchors — 15 of ~29k rows on
 the reference system, always on anchors carrying a `\ME:` part, on class-own AND interface methods
