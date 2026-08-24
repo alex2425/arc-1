@@ -364,6 +364,24 @@ export interface EnhancementAnchor {
   mode?: 'static' | 'dynamic';
   /** FORM or function-module name this anchor sits in (`form` / `functionModule`). */
   member?: string;
+  /** Enhanced class (`class` anchors). */
+  class?: string;
+  /** Enhanced method, when the anchor names one. */
+  method?: string;
+  /** Interface the method belongs to, for interface-method anchors. */
+  interface?: string;
+  /** Declaration section (PUBLIC/PROTECTED/PRIVATE/…) for anchors that name no method. */
+  section?: string;
+  /**
+   * `ENHINCINX~METHOD = 'X'`, reported verbatim because its meaning is NOT established.
+   *
+   * On the reference system it is set on 15 of ~29k anchors, always together with a `\ME:` part,
+   * on class-own AND interface methods alike. The one anchor with SE24 ground truth — an
+   * OVERWRITE exit — has it EMPTY, and a pre/post exit on the same class has it set, which is
+   * consistent with "the enhancement sits inside an existing method body" versus "the enhancement
+   * IS the method". That is one sample: do not derive pre/post/overwrite from it. ARC-1 does not.
+   */
+  inMethodBody?: boolean;
   enhancedObjectUri?: string;
   contextUri?: string;
 }
@@ -411,7 +429,25 @@ export function parseEnhancementAnchors(rows: Array<Record<string, unknown>>): E
 
     // A class pool as PROGRAMNAME means the anchor is inside a class, whatever its FULL_NAME says.
     if (classType || CLASS_POOL.test(program ?? '') || CLASS_POOL.test(mainProgram)) {
-      anchors.push({ ...base, kind: 'class' });
+      // Name what the anchor touches — an assessment needs the method, not just the section.
+      const method = /\\ME:([^\\]+)/.exec(fullName)?.[1]?.trim();
+      const iface = /\\IN:([^\\]+)/.exec(fullName)?.[1]?.trim();
+      const section = /\\SE:([^\\]+)/.exec(fullName)?.[1]?.trim();
+      anchors.push({
+        ...base,
+        kind: 'class',
+        class: classType ?? CLASS_POOL.exec(program || mainProgram)?.groups?.name,
+        ...(method ? { method } : {}),
+        ...(iface ? { interface: iface } : {}),
+        ...(section && !method ? { section } : {}),
+        // ENHINCINX~METHOD: set on 15 of 129 anchors on the reference system, and only ever on
+        // anchors that name a method. Reported as-is — see EnhancementAnchor.inMethodBody.
+        ...(String(row.METHOD ?? '')
+          .trim()
+          .toUpperCase() === 'X'
+          ? { inMethodBody: true }
+          : {}),
+      });
       continue;
     }
     if (functionModule) {

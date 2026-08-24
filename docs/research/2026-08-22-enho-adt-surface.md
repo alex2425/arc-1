@@ -196,6 +196,37 @@ resolves internally, not a readable resource. Class-enhancement coding has no AD
 generated `{ENHANCEMENT}======EIMP` include exists in `REPOSRC` (2.5–39 KB) but ADT 500s on it and
 `REPOSRC~DATA` is compressed.
 
+### 9. Method exits (pre / post / overwrite) are not derivable on 7.50
+
+SE24 shows the exit type per method (tab *Methoden*, column *Overwrite-Exit*). The type lives in the
+GENERATED method name inside the enhancement include — `IPR_<enh>~<method>` pre, `IPO_` post,
+`IOW_` overwrite. Everything that could expose it was tried and fails:
+
+| Route | Result |
+|---|---|
+| `/programs/includes/{ENH}=====E/source/main` (name padded to 30 chars + `E`), with and without the class pool as `context` | 500 `Resource PROGRAM … could not be successfully read` |
+| the same include, `/versions` | 404 |
+| `/programs/programs/{CLASSPOOL}/source/main` | 500 |
+| `/repository/objectstructure?objectname={CLASSPOOL}&objecttype=PROG/P` | 500 `Object type OU is not defined` |
+| `/oo/classes/{class}/objectstructure` | class members only — no `IPR_`/`IPO_`/`IOW_` |
+| `ENHCROSS` — columns `METHTYPE`, `METHOD_NAME`, `INT_NAME`, `ENHHOOKTYPE`, exactly the right shape | **empty system-wide** |
+| `ENHA_TMDIR`, `SEOCOMPO`, `TMDIR`, `ENHINCINX~OVERWRITE` | empty / not applicable |
+
+Note the padding rule, which cost one earlier probe: the include is the enhancement name padded to
+**30** characters with `=`, then `E` (declarations) or `EIMP` (implementations). One `=` short and
+ADT answers 404 instead of 500, which reads like "wrong URL" rather than "reader refuses".
+
+`ENHINCINX~METHOD = 'X'` is the only field that varies between method anchors — 15 of ~29k rows on
+the reference system, always on anchors carrying a `\ME:` part, on class-own AND interface methods
+alike. On the one anchor with SE24 ground truth (an overwrite exit) it is EMPTY, while a pre/post
+exit on the same class has it set. That is consistent with *"the enhancement sits inside an existing
+method body"* versus *"the enhancement IS the method"* — but it is a single sample, and SAP's
+switch-check classes contribute thousands of `METHOD = ''` method anchors that are not overwrites.
+ARC-1 reports the flag verbatim as `anchors[].inMethodBody` and derives NO exit type from it: a
+wrong overwrite label is worse for a migration assessment than an absent one.
+
+Surfaced for class anchors instead: `class`, `method`, `interface`, `section`.
+
 ## What ARC-1 does with this
 
 - `src/adt/enhancements.ts` owns the domain: discovery-ordered collection candidates for ENHO/ENHS,

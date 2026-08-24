@@ -859,16 +859,22 @@ async function withEnhancementSource(
 /** Explain an empty coding result — the three reasons differ in what the caller should do next. */
 function enhancementSourceHint(anchors: EnhancementAnchor[], targetCount: number): string {
   if (anchors.some((a) => a.kind === 'class')) {
+    const methods = [...new Set(anchors.filter((a) => a.method).map((a) => a.method))];
+    const touched = methods.length > 0 ? ` Enhanced methods: ${methods.join(', ')}.` : '';
     return (
-      'This enhancement hooks into a class (see anchors[].fullName). ADT on this release serves no ' +
-      'reader for class-enhancement coding: eight enhancement-feed URL shapes for the class all ' +
-      'return an empty feed, and the per-plug-in resource ' +
+      'This enhancement hooks into a class (see anchors[]).' +
+      touched +
+      ' ADT on this release serves no reader for class-enhancement coding: eight enhancement-feed ' +
+      'URL shapes for the class all return an empty feed, and the per-plug-in resource ' +
       '(/sap/bc/adt/enhancements/implementations/{enh}/elements/sourcecodeplugins/{fullName}) is not ' +
       'GET-able at all — it 404s for class AND for program anchors whose coding ARC-1 does retrieve ' +
-      'by other means, so it is an editor-internal identifier, not an API. The coding itself lives in ' +
-      'the generated include {ENHANCEMENT}======EIMP (REPOSRC), which ADT refuses to serve (500) and ' +
-      'whose REPOSRC~DATA is compressed. Treat this as a platform limit: the anchors give the exact ' +
-      'sections/methods, the coding needs SE80/SE24 or the enhancement editor.'
+      'by other means, so it is an editor-internal identifier, not an API. The generated includes ' +
+      '{ENHANCEMENT}=====E (declarations) and =====EIMP (implementations) exist in REPOSRC but ADT ' +
+      'refuses both (500 "could not be successfully read"), their REPOSRC~DATA is compressed, and ' +
+      'ENHCROSS / ENHA_TMDIR — the tables that would carry the generated IPR_/IPO_/IOW_ method ' +
+      'names — are empty system-wide. The exit type (pre / post / overwrite) is therefore NOT ' +
+      'available on this release; anchors[].method names the affected method, and SE24 (tab ' +
+      'Methoden, column Overwrite-Exit) is the only source for the type.'
     );
   }
   if (targetCount === 0) {

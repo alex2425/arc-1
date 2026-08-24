@@ -70,6 +70,43 @@ describe('enhancement anchor classification', () => {
     expect(anchors.map((a) => a.kind)).toEqual(['form', 'form', 'include']);
   });
 
+  it('names the class, method and interface a class anchor touches', () => {
+    // Rows verbatim from the reference system: a declaration section, a class-own method with
+    // ENHINCINX~METHOD set, and an interface method (the one SE24 shows as an overwrite exit).
+    const anchors = parseEnhancementAnchors([
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'CL_DEMO_DPC_EXTCP',
+        ENHMODE: 'S',
+        METHOD: '',
+        FULL_NAME: '\\TY:CL_DEMO_DPC_EXT\\SE:PUBLIC\\SE:END\\EI',
+      },
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'CL_DEMO_DPC_EXTCP',
+        ENHMODE: 'D',
+        METHOD: 'X',
+        FULL_NAME: '\\TY:CL_DEMO_DPC_EXT\\ME:ENRICH_REQUEST\\SE:%_BEGIN\\EI',
+      },
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'CL_DEMO_DPC_EXTCP',
+        ENHMODE: 'D',
+        METHOD: '',
+        FULL_NAME: '\\TY:CL_DEMO_DPC_EXT\\IN:IF_DEMO_RUNTIME\\ME:CHANGESET_PROCESS\\SE:%_BEGIN\\EI',
+      },
+    ]);
+
+    expect(anchors.map((a) => a.kind)).toEqual(['class', 'class', 'class']);
+    expect(anchors[0]).toMatchObject({ class: 'CL_DEMO_DPC_EXT', section: 'PUBLIC' });
+    expect(anchors[0]?.method).toBeUndefined();
+    expect(anchors[1]).toMatchObject({ method: 'ENRICH_REQUEST', inMethodBody: true });
+    expect(anchors[1]?.interface).toBeUndefined();
+    expect(anchors[2]).toMatchObject({ method: 'CHANGESET_PROCESS', interface: 'IF_DEMO_RUNTIME' });
+    // NOT derived into an exit type: the flag is unproven, and a wrong overwrite label is worse
+    // for a migration assessment than no label.
+    expect(anchors[2]?.inMethodBody).toBeUndefined();
+  });
   it('treats an UNPADDED class pool as a class', () => {
     // CL_HCMFAB_TIMESHEET_CR_DPC_EXT already fills 30 characters, so the pool carries no `=`
     // padding. With a padding-required pattern this anchor was mis-typed as a plain include and
