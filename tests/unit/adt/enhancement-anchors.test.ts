@@ -105,9 +105,41 @@ describe('enhancement anchor classification', () => {
     expect(anchors[1]).toMatchObject({ method: 'ENRICH_REQUEST', inMethodBody: true });
     expect(anchors[1]?.interface).toBeUndefined();
     expect(anchors[2]).toMatchObject({ method: 'CHANGESET_PROCESS', interface: 'IF_DEMO_RUNTIME' });
-    // NOT derived into an exit type: the flag is unproven, and a wrong overwrite label is worse
-    // for a migration assessment than no label.
+    // The flag is absent on this one — which is what makes it an overwrite; see the exitType test.
     expect(anchors[2]?.inMethodBody).toBeUndefined();
+  });
+
+  it('separates overwrite exits from the pre/post pair via ENHINCINX~METHOD', () => {
+    // Verified against SE24 in both directions: an empty flag on a method anchor is an OVERWRITE
+    // (customer redefinition and SAP switch-check method both confirmed), 'X' is a pre/post exit.
+    // The flag cannot split pre from post — only the generated method name does that.
+    const anchors = parseEnhancementAnchors([
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'CL_DEMO_DPC_EXTCP',
+        ENHMODE: 'D',
+        METHOD: '',
+        FULL_NAME: '\\TY:CL_DEMO_DPC_EXT\\IN:IF_DEMO_RUNTIME\\ME:CHANGESET_PROCESS\\SE:%_BEGIN\\EI',
+      },
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'CL_DEMO_DPC_EXTCP',
+        ENHMODE: 'D',
+        METHOD: 'X',
+        FULL_NAME: '\\TY:CL_DEMO_DPC_EXT\\ME:ENRICH_REQUEST\\SE:%_BEGIN\\EI',
+      },
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'CL_DEMO_DPC_EXTCP',
+        ENHMODE: 'S',
+        METHOD: '',
+        FULL_NAME: '\\TY:CL_DEMO_DPC_EXT\\SE:PUBLIC\\SE:END\\EI',
+      },
+    ]);
+
+    expect(anchors.map((a) => a.exitType)).toEqual(['overwrite', 'pre-or-post', undefined]);
+    // A declaration-section anchor enhances no method at all and must stay untyped.
+    expect(anchors[2]?.method).toBeUndefined();
   });
   it('treats an UNPADDED class pool as a class', () => {
     // CL_HCMFAB_TIMESHEET_CR_DPC_EXT already fills 30 characters, so the pool carries no `=`

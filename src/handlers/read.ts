@@ -883,11 +883,18 @@ async function withEnhancementSource(
 /** Explain an empty coding result — the three reasons differ in what the caller should do next. */
 function enhancementSourceHint(anchors: EnhancementAnchor[], targetCount: number): string {
   if (anchors.some((a) => a.kind === 'class')) {
-    const methods = [...new Set(anchors.filter((a) => a.method).map((a) => a.method))];
+    const label = (a: EnhancementAnchor) => `${a.method}${a.exitType === 'overwrite' ? ' (OVERWRITE)' : ''}`;
+    const methods = [...new Set(anchors.filter((a) => a.method).map(label))];
     const touched = methods.length > 0 ? ` Enhanced methods: ${methods.join(', ')}.` : '';
+    const overwrites = anchors.filter((a) => a.exitType === 'overwrite').length;
+    const critical =
+      overwrites > 0
+        ? ` ${overwrites} of them REPLACE the SAP implementation (anchors[].exitType = "overwrite") — treat those like a modification.`
+        : '';
     return (
       'This enhancement hooks into a class (see anchors[]).' +
       touched +
+      critical +
       ' ADT on this release serves no reader for class-enhancement coding: eight enhancement-feed ' +
       'URL shapes for the class all return an empty feed, and the per-plug-in resource ' +
       '(/sap/bc/adt/enhancements/implementations/{enh}/elements/sourcecodeplugins/{fullName}) is not ' +
@@ -896,9 +903,9 @@ function enhancementSourceHint(anchors: EnhancementAnchor[], targetCount: number
       '{ENHANCEMENT}=====E (declarations) and =====EIMP (implementations) exist in REPOSRC but ADT ' +
       'refuses both (500 "could not be successfully read"), their REPOSRC~DATA is compressed, and ' +
       'ENHCROSS / ENHA_TMDIR — the tables that would carry the generated IPR_/IPO_/IOW_ method ' +
-      'names — are empty system-wide. The exit type (pre / post / overwrite) is therefore NOT ' +
-      'available on this release; anchors[].method names the affected method, and SE24 (tab ' +
-      'Methoden, column Overwrite-Exit) is the only source for the type.'
+      'names — are empty system-wide. anchors[].exitType still separates overwrite from the ' +
+      'pre/post pair (derived from ENHINCINX~METHOD); splitting pre from post needs the generated ' +
+      'method name, so it stays open until that include is servable or SE24 is consulted.'
     );
   }
   if (targetCount === 0) {

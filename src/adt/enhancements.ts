@@ -369,8 +369,13 @@ export interface EnhancementAnchor {
   /** Enhanced method, when the anchor names one. */
   method?: string;
   /**
-   * pre / post / overwrite, read from the generated method name in the enhancement include.
-   * Only present where that include is servable — see resolveClassMethodExits.
+   * How the enhancement relates to the method it hooks into.
+   *
+   * `overwrite` REPLACES the SAP implementation and is as critical as a modification; a pre/post
+   * exit only runs around it. Derived from `ENHINCINX~METHOD` (see `inMethodBody`), which
+   * separates overwrite from the pre/post pair but not pre from post — hence `pre-or-post`.
+   * Where the enhancement include is servable, its generated method names resolve the pair to the
+   * exact `pre` / `post` and take precedence.
    */
   exitType?: EnhancementExitType;
   /** Interface the method belongs to, for interface-method anchors. */
@@ -438,6 +443,10 @@ export function parseEnhancementAnchors(rows: Array<Record<string, unknown>>): E
       const method = /\\ME:([^\\]+)/.exec(fullName)?.[1]?.trim();
       const iface = /\\IN:([^\\]+)/.exec(fullName)?.[1]?.trim();
       const section = /\\SE:([^\\]+)/.exec(fullName)?.[1]?.trim();
+      const inMethodBody =
+        String(row.METHOD ?? '')
+          .trim()
+          .toUpperCase() === 'X';
       anchors.push({
         ...base,
         kind: 'class',
@@ -445,13 +454,12 @@ export function parseEnhancementAnchors(rows: Array<Record<string, unknown>>): E
         ...(method ? { method } : {}),
         ...(iface ? { interface: iface } : {}),
         ...(section && !method ? { section } : {}),
-        // ENHINCINX~METHOD: set on 15 of 129 anchors on the reference system, and only ever on
-        // anchors that name a method. Reported as-is — see EnhancementAnchor.inMethodBody.
-        ...(String(row.METHOD ?? '')
-          .trim()
-          .toUpperCase() === 'X'
-          ? { inMethodBody: true }
-          : {}),
+        ...(inMethodBody ? { inMethodBody: true } : {}),
+        // ENHINCINX~METHOD separates the two kinds of method enhancement. Verified against SE24 in
+        // both directions: two overwrite exits carry an EMPTY flag (a customer redefinition and an
+        // SAP switch-check method), a pre/post exit on the same class as the first carries 'X'.
+        // The flag does not separate pre from post — only the generated method name does.
+        ...(method ? { exitType: inMethodBody ? ('pre-or-post' as const) : ('overwrite' as const) } : {}),
       });
       continue;
     }
@@ -644,7 +652,7 @@ export function enhancementIncludeName(enhancement: string, part: 0 | 1 = 0): st
 }
 
 /** How a class-enhancement method relates to the method it enhances. */
-export type EnhancementExitType = 'pre' | 'post' | 'overwrite';
+export type EnhancementExitType = 'pre' | 'post' | 'overwrite' | 'pre-or-post';
 
 /** One generated exit method of a class enhancement. */
 export interface EnhancementMethodExit {

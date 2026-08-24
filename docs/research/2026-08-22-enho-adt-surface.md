@@ -218,14 +218,23 @@ HTTP status: the reader answers 500 for the correct name and for a deliberately 
 alike. An earlier note in this file claimed a mis-padded name gives 404; that was a comparison of
 two different objects on two different request paths and is wrong.
 
-`ENHINCINX~METHOD = 'X'` is the only field that varies between method anchors — 15 of ~29k rows on
-the reference system, always on anchors carrying a `\ME:` part, on class-own AND interface methods
-alike. On the one anchor with SE24 ground truth (an overwrite exit) it is EMPTY, while a pre/post
-exit on the same class has it set. That is consistent with *"the enhancement sits inside an existing
-method body"* versus *"the enhancement IS the method"* — but it is a single sample, and SAP's
-switch-check classes contribute thousands of `METHOD = ''` method anchors that are not overwrites.
-ARC-1 reports the flag verbatim as `anchors[].inMethodBody` and derives NO exit type from it: a
-wrong overwrite label is worse for a migration assessment than an absent one.
+**The exit type IS derivable after all — from `ENHINCINX~METHOD`.** Verified against SE24 in both
+directions:
+
+| Anchor |  | SE24 Overwrite-Exit | Reading |
+|---|---|---|---|
+| customer interface method, redefined in the class | empty | filled | overwrite |
+| SAP switch-check method (), 1433 such anchors system-wide | empty | filled | overwrite |
+| pre/post exit on the same class as the first |  | not filled | pre or post |
+
+So an EMPTY flag on an anchor that names a method means the enhancement IS the method — it
+replaces the SAP implementation.  means it sits INSIDE an existing method body, i.e. a pre or a
+post exit. The flag does not separate pre from post; only the generated method name does, and that
+needs the include. ARC-1 reports  as  or  accordingly,
+and lets a readable include upgrade the pair to the exact value.
+
+An earlier revision of this note called the flag unproven and refused to derive anything from it.
+That was correct at one sample; the switch-check check supplied the second and third.
 
 Surfaced for class anchors instead: `class`, `method`, `interface`, `section`.
 
