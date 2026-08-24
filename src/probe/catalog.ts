@@ -196,12 +196,21 @@ export const CATALOG: CatalogEntry[] = [
   },
   {
     type: 'ENHO',
+    // Tracks the BAdI-specific collection, which is what the recorded fixtures replay: it 404s on
+    // 7.50 (see responses/GET__sap_bc_adt_enhancements_enhoxhb.json) while discovery there lists
+    // `/enhancements/enhoxh` instead. The runtime read does NOT depend on this entry — it tries
+    // both collections, discovery-first (src/adt/enhancements.ts). Point this row at `enhoxh`
+    // only together with re-recorded A4H + NPL fixtures.
     collectionUrl: '/sap/bc/adt/enhancements/enhoxhb',
     objectUrlTemplate: '/sap/bc/adt/enhancements/enhoxhb/{name}',
     knownObjects: [],
     minRelease: 702,
     note: 'Enhancement implementations — no universally-shipped ENHO',
   },
+  // ENHS (enhancement spots) is deliberately NOT in the catalog: the replay fixtures assert
+  // "zero unavailable/ambiguous" per recorded system, and a type added without re-recording
+  // A4H + NPL would break that. ENHS availability is handled at runtime by the discovery-gated
+  // collection fallback in src/adt/enhancements.ts.
   // NOTE: the server-driven object types (DESD/EVTB/DTSC/CSNM/EVTO/COTA/DSFD/DTDC/UIAD) are deliberately
   // NOT in this probe catalog. The catalog's recorded-fixture replay asserts "zero
   // unavailable/ambiguous" per system, which 816-only types break (unavailable on 7.5x/758;

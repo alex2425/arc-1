@@ -20,6 +20,7 @@ import type { AdtClientConfig } from './config.js';
 import { defaultAdtClientConfig } from './config.js';
 import { lockObject, unlockObject } from './crud.js';
 import { parseTableType, type TableTypeInfo } from './ddic-xml.js';
+import { readEnhancementImplementation, readEnhancementSpot, readObjectEnhancements } from './enhancements.js';
 import { AdtApiError, AdtSafetyError, isNotFoundError } from './errors.js';
 import { AdtHttpClient, type AdtHttpConfig, type AdtResponse } from './http.js';
 import { AdtPackageHierarchyResolver, type PackageHierarchyResolver } from './package-hierarchy.js';
@@ -38,11 +39,13 @@ import type {
   DataElementInfo,
   DomainInfo,
   EnhancementImplementationInfo,
+  EnhancementSpotInfo,
   FeatureToggleInfo,
   FunctionGroupStructure,
   FunctionModuleProperties,
   InactiveObject,
   MessageClassInfo,
+  ObjectEnhancementsResult,
   RevisionListResult,
   SourceSearchResult,
   StructuredClassResponse,
@@ -61,7 +64,6 @@ import {
   parseDataElementMetadata,
   parseDataPreviewMeta,
   parseDomainMetadata,
-  parseEnhancementImplementation,
   parseFeatureToggleStates,
   parseFunctionGroup,
   parseFunctionGroupNodes,
@@ -1050,13 +1052,37 @@ export class AdtClient {
     return parseFeatureToggleStates(resp.body, name);
   }
 
-  /** Get enhancement implementation metadata (technology, referenced object, BAdI implementations) */
+  /** Get enhancement implementation metadata (technology, enhanced object, BAdI implementations) */
   async getEnhancementImplementation(name: string): Promise<EnhancementImplementationInfo> {
     checkOperation(this.safety, OperationType.Read, 'GetEnhancementImplementation');
-    const resp = await this.http.get(`/sap/bc/adt/enhancements/enhoxhb/${encodeURIComponent(name)}`, {
-      Accept: 'application/vnd.sap.adt.enh.enhoxhb.v4+xml',
-    });
-    return parseEnhancementImplementation(resp.body);
+    return readEnhancementImplementation(this.http, name);
+  }
+
+  /**
+   * Read a repository object structure (flat project-explorer nodes). Used to find the include
+   * that holds a FORM: the node URI carries the include path AND its context.
+   */
+  async getRepositoryObjectStructure(objectType: string, name: string): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'GetObjectStructure');
+    const query = `objectname=${encodeURIComponent(name)}&objecttype=${encodeURIComponent(objectType)}`;
+    return (await this.http.get(`/sap/bc/adt/repository/objectstructure?${query}`)).body;
+  }
+
+  /** Get enhancement spot metadata (ENHS — the definition side of the enhancement framework) */
+  async getEnhancementSpot(name: string): Promise<EnhancementSpotInfo> {
+    checkOperation(this.safety, OperationType.Read, 'GetEnhancementSpot');
+    return readEnhancementSpot(this.http, name);
+  }
+
+  /**
+   * List the enhancement implementations bound to one object, with their decoded ABAP coding.
+   *
+   * For an include, `context` MUST be the URI of its MAIN PROGRAM: passing no context, or the
+   * include itself, returns an empty feed (live-verified NW 7.50).
+   */
+  async getObjectEnhancements(objectUri: string, opts: { context?: string } = {}): Promise<ObjectEnhancementsResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetObjectEnhancements');
+    return readObjectEnhancements(this.http, objectUri, opts);
   }
 
   /** Get transaction code metadata (description, package) */

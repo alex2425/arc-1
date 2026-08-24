@@ -1,0 +1,4 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Live 7.50 answer for an object with no enhancements, and for a request whose `context`
+     is missing or names the include itself instead of its main program. -->
+<enh:enhancements xmlns:enh="http://www.sap.com/adt/abapsource/enhancements"/>

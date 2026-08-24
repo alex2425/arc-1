@@ -16,7 +16,6 @@ import {
   parseDataElementMetadata,
   parseDataPreviewMeta,
   parseDomainMetadata,
-  parseEnhancementImplementation,
   parseFeatureToggleStates,
   parseFunctionGroup,
   parseFunctionGroupNodes,
@@ -914,43 +913,6 @@ describe('XML Parser', () => {
         'Z',
       );
       expect(toggle.states[0]?.state).toBe('unknown');
-    });
-  });
-
-  // ─── parseEnhancementImplementation ──────────────────────────────
-
-  describe('parseEnhancementImplementation', () => {
-    it('parses enhancement implementation metadata from real SAP fixture', () => {
-      const xml = loadFixture('enhancement-implementation.xml');
-      const enho = parseEnhancementImplementation(xml);
-      expect(enho.name).toBe('SFW_BCF_TCD');
-      expect(enho.description).toBe('TCD Lookup, Assignment...');
-      expect(enho.package).toBe('SFWTOOLS');
-      expect(enho.technology).toBe('BADI_IMPL');
-      expect(enho.switchSupported).toBe(true);
-      expect(enho.badiImplementations).toHaveLength(2);
-      expect(enho.badiImplementations[0]).toEqual({
-        name: 'SFW_TCD',
-        shortText: 'Implementierung: BCF: BADI für TCD Remote Service',
-        implementingClass: 'CL_SFW_TCD',
-        badiDefinition: 'BCF_TCD_REMOTE_BADI',
-        enhancementSpot: 'BCF_REMOTE_TCD',
-        active: true,
-        default: false,
-      });
-      expect(enho.badiImplementations[1]?.default).toBe(true);
-      expect(enho.badiImplementations[1]?.active).toBe(false);
-    });
-
-    it('handles minimal enhancement implementation XML', () => {
-      const xml =
-        '<enho:objectData xmlns:enho="http://www.sap.com/adt/enhancements/enho" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZENHO" adtcore:description="Test"/>';
-      const enho = parseEnhancementImplementation(xml);
-      expect(enho.name).toBe('ZENHO');
-      expect(enho.description).toBe('Test');
-      expect(enho.package).toBe('');
-      expect(enho.technology).toBe('');
-      expect(enho.badiImplementations).toEqual([]);
     });
   });
 

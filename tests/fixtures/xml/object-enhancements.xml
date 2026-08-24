@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shape captured live from NW 7.50 (2026-08-22):
+     GET /sap/bc/adt/programs/includes/rptmoz00/source/main/enhancements
+         ?context=%2Fsap%2Fbc%2Fadt%2Fprograms%2Fprograms%2Fsapfp51t
+     Object names and the ABAP payload are anonymized; the XML structure is verbatim. -->
+<enh:enhancements xmlns:enh="http://www.sap.com/adt/abapsource/enhancements"><enh:enhancementImplementations abapsource:fixPointArithmetic="false" abapsource:activeUnicodeCheck="false" adtcore:name="ZENH_HOOK_DEMO" adtcore:type="ENHO/XH" adtcore:version="active" xmlns:abapsource="http://www.sap.com/adt/abapsource" xmlns:adtcore="http://www.sap.com/adt/core"><enh:elements><enh:sourceCodePlugin enh:uri="/sap/bc/adt/enhancements/implementations/zenh_hook_demo/elements/sourcecodeplugins/%5cPR%3aSAPFP51T%5cIC%3aRPTMOZ00%5cSE%3aEND%5cEI#start=0,0" enh:id="1 " enh:fullname="\PR:SAPFP51T\IC:RPTMOZ00\SE:END\EI" enh:mode="static" enh:replacing="false"><enh:source>RU5IQU5DRU1FTlQgMSB6ZW5oX2hvb2tfZGVtby4KdGFibGVzIHpkZW1vX2NvbmZpZy4KZm9y
+bSBjaGVja19kZW1vLgogIGRhdGEgOiBsX3N1YnJjIGxpa2Ugc3ktc3VicmMuCmVuZGZvcm0u
+CkVOREVOSEFOQ0VNRU5ULg==</enh:source><enh:option><enh:sourceCodePluginOption enh:fullname="\PR:SAPFP51T\IC:RPTMOZ00\SE:END\EI"><enh:position adtcore:uri="/sap/bc/adt/programs/includes/rptmoz00/source/main?context=%2fsap%2fbc%2fadt%2fprograms%2fincludes%2frptmoz00#start=1310,0"/></enh:sourceCodePluginOption></enh:option></enh:sourceCodePlugin></enh:elements><enh:enhancedObject adtcore:uri="/sap/bc/adt/programs/programs/sapfp51t" adtcore:type="PROG/P" adtcore:name="SAPFP51T"/></enh:enhancementImplementations></enh:enhancements>

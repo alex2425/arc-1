@@ -1021,6 +1021,130 @@ describe('AdtClient', () => {
         default: false,
       });
     });
+
+    it('asks only the collections discovery advertises', async () => {
+      // Recorded discovery: 7.50 (NPL + ECC EhP8) lists ONLY enhoxh, S/4 758 and 8.16 list
+      // enhoxhb/enhoxhh/enhoxh. On a 7.50 system that must be a single request, not three 404s.
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('enhancement-implementation.xml')));
+      const client = createClient();
+      client.http.setDiscoveryMap(
+        new Map([['/sap/bc/adt/enhancements/enhoxh', ['application/vnd.sap.adt.enh.enho.v1+xml']]]),
+      );
+
+      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO');
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+      expect(mockFetch.mock.calls[0]?.[0]).toContain('/sap/bc/adt/enhancements/enhoxh/ZENH_HOOK_DEMO');
+      expect(fetchHeaders(0).Accept).toBe('application/vnd.sap.adt.enh.enho.v1+xml');
+      expect(enho.uri).toBe('/sap/bc/adt/enhancements/enhoxh/ZENH_HOOK_DEMO');
+    });
+    it('falls back to the enhoxh collection when enhoxhb is absent (NW 7.50)', async () => {
+      // NW 7.50, live-verified: /enhancements/enhoxhb/{name} 404s, /enhoxh/{name} serves it.
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(mockResponse(200, loadFixture('enhancement-implementation.xml')));
+      const client = createClient();
+      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO');
+
+      // Without discovery data every candidate is tried, richest representation first.
+      expect(mockFetch.mock.calls[0]?.[0]).toContain('/sap/bc/adt/enhancements/enhoxhb/ZENH_HOOK_DEMO');
+      expect(mockFetch.mock.calls[1]?.[0]).toContain('/sap/bc/adt/enhancements/enhoxhh/ZENH_HOOK_DEMO');
+      expect(mockFetch.mock.calls[2]?.[0]).toContain('/sap/bc/adt/enhancements/enhoxh/ZENH_HOOK_DEMO');
+      expect(fetchHeaders(2).Accept).toBe('application/vnd.sap.adt.enh.enho.v1+xml');
+      expect(enho.uri).toBe('/sap/bc/adt/enhancements/enhoxh/ZENH_HOOK_DEMO');
+      expect(enho.name).toBe('SFW_BCF_TCD');
+    });
+
+    it('falls back to the workbench wrapper when the enhancement endpoint dumps (7.50)', async () => {
+      // Live 7.50 sequence: enhoxhb 404 → enhoxh 500 (ADT could not serve enhancements before
+      // 7.53) → the VIT workbench wrapper still answers with the common envelope.
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(mockResponse(500, 'Internal Server Error'))
+        .mockResolvedValueOnce(
+          mockResponse(
+            200,
+            '<adtcore:mainObject xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZENH_HOOK_DEMO" ' +
+              'adtcore:type="ENHO/XH" adtcore:responsible="TESTUSER">' +
+              '<adtcore:packageRef adtcore:name="ZENH_DEMO"/></adtcore:mainObject>',
+          ),
+        );
+      const client = createClient();
+      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO');
+
+      expect(mockFetch.mock.calls[3]?.[0]).toContain(
+        '/sap/bc/adt/vit/wb/object_type/enhoxh/object_name/ZENH_HOOK_DEMO',
+      );
+      expect(enho.name).toBe('ZENH_HOOK_DEMO');
+      expect(enho.package).toBe('ZENH_DEMO');
+      expect(enho.technology).toBe('ENHO/XH');
+      expect(enho.raw).toContain('adtcore:mainObject');
+    });
+
+    it('reports the original dump when the workbench fallback also fails', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(mockResponse(500, 'dump'))
+        .mockResolvedValueOnce(mockResponse(404, 'no workbench wrapper here'));
+      const client = createClient();
+      await expect(client.getEnhancementImplementation('ZENHO')).rejects.toMatchObject({ statusCode: 500 });
+    });
+    it('surfaces an auth failure instead of trying another endpoint', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(403, 'Forbidden'));
+      const client = createClient();
+      await expect(client.getEnhancementImplementation('ZENHO')).rejects.toBeInstanceOf(AdtApiError);
+      expect(mockFetch).toHaveBeenCalledTimes(1);
+    });
+
+    it('getObjectEnhancements decodes plug-in source and passes the main program as context', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('object-enhancements.xml')));
+      const client = createClient();
+      const feed = await client.getObjectEnhancements('/sap/bc/adt/programs/includes/rptmoz00', {
+        context: '/sap/bc/adt/programs/programs/sapfp51t',
+      });
+
+      const url = mockFetch.mock.calls[0]?.[0] as string;
+      expect(url).toContain('/sap/bc/adt/programs/includes/rptmoz00/source/main/enhancements');
+      expect(url).toContain('?context=%2Fsap%2Fbc%2Fadt%2Fprograms%2Fprograms%2Fsapfp51t');
+      expect(feed.implementations[0]?.name).toBe('ZENH_HOOK_DEMO');
+      expect(feed.implementations[0]?.elements[0]?.source).toContain('ENHANCEMENT 1 zenh_hook_demo.');
+    });
+
+    it('getObjectEnhancements does not double-append /source/main', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(200, loadFixture('object-enhancements-empty.xml')));
+      const client = createClient();
+      const feed = await client.getObjectEnhancements('/sap/bc/adt/programs/programs/sapfp51t/source/main');
+      expect(mockFetch.mock.calls[0]?.[0]).toContain('/programs/sapfp51t/source/main/enhancements');
+      expect(mockFetch.mock.calls[0]?.[0]).not.toContain('source/main/source/main');
+      expect(feed.implementations).toEqual([]);
+    });
+
+    it('getEnhancementSpot reads the spot collection', async () => {
+      mockFetch.mockReset();
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found'))
+        .mockResolvedValueOnce(
+          mockResponse(
+            200,
+            '<enho:objectData xmlns:enho="http://www.sap.com/adt/enhancements/enho" ' +
+              'xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZSPOT"/>',
+          ),
+        );
+      const client = createClient();
+      const spot = await client.getEnhancementSpot('ZSPOT');
+      expect(mockFetch.mock.calls[0]?.[0]).toContain('/sap/bc/adt/enhancements/enhsxsb/ZSPOT');
+      expect(mockFetch.mock.calls[1]?.[0]).toContain('/sap/bc/adt/enhancements/enhsxs/ZSPOT');
+      expect(spot.name).toBe('ZSPOT');
+    });
   });
 
   // ─── API Release State ──────────────────────────────────────────

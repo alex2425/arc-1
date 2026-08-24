@@ -28,7 +28,6 @@ import type {
   ClassStructure,
   DataElementInfo,
   DomainInfo,
-  EnhancementImplementationInfo,
   FeatureToggleInfo,
   FunctionGroupStructure,
   FunctionModuleProperties,
@@ -103,6 +102,10 @@ const ARRAY_TAGS = new Set([
   'accept',
   'orglvlinfo',
   'badiImplementation',
+  // Object enhancement feed ({objectUri}/source/main/enhancements) — one entry per bound ENHO,
+  // each with one or more source-code plug-ins.
+  'enhancementImplementations',
+  'sourceCodePlugin',
 ]);
 
 /** Shared parser instance — configured for ADT XML conventions */
@@ -776,56 +779,6 @@ export function parseFeatureToggleStates(json: string, name: string): FeatureTog
 }
 
 /**
- * Parse enhancement implementation metadata from /sap/bc/adt/enhancements/enhoxhb/{name}.
- *
- * Expected root: <enho:objectData> with contentCommon/contentSpecific and BAdI entries.
- */
-export function parseEnhancementImplementation(xml: string): EnhancementImplementationInfo {
-  const parsed = parseXml(xml);
-  const objectData = (parsed.objectData ?? findDeepNodes(parsed, 'objectData')[0] ?? {}) as Record<string, unknown>;
-  const pkgRef = (objectData.packageRef ?? {}) as Record<string, unknown>;
-  const contentCommon = (objectData.contentCommon ?? {}) as Record<string, unknown>;
-  const contentSpecific = (objectData.contentSpecific ?? {}) as Record<string, unknown>;
-
-  // Real responses wrap impls: contentSpecific > badiTechnology > badiImplementations > badiImplementation[]
-  // badiTechnology may be an empty element (text value) on implementations with no BAdIs.
-  const badiTech = contentSpecific.badiTechnology;
-  const badiTechRec =
-    badiTech && typeof badiTech === 'object' ? (badiTech as Record<string, unknown>) : ({} as Record<string, unknown>);
-  const badiImplContainer = (badiTechRec.badiImplementations ?? contentSpecific.badiImplementations ?? {}) as Record<
-    string,
-    unknown
-  >;
-  const badiImplNodes = toRecordArray(badiImplContainer.badiImplementation);
-
-  const technology = String(
-    contentCommon['@_toolType'] ?? (typeof badiTech === 'string' || typeof badiTech === 'number' ? badiTech : ''),
-  );
-
-  return {
-    name: String(objectData['@_name'] ?? ''),
-    description: String(objectData['@_description'] ?? ''),
-    package: String(pkgRef['@_name'] ?? ''),
-    technology,
-    switchSupported: String(contentCommon['@_switchSupported'] ?? '') === 'true',
-    badiImplementations: badiImplNodes.map((node) => {
-      const implementingClass = (node.implementingClass ?? {}) as Record<string, unknown>;
-      const badiDefinition = (node.badiDefinition ?? {}) as Record<string, unknown>;
-      const enhancementSpot = (node.enhancementSpot ?? {}) as Record<string, unknown>;
-      return {
-        name: String(node['@_name'] ?? ''),
-        shortText: String(node['@_shortText'] ?? ''),
-        implementingClass: String(implementingClass['@_name'] ?? ''),
-        badiDefinition: String(badiDefinition['@_name'] ?? ''),
-        enhancementSpot: String(enhancementSpot['@_name'] ?? ''),
-        active: String(node['@_active'] ?? '') === 'true',
-        default: String(node['@_default'] ?? '') === 'true',
-      };
-    }),
-  };
-}
-
-/**
  * Parse transaction metadata XML from /sap/bc/adt/vit/wb/object_type/trant/object_name/{name}.
  *
  * Returns basic transaction info: code, description, package.
@@ -1364,7 +1317,7 @@ function getDeepArray(obj: Record<string, unknown>, path: string[]): Array<Recor
   return [];
 }
 
-function toRecordArray(value: unknown): Array<Record<string, unknown>> {
+export function toRecordArray(value: unknown): Array<Record<string, unknown>> {
   if (Array.isArray(value)) {
     return value.filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object');
   }

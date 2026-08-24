@@ -1,0 +1,226 @@
+/**
+ * Anchor resolution: turning ENHINCINX rows into the enhancement-feed requests that actually
+ * carry coding. Every row and URI below is verbatim from the live NW 7.50 system
+ * (2026-08-23) — see docs/research/2026-08-22-enho-adt-surface.md.
+ */
+import { describe, expect, it, vi } from 'vitest';
+import {
+  anchorFeedTargets,
+  feedTargetFromSourceUri,
+  parseEnhancementAnchors,
+  parseSubroutineNodes,
+  resolveAnchorFeedTargets,
+} from '../../../src/adt/enhancements.js';
+
+const row = (fullName: string, programName: string) => ({
+  ENHNAME: 'ZE',
+  PROGRAMNAME: programName,
+  FULL_NAME: fullName,
+});
+
+/** Two `<projectexplorer:node>` entries in the shape the repository objectstructure returns. */
+const objectStructureXml = (nodes: Array<{ description: string; type: string; uri: string }>) =>
+  `<projectexplorer:objectstructure xmlns:projectexplorer="http://www.sap.com/adt/projectexplorer">${nodes
+    .map(
+      (n) =>
+        `<projectexplorer:node isfolder="false" description="${n.description}" objecttype="${n.type}" objecturi="${n.uri}"/>`,
+    )
+    .join(
+      '',
+    )}<projectexplorer:node isfolder="true" description="Subroutines" objecttype="PROG/PU"/></projectexplorer:objectstructure>`;
+
+describe('enhancement anchor classification', () => {
+  it('classifies each FULL_NAME shape seen on the live system', () => {
+    const anchors = parseEnhancementAnchors([
+      row('\\PR:SAPFP51T\\IC:RPTMOZ00\\SE:END\\EI', 'SAPFP51T'),
+      row('\\IC:H99CWTR0_FORMS\\EX:CHANGE_DRIVER_CODE\\EI', 'H99CWTR0'),
+      row('\\PR:ZDEMO_REPORT\\FO:CHECK_EXPORT_3X\\SE:BEGIN\\EI', 'ZDEMO_REPORT'),
+      row('\\FU:CATS_SAVE_CATSDB\\SE:BEGIN\\EI', 'SAPLCATSTOOLS'),
+      row(
+        '\\TY:CL_HCMFAB_EMPLOYEE_API\\ME:GET_EMPLOYEENUMBER_FROM_USER\\SE:%_BEGIN\\EI',
+        'CL_HCMFAB_EMPLOYEE_API========CP',
+      ),
+      row('\\TY:CL_X\\SE:PUBLIC\\SE:END\\EI', 'CL_X=========================CP'),
+    ]);
+    expect(anchors.map((a) => a.kind)).toEqual(['include', 'include', 'form', 'functionModule', 'class', 'class']);
+    expect(anchors[2]?.member).toBe('CHECK_EXPORT_3X');
+    expect(anchors[3]?.member).toBe('CATS_SAVE_CATSDB');
+  });
+
+  it('carries the ENHINCINX mode, which the feed does not report faithfully', () => {
+    // The feed says enh:mode="any" for hooks that ENHINCINX marks D, so both values are kept:
+    // anchors[].mode is authoritative, sourceCodePlugins[].mode is SAP's feed value verbatim.
+    const anchors = parseEnhancementAnchors([
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'SAPLOM_GEN_OVERVIEW',
+        ENHMODE: 'D',
+        FULL_NAME: '\\PR:SAPLOM_GEN_OVERVIEW\\FO:GET_FCODES_PER_OTYPE\\SE:END\\EI',
+      },
+      {
+        ENHNAME: 'ZE',
+        PROGRAMNAME: 'SAPLOM_GEN_OVERVIEW',
+        ENHMODE: 'S',
+        FULL_NAME: '\\PR:SAPLOM_GEN_OVERVIEW\\FO:GET_FCODES_PER_OTYPE\\SE:BEGIN\\EI',
+      },
+      { ENHNAME: 'ZE', PROGRAMNAME: 'ZP', ENHMODE: '', FULL_NAME: '\\PR:ZP\\IC:ZI\\SE:END\\EI' },
+    ]);
+    expect(anchors.map((a) => a.mode)).toEqual(['dynamic', 'static', undefined]);
+    // Both hooks of the same routine are FORM anchors — the pair that exposed the parser bug.
+    expect(anchors.map((a) => a.kind)).toEqual(['form', 'form', 'include']);
+  });
+
+  it('treats an UNPADDED class pool as a class', () => {
+    // CL_HCMFAB_TIMESHEET_CR_DPC_EXT already fills 30 characters, so the pool carries no `=`
+    // padding. With a padding-required pattern this anchor was mis-typed as a plain include and
+    // ARC-1 then asked a program URI that does not exist.
+    const anchors = parseEnhancementAnchors([
+      row(
+        '\\PR:CL_HCMFAB_TIMESHEET_CR_DPC_EXTCP\\IC:CL_HCMFAB_TIMESHEET_CR_DPC_EXTCCIMP\\SE:END\\EI',
+        'CL_HCMFAB_TIMESHEET_CR_DPC_EXTCP',
+      ),
+    ]);
+    expect(anchors[0]?.kind).toBe('class');
+    expect(anchorFeedTargets(anchors)).toEqual([]);
+  });
+});
+
+describe('feedTargetFromSourceUri', () => {
+  it('keeps the context the object structure already encoded and drops the fragment', () => {
+    expect(
+      feedTargetFromSourceUri(
+        '/sap/bc/adt/programs/includes/rpcipe03_old/source/main?context=%2fsap%2fbc%2fadt%2fprograms%2fprograms%2fzdemo_report#start=21,5',
+        '/fallback',
+      ),
+    ).toEqual({
+      objectUri: '/sap/bc/adt/programs/includes/rpcipe03_old/source/main',
+      context: '/sap/bc/adt/programs/programs/zdemo_report',
+    });
+  });
+
+  it('falls back to the container context when the URI carries none', () => {
+    expect(
+      feedTargetFromSourceUri(
+        '/sap/bc/adt/functions/groups/hrbas00search_internal/includes/lhrbas00search_internalf50/source/main#start=11,5',
+        '/sap/bc/adt/functions/groups/hrbas00search_internal',
+      ),
+    ).toEqual({
+      objectUri: '/sap/bc/adt/functions/groups/hrbas00search_internal/includes/lhrbas00search_internalf50/source/main',
+      context: '/sap/bc/adt/functions/groups/hrbas00search_internal',
+    });
+  });
+});
+
+describe('parseSubroutineNodes', () => {
+  it('maps FORM names to their include URI and ignores folders and non-subroutines', () => {
+    const forms = parseSubroutineNodes(
+      objectStructureXml([
+        {
+          description: 'CHECK_EXPORT_3X',
+          type: 'PROG/PU',
+          uri: '/sap/bc/adt/programs/includes/rpcipe03_old/source/main',
+        },
+        { description: 'NATIVE_SQL', type: 'FUGR/PD', uri: '/sap/bc/adt/programs/includes/other/source/main' },
+      ]),
+    );
+    expect(forms.get('CHECK_EXPORT_3X')).toBe('/sap/bc/adt/programs/includes/rpcipe03_old/source/main');
+    expect(forms.has('NATIVE_SQL')).toBe(false);
+  });
+});
+
+describe('resolveAnchorFeedTargets', () => {
+  it('resolves a function-module anchor through its group', async () => {
+    const deps = {
+      getObjectStructure: vi.fn(),
+      resolveFunctionGroup: vi.fn().mockResolvedValue('CATSTOOLS'),
+    };
+    const anchors = parseEnhancementAnchors([row('\\FU:CATS_SAVE_CATSDB\\SE:BEGIN\\EI', 'SAPLCATSTOOLS')]);
+
+    expect(await resolveAnchorFeedTargets(deps, anchors)).toEqual([
+      {
+        objectUri: '/sap/bc/adt/functions/groups/catstools/fmodules/cats_save_catsdb/source/main',
+        context: '/sap/bc/adt/functions/groups/catstools',
+      },
+    ]);
+    expect(deps.getObjectStructure).not.toHaveBeenCalled();
+  });
+
+  it('finds the include holding a FORM instead of asking the main program', async () => {
+    const deps = {
+      getObjectStructure: vi.fn().mockResolvedValue(
+        objectStructureXml([
+          {
+            description: 'CHECK_EXPORT_3X',
+            type: 'PROG/PU',
+            uri: '/sap/bc/adt/programs/includes/rpcipe03_old/source/main?context=%2fsap%2fbc%2fadt%2fprograms%2fprograms%2fzdemo_report#start=21,5',
+          },
+        ]),
+      ),
+      resolveFunctionGroup: vi.fn(),
+    };
+    const anchors = parseEnhancementAnchors([
+      row('\\PR:ZDEMO_REPORT\\FO:CHECK_EXPORT_3X\\SE:BEGIN\\EI', 'ZDEMO_REPORT'),
+    ]);
+
+    expect(await resolveAnchorFeedTargets(deps, anchors)).toEqual([
+      {
+        objectUri: '/sap/bc/adt/programs/includes/rpcipe03_old/source/main',
+        context: '/sap/bc/adt/programs/programs/zdemo_report',
+      },
+    ]);
+    expect(deps.getObjectStructure).toHaveBeenCalledWith('PROG/P', 'ZDEMO_REPORT');
+  });
+
+  it('reads a FORM inside a function group as FUGR/F, once per container', async () => {
+    const deps = {
+      getObjectStructure: vi.fn().mockResolvedValue(
+        objectStructureXml([
+          {
+            description: 'F4_CALLBACK_SHLP',
+            type: 'FUGR/PU',
+            uri: '/sap/bc/adt/functions/groups/hrbas00search_internal/includes/lhrbas00search_internalf50/source/main#start=11,5',
+          },
+          {
+            description: 'OTHER_FORM',
+            type: 'FUGR/PU',
+            uri: '/sap/bc/adt/functions/groups/hrbas00search_internal/includes/lhrbas00search_internalf60/source/main',
+          },
+        ]),
+      ),
+      resolveFunctionGroup: vi.fn(),
+    };
+    const anchors = parseEnhancementAnchors([
+      row('\\PR:SAPLHRBAS00SEARCH_INTERNAL\\FO:F4_CALLBACK_SHLP\\SE:END\\EI', 'SAPLHRBAS00SEARCH_INTERNAL'),
+      row('\\PR:SAPLHRBAS00SEARCH_INTERNAL\\FO:OTHER_FORM\\SE:END\\EI', 'SAPLHRBAS00SEARCH_INTERNAL'),
+    ]);
+
+    const targets = await resolveAnchorFeedTargets(deps, anchors);
+    expect(deps.getObjectStructure).toHaveBeenCalledTimes(1);
+    expect(deps.getObjectStructure).toHaveBeenCalledWith('FUGR/F', 'HRBAS00SEARCH_INTERNAL');
+    expect(targets).toHaveLength(2);
+    expect(targets[0]).toEqual({
+      objectUri: '/sap/bc/adt/functions/groups/hrbas00search_internal/includes/lhrbas00search_internalf50/source/main',
+      context: '/sap/bc/adt/functions/groups/hrbas00search_internal',
+    });
+  });
+
+  it('drops an anchor whose lookup fails instead of failing the whole read', async () => {
+    const deps = {
+      getObjectStructure: vi.fn().mockRejectedValue(new Error('boom')),
+      resolveFunctionGroup: vi.fn().mockResolvedValue(null),
+    };
+    const anchors = parseEnhancementAnchors([
+      row('\\PR:ZDEMO_REPORT\\FO:CHECK_EXPORT_3X\\SE:BEGIN\\EI', 'ZDEMO_REPORT'),
+      row('\\FU:CATS_SAVE_CATSDB\\SE:BEGIN\\EI', 'SAPLCATSTOOLS'),
+      row('\\PR:SAPFP51T\\IC:RPTMOZ00\\SE:END\\EI', 'SAPFP51T'),
+    ]);
+
+    // The direct include anchor still produces its target.
+    expect(await resolveAnchorFeedTargets(deps, anchors)).toEqual([
+      {
+        objectUri: '/sap/bc/adt/programs/includes/rptmoz00',
+        context: '/sap/bc/adt/programs/programs/sapfp51t',
+      },
+    ]);
+  });
+});

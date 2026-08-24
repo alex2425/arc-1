@@ -2402,4 +2402,95 @@ ENDCLASS.`;
       expect(result.content[0]?.text).not.toContain('has no source code stored');
     });
   });
+
+  describe('ENHO / ENHS (enhancement framework)', () => {
+    const enhoXml = readFileSync('tests/fixtures/xml/enhancement-implementation.xml', 'utf-8');
+    const feedXml = readFileSync('tests/fixtures/xml/object-enhancements.xml', 'utf-8');
+
+    it('attaches the decoded coding of the enhancement source plug-ins', async () => {
+      // enhoxhb 404s (7.50) → enhoxh serves the metadata → the enhanced object's feed carries
+      // the ABAP coding, which is the part a migration assessment actually needs.
+      // The feed lists every ENHO bound to the object — only the one being read may be kept.
+      const feedForThisEnho = feedXml.replace(/ZENH_HOOK_DEMO/g, 'SFW_BCF_TCD');
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found', { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found', { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, enhoXml, { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(200, feedForThisEnho, { 'x-csrf-token': 'T' }));
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+        type: 'ENHO',
+        name: 'SFW_BCF_TCD',
+      });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0]?.text ?? '{}');
+      expect(payload.uri).toBe('/sap/bc/adt/enhancements/enhoxh/SFW_BCF_TCD');
+      // The coding is fetched from the ENHANCED object, with its main object as context.
+      const feedUrl = mockFetch.mock.calls[3]?.[0] as string;
+      expect(feedUrl).toContain(`${payload.enhancedObject.uri}/source/main/enhancements`);
+      expect(feedUrl).toContain(`?context=${encodeURIComponent(payload.mainObject.uri)}`);
+      expect(payload.sourceCodePlugins[0].source).toContain('ENHANCEMENT 1 zenh_hook_demo.');
+      expect(payload.sourceCodePlugins[0].position.line).toBe(1310);
+    });
+
+    it('still returns metadata when the coding lookup fails', async () => {
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(200, enhoXml, { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(500, 'Internal Server Error', { 'x-csrf-token': 'T' }));
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+        type: 'ENHO',
+        name: 'SFW_BCF_TCD',
+      });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0]?.text ?? '{}');
+      expect(payload.name).toBe('SFW_BCF_TCD');
+      expect(payload.sourceCodePlugins).toBeUndefined();
+    });
+
+    it('explains why no coding came back when the enhanced object cannot be resolved', async () => {
+      // 7.50: the enhancement endpoint dumps, the workbench wrapper answers with metadata only,
+      // and without free SQL there is no ENHINCINX fallback to find the enhanced object.
+      mockFetch
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found', { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(404, 'Not Found', { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(mockResponse(500, 'dump', { 'x-csrf-token': 'T' }))
+        .mockResolvedValueOnce(
+          mockResponse(
+            200,
+            '<adtcore:mainObject xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZENH_HOOK_DEMO" ' +
+              'adtcore:type="ENHO/XH"/>',
+            { 'x-csrf-token': 'T' },
+          ),
+        );
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+        type: 'ENHO',
+        name: 'ZENH_HOOK_DEMO',
+      });
+
+      expect(result.isError).toBeUndefined();
+      const payload = JSON.parse(result.content[0]?.text ?? '{}');
+      expect(payload.name).toBe('ZENH_HOOK_DEMO');
+      expect(payload.sourceHint).toContain('SAP_ALLOW_FREE_SQL');
+    });
+    it('reads an enhancement spot (ENHS)', async () => {
+      mockFetch.mockResolvedValue(
+        mockResponse(
+          200,
+          '<enho:objectData xmlns:enho="http://www.sap.com/adt/enhancements/enho" ' +
+            'xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZSPOT" adtcore:description="Spot"/>',
+          { 'x-csrf-token': 'T' },
+        ),
+      );
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+        type: 'ENHS',
+        name: 'ZSPOT',
+      });
+      expect(result.isError).toBeUndefined();
+      expect(JSON.parse(result.content[0]?.text ?? '{}').name).toBe('ZSPOT');
+    });
+  });
 });

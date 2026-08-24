@@ -45,7 +45,7 @@ Use `SAPRead` when you need exact raw source, one method body, grep output, inac
 
 | Parameter | Type | Required | Description |
 |-----------|------|----------|-------------|
-| `type` | string | Yes | Object type (see below; includes `AUTH`, `FEATURE_TOGGLE`, `ENHO`, `VERSIONS`, `VERSION_SOURCE` on on-prem systems, and the server-driven objects `DSFD`/`DESD`/`EVTB`/`EVTO`/`DTSC`/`CSNM`/`COTA`/`DTDC`/`UIAD` where the system advertises them — ABAP Platform 2025 / 8.16+, plus `EVTB` on S/4HANA 2023) |
+| `type` | string | Yes | Object type (see below; includes `AUTH`, `FEATURE_TOGGLE`, `ENHO`, `ENHS`, `VERSIONS`, `VERSION_SOURCE` on on-prem systems, and the server-driven objects `DSFD`/`DESD`/`EVTB`/`EVTO`/`DTSC`/`CSNM`/`COTA`/`DTDC`/`UIAD` where the system advertises them — ABAP Platform 2025 / 8.16+, plus `EVTB` on S/4HANA 2023) |
 | `name` | string | No | Object name (e.g., `ZTEST_PROGRAM`, `ZCL_ORDER`, `MARA`) |
 | `action` | string | No | `"diff"` — return a unified diff between two source versions on this system (only the hunks, not two full sources), using `from`/`to`. Source types only: `PROG, CLAS, INTF, FUNC, FUGR, INCL, DDLS, DCLS, BDEF, SRVD, DDLX, TABL` (CDS views are `DDLS`; classic DDIC `VIEW` is unsupported — it has no plain-text source). Note: SAP only snapshots a version on transport *release*, so `from`/`to` revision ids are sparse — `active` vs `inactive` (pending unactivated changes) is the most reliable use. |
 | `from` | string | No | For `action="diff"`: OLD side — `"active"` (default), `"inactive"`, a revision id (from a VERSIONS response), or a full `/sap/bc/adt/` revision URI. |
@@ -90,7 +90,8 @@ Use `SAPRead` when you need exact raw source, one method body, grep output, inac
 | `DTEL` | Data element metadata (structured JSON: type, labels, search help) |
 | `AUTH` | Authorization field metadata (structured JSON: role name, check table, domain, conversion exit, org-level info) |
 | `FEATURE_TOGGLE` | Feature toggle states (structured JSON: toggle state per system from SAP switch framework). Renamed from `FTG2` in audit Plan B (docs/research/abap-types/types/ftg2.md) — `FTG2` still accepted as deprecated alias for one minor release with stderr warning. |
-| `ENHO` | Enhancement implementation metadata (structured JSON: BAdI technology, referenced object, implementation classes) |
+| `ENHO` | Enhancement implementation (structured JSON: technology, enhanced object, BAdI implementation classes) **plus `sourceCodePlugins[]` — the decoded ABAP coding of source-code plug-ins**, fetched from the enhanced object's enhancement feed. The collection differs per release (`enhoxh` on 7.50, `enhoxhb` from 7.58); the read resolves it from ADT discovery. On 7.50 the ADT representation dumps, so metadata falls back to the workbench wrapper and the hook locations (`anchors[]`) come from `ENHINCINX` when free SQL is allowed. Coding is fetched per anchor form (program include, function module, or the include holding a FORM); class enhancements return locations only. When no coding is returned, `sourceHint` says why |
+| `ENHS` | Enhancement spot (`enhsxsb` → `enhsxs`, discovery-first): description, package, tool type and structured `badiDefinitions[]` (interface, single-use, filters). Raw ADT XML only when the envelope is unrecognized |
 | `VERSIONS` | Revision history for an ABAP object. Returns JSON: `{ object: { name, type }, revisions: [{ id, author, timestamp, transport?, uri }] }`. Optional `include` for CLAS and `group` for FUNC. On-prem only. |
 | `VERSION_SOURCE` | Source code at a specific revision. Pass `versionUri` from a VERSIONS response. Returns raw source text. On-prem only. |
 | `DESD` | CDS Logical External Schema — **server-driven object** (generic AFF read). Returns JSON: parsed `blue:blueSource` metadata (name, type, description, package, language, version, …) + the AFF JSON source. SAP_BASIS 8.16+ (ABAP Platform 2025), discovery-gated. |
@@ -151,7 +152,8 @@ SAPRead(type="DTEL", name="MANDT")               — data element metadata with 
 SAPRead(type="AUTH", name="BUKRS")               — authorization field metadata
 SAPRead(type="FEATURE_TOGGLE", name="ABC_TOGGLE")  — feature toggle states (FTG2 still works as deprecated alias)
 SAPRead(type="MSAG", name="SY")                    — message class (MESSAGES still works as deprecated alias)
-SAPRead(type="ENHO", name="ZMY_BADI_IMPL")       — enhancement implementation metadata
+SAPRead(type="ENHO", name="ZMY_BADI_IMPL")       — enhancement implementation + plug-in coding
+SAPRead(type="ENHS", name="ZMY_SPOT")            — enhancement spot metadata
 SAPRead(type="VERSIONS", name="ZARC1_TEST_REPORT") — list object revisions with revision URIs
 SAPRead(type="VERSIONS", name="ZCL_X", include="definitions") — list revisions for CLAS definitions include
 SAPRead(type="VERSION_SOURCE", versionUri="/sap/bc/adt/programs/programs/ZARC1_TEST_REPORT/source/main/versions/20260410185851/00000/content") — fetch source at one revision

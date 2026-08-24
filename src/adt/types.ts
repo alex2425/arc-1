@@ -1137,7 +1137,49 @@ export interface FeatureToggleInfo {
   }>;
 }
 
-/** Enhancement implementation metadata from /sap/bc/adt/enhancements/enhoxhb/{name} */
+/** An ADT object reference (uri/type/name) as it appears in enhancement payloads. */
+export interface EnhancementObjectRef {
+  name: string;
+  type: string;
+  uri: string;
+}
+
+/**
+ * One source-code plug-in of an enhancement implementation, as served by
+ * `{objectUri}/source/main/enhancements`. `source` is the decoded ABAP coding
+ * (the wire format is base64).
+ */
+export interface EnhancementSourcePlugin {
+  /** Enhancement-framework full name, e.g. `\PR:SAPFP51T\IC:RPTMOZ00\SE:END\EI`. */
+  fullName: string;
+  id: string;
+  /** `static` for a source plug-in bound at compile time. */
+  mode: string;
+  replacing: boolean;
+  uri: string;
+  /** Insertion point in the enhanced source: `{uri, line, column}` (0-based columns). */
+  position?: { uri: string; line?: number; column?: number };
+  /** Decoded ABAP source (ENHANCEMENT … ENDENHANCEMENT), when the feed carried one. */
+  source?: string;
+}
+
+/** One `<enh:enhancementImplementations>` entry of an object's enhancement feed. */
+export interface ObjectEnhancementImplementation {
+  name: string;
+  type: string;
+  version: string;
+  enhancedObject?: EnhancementObjectRef;
+  elements: EnhancementSourcePlugin[];
+}
+
+/** Parsed `{objectUri}/source/main/enhancements` feed — the enhancements bound to one object. */
+export interface ObjectEnhancementsResult {
+  objectUri: string;
+  context?: string;
+  implementations: ObjectEnhancementImplementation[];
+}
+
+/** Enhancement implementation metadata from /sap/bc/adt/enhancements/{enhoxh|enhoxhb}/{name} */
 export interface EnhancementImplementationInfo {
   name: string;
   description: string;
@@ -1153,6 +1195,41 @@ export interface EnhancementImplementationInfo {
     active: boolean;
     default: boolean;
   }>;
+  /** ADT URI the metadata was read from — the collection differs per release (enhoxh vs enhoxhb). */
+  uri?: string;
+  /** Object this enhancement is bound to (source plug-ins: the enhanced program/include). */
+  enhancedObject?: EnhancementObjectRef;
+  /** Main program of `enhancedObject` — the `context` an include read needs. */
+  mainObject?: EnhancementObjectRef;
+  /** Decoded coding of the enhancement's source plug-ins, when resolvable. */
+  sourceCodePlugins?: EnhancementSourcePlugin[];
+  /** Raw ADT XML — present when the structured parse did not recognize the payload. */
+  raw?: string;
+}
+
+/** One BAdI definition inside an enhancement spot. */
+export interface BadiDefinitionInfo {
+  name: string;
+  shortText: string;
+  /** Interface an implementing class must implement. */
+  interface: string;
+  singleUse: boolean;
+  useFallbackClass: boolean;
+  filters: Array<{ name: string; type: string; shortText: string }>;
+}
+
+/** Enhancement spot metadata from /sap/bc/adt/enhancements/{enhsxs|enhsxsb}/{name} */
+export interface EnhancementSpotInfo {
+  name: string;
+  description: string;
+  package: string;
+  technology: string;
+  /** ADT URI the metadata was read from. */
+  uri?: string;
+  /** BAdI definitions the spot declares, when the payload carries any. */
+  badiDefinitions?: BadiDefinitionInfo[];
+  /** Raw ADT XML — present when the structured parse did not recognize the payload. */
+  raw?: string;
 }
 
 // ─── Source Revision / Version History Types ─────────────────────

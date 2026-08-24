@@ -102,6 +102,8 @@ const SAPREAD_TYPE_TABLE = [
   { type: 'FEATURE_TOGGLE', btp: false },
   { type: 'FTG2', btp: false },
   { type: 'ENHO', btp: false },
+  // Enhancement spots (the definition side of ENHO) — classic on-prem enhancement framework.
+  { type: 'ENHS', btp: false },
   { type: 'VERSIONS', btp: false },
   { type: 'VERSION_SOURCE', btp: false },
   // Server-driven objects (ABAP Platform 2025 / SAP_BASIS 8.16+) — generic AFF read path,

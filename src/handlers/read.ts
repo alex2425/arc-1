@@ -5,6 +5,7 @@
 
 import type { AdtClient, SourceReadResult } from '../adt/client.js';
 import { decodeKtdText } from '../adt/ddic-xml.js';
+import { type EnhancementAnchor, parseEnhancementAnchors, resolveAnchorFeedTargets } from '../adt/enhancements.js';
 import { extractUnknownColumn, formatUnknownColumnHint, isNotFoundError } from '../adt/errors.js';
 import { mapSapReleaseToAbaplintVersion } from '../adt/features.js';
 import { type FmParameter, type FmParameterKind, parseFmSignature } from '../adt/fm-signature.js';
@@ -15,7 +16,12 @@ import {
   isServerDrivenObjectType,
   serverDrivenUnavailableMessage,
 } from '../adt/server-driven.js';
-import type { FunctionModuleProperties, InactiveObject } from '../adt/types.js';
+import type {
+  EnhancementImplementationInfo,
+  EnhancementSourcePlugin,
+  FunctionModuleProperties,
+  InactiveObject,
+} from '../adt/types.js';
 import { getAppInfo } from '../adt/ui5-repository.js';
 import { getVersionDiff } from '../adt/version-diff.js';
 import type { CachingLayer } from '../cache/caching-layer.js';
@@ -553,7 +559,11 @@ export async function handleSAPRead(
     }
     case 'ENHO': {
       const enhancement = await client.getEnhancementImplementation(name);
-      return textResult(toolJson(enhancement));
+      return textResult(toolJson(await withEnhancementSource(client, name, enhancement)));
+    }
+    case 'ENHS': {
+      const spot = await client.getEnhancementSpot(name);
+      return textResult(toolJson(spot));
     }
     case 'VERSIONS': {
       const include = typeof args.include === 'string' ? args.include : undefined;
@@ -783,9 +793,109 @@ export async function handleSAPRead(
     }
     default:
       return errorResult(
-        `Unknown SAPRead type: "${type}". Supported types: PROG, CLAS, INTF, FUNC, FUGR, INCL, DDLS, DCLS, DDLX, BDEF, SRVD, SRVB, SKTD, TABL, TTYP, VIEW, DOMA, DTEL, MSAG, AUTH, FEATURE_TOGGLE, ENHO, VERSIONS, VERSION_SOURCE, TRAN, TABLE_CONTENTS, DEVC, SOBJ, SYSTEM, COMPONENTS, TEXT_ELEMENTS, VARIANTS, BSP, BSP_DEPLOY, API_STATE, INACTIVE_OBJECTS. Deprecated aliases: MESSAGES (use MSAG), FTG2 (use FEATURE_TOGGLE). ` +
+        `Unknown SAPRead type: "${type}". Supported types: PROG, CLAS, INTF, FUNC, FUGR, INCL, DDLS, DCLS, DDLX, BDEF, SRVD, SRVB, SKTD, TABL, TTYP, VIEW, DOMA, DTEL, MSAG, AUTH, FEATURE_TOGGLE, ENHO, ENHS, VERSIONS, VERSION_SOURCE, TRAN, TABLE_CONTENTS, DEVC, SOBJ, SYSTEM, COMPONENTS, TEXT_ELEMENTS, VARIANTS, BSP, BSP_DEPLOY, API_STATE, INACTIVE_OBJECTS. Deprecated aliases: MESSAGES (use MSAG), FTG2 (use FEATURE_TOGGLE). ` +
           'Tip: Type aliases are auto-normalized (e.g., DDLS/DF → DDLS, DCLS/DL → DCLS, CLAS/OC → CLAS, PROG/P → PROG). ' +
           'Do not pass a URI — use the "type" and "name" parameters instead.',
       );
+  }
+}
+
+/**
+ * Attach the enhancement's actual ABAP coding, best effort.
+ *
+ * The ENHO object resource is metadata only — it has no `/source/main` (live-verified 404 on
+ * NW 7.50). A source plug-in's coding lives in the ENHANCED object's enhancement feed, so we
+ * follow the reference the metadata gives us, keep the entries belonging to this ENHO, and hand
+ * back their decoded source. Every failure here is non-fatal: metadata alone still answers
+ * "what is this enhancement?", and losing it because the coding lookup failed would be worse.
+ */
+async function withEnhancementSource(
+  client: AdtClient,
+  name: string,
+  info: EnhancementImplementationInfo,
+): Promise<EnhancementImplementationInfo & { anchors?: EnhancementAnchor[]; sourceHint?: string }> {
+  // 7.58+ names the enhanced object in the payload. 7.50 serves no usable payload at all, so the
+  // hook locations come from ENHINCINX — behind the same free-SQL gate as the TRAN program lookup.
+  const fromPayload = info.enhancedObject?.uri
+    ? [{ objectUri: info.enhancedObject.uri, context: info.mainObject?.uri }]
+    : [];
+  const anchors = fromPayload.length === 0 ? await resolveEnhancementAnchors(client, name) : [];
+  const targets =
+    fromPayload.length > 0
+      ? fromPayload
+      : await resolveAnchorFeedTargets(
+          {
+            getObjectStructure: (objectType, objectName) => client.getRepositoryObjectStructure(objectType, objectName),
+            resolveFunctionGroup: (fm) => client.resolveFunctionGroup(fm),
+          },
+          anchors,
+        );
+
+  const plugins: EnhancementSourcePlugin[] = [];
+  const wanted = (info.name || name).toUpperCase();
+  for (const target of targets) {
+    try {
+      // An include's feed is empty unless `context` names its MAIN program.
+      const feed = await client.getObjectEnhancements(target.objectUri, { context: target.context });
+      for (const impl of feed.implementations) {
+        if (impl.name && impl.name.toUpperCase() !== wanted) continue;
+        plugins.push(...impl.elements);
+      }
+    } catch (err) {
+      logger.debug('Enhancement source lookup failed', {
+        enhancement: name,
+        enhancedObject: target.objectUri,
+        error: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  const anchorInfo = anchors.length > 0 ? { anchors } : {};
+  if (plugins.length > 0) return { ...info, ...anchorInfo, sourceCodePlugins: plugins };
+  // No coding: say why, because "no sourceCodePlugins" alone is ambiguous.
+  return { ...info, ...anchorInfo, sourceHint: enhancementSourceHint(anchors, targets.length) };
+}
+
+/** Explain an empty coding result — the three reasons differ in what the caller should do next. */
+function enhancementSourceHint(anchors: EnhancementAnchor[], targetCount: number): string {
+  if (anchors.some((a) => a.kind === 'class')) {
+    return (
+      'This enhancement hooks into a class (see anchors[].fullName). ADT on this release serves no ' +
+      'reader for class-enhancement coding: eight enhancement-feed URL shapes for the class all ' +
+      'return an empty feed, and the per-plug-in resource ' +
+      '(/sap/bc/adt/enhancements/implementations/{enh}/elements/sourcecodeplugins/{fullName}) is not ' +
+      'GET-able at all — it 404s for class AND for program anchors whose coding ARC-1 does retrieve ' +
+      'by other means, so it is an editor-internal identifier, not an API. The coding itself lives in ' +
+      'the generated include {ENHANCEMENT}======EIMP (REPOSRC), which ADT refuses to serve (500) and ' +
+      'whose REPOSRC~DATA is compressed. Treat this as a platform limit: the anchors give the exact ' +
+      'sections/methods, the coding needs SE80/SE24 or the enhancement editor.'
+    );
+  }
+  if (targetCount === 0) {
+    return (
+      'The enhanced object could not be resolved: the ADT payload does not name it and the ENHINCINX ' +
+      'lookup is unavailable (needs SAP_ALLOW_FREE_SQL). BAdI implementations keep their logic in the ' +
+      'implementing class listed under badiImplementations.'
+    );
+  }
+  return 'The enhanced object was queried but its enhancement feed returned no plug-in for this implementation.';
+}
+
+/** Hook locations from ENHINCINX. Read-only, best effort, and only when free SQL is allowed. */
+async function resolveEnhancementAnchors(client: AdtClient, name: string): Promise<EnhancementAnchor[]> {
+  if (!isOperationAllowed(client.safety, OperationType.FreeSQL)) return [];
+  try {
+    const safeName = name.toUpperCase().replace(/[^A-Z0-9_/]/g, '');
+    const data = await client.runQuery(
+      `SELECT ENHNAME, PROGRAMNAME, ENHMODE, FULL_NAME FROM ENHINCINX WHERE ENHNAME = '${safeName}'`,
+      50,
+    );
+    return parseEnhancementAnchors(data.rows);
+  } catch (err) {
+    logger.debug('ENHINCINX anchor lookup failed', {
+      enhancement: name,
+      error: err instanceof Error ? err.message : String(err),
+    });
+    return [];
   }
 }
