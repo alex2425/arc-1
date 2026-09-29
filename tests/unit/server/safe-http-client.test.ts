@@ -91,7 +91,7 @@ describe('createSafeHttpClient — gated non-ADT writes (SAP_ALLOW_PLUGIN_RAW_WR
     const u = fakeUnderlying();
     const c = createSafeHttpClient(as(u), unrestrictedSafetyConfig(), 'Custom_W', 'write', true);
     await expect(c.post(ICF, 'payload', 'application/json')).resolves.toBeTruthy();
-    expect(u.post).toHaveBeenCalledWith(ICF, 'payload', 'application/json', undefined);
+    expect(u.post).toHaveBeenCalledWith(ICF, 'payload', 'application/json', undefined, { retryTransientErrors: false });
   });
 
   it('gates PUT and DELETE the same way (allowed to non-ADT when all gates pass)', async () => {
@@ -140,7 +140,9 @@ describe('createPluginRunOps.classRun (gated code execution)', () => {
     const u = fakeUnderlying();
     const run = createPluginRunOps(as(u), unrestrictedSafetyConfig(), true, 'write', 'Custom_Run');
     await expect(run.classRun('ZCL_ARC1_RUN_DEMO')).resolves.toBe('console output');
-    expect(u.post).toHaveBeenCalledWith('/sap/bc/adt/oo/classrun/zcl_arc1_run_demo');
+    expect(u.post).toHaveBeenCalledWith('/sap/bc/adt/oo/classrun/zcl_arc1_run_demo', undefined, undefined, undefined, {
+      retryTransientErrors: false,
+    });
   });
 });
 
@@ -179,7 +181,13 @@ describe('createPluginRunOps.programRun (gated report execution)', () => {
     const u = fakeUnderlying();
     const run = createPluginRunOps(as(u), unrestrictedSafetyConfig(), true, 'write', 'Custom_Run');
     await expect(run.programRun('/ACME/Z_REPORT$1')).resolves.toBe('console output');
-    expect(u.post).toHaveBeenCalledWith('/sap/bc/adt/programs/programrun/%2Facme%2Fz_report%241');
+    expect(u.post).toHaveBeenCalledWith(
+      '/sap/bc/adt/programs/programrun/%2Facme%2Fz_report%241',
+      undefined,
+      undefined,
+      undefined,
+      { retryTransientErrors: false },
+    );
   });
 });
 
