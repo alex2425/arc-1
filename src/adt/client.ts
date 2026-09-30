@@ -596,8 +596,8 @@ export class AdtClient {
    *
    * Bounded for safety: a `seen` set (cycle + dedup guard), a depth cap, and a total-block
    * cap so a pathological include graph can't blow up the response. Comment-only INCLUDE
-   * lines (leading `*`) are skipped. Each block that fails to read carries a placeholder.
-   * `truncated` is true if the block cap was hit.
+   * lines (leading `*`) are skipped. A block that fails to read is a placeholder, `unreadable`.
+   * `truncated` is true if either cap leaves an unseen include unread.
    *
    * Note: dynpros (screens) and GUI status (CUA) are NOT included — ADT does not expose
    * those over REST (they are SAPGUI/SE51/SE41-only; the endpoints return 404). This
@@ -606,12 +606,12 @@ export class AdtClient {
   async getFunctionGroupExpanded(
     name: string,
     opts?: SourceReadOptions,
-  ): Promise<{ blocks: Array<{ name: string; source: string }>; truncated: boolean }> {
+  ): Promise<{ blocks: Array<{ name: string; source: string; unreadable?: true }>; truncated: boolean }> {
     checkOperation(this.safety, OperationType.Read, 'GetFunctionGroupExpanded');
     const MAX_BLOCKS = 80;
     const MAX_DEPTH = 5;
     const seen = new Set<string>();
-    const blocks: Array<{ name: string; source: string }> = [];
+    const blocks: Array<{ name: string; source: string; unreadable?: true }> = [];
     let truncated = false;
 
     const { source: mainSource } = await this.getFunctionGroupSource(name, opts);
@@ -631,11 +631,10 @@ export class AdtClient {
     while (frontier.length > 0 && !truncated) {
       const next: Array<{ src: string; depth: number }> = [];
       for (const { src, depth } of frontier) {
-        if (depth >= MAX_DEPTH) continue;
         for (const incRaw of findIncludes(src)) {
           const key = incRaw.toLowerCase();
           if (seen.has(key)) continue;
-          if (blocks.length >= MAX_BLOCKS) {
+          if (depth >= MAX_DEPTH || blocks.length >= MAX_BLOCKS) {
             truncated = true;
             break;
           }
@@ -645,7 +644,7 @@ export class AdtClient {
             blocks.push({ name: incRaw, source: incSource });
             next.push({ src: incSource, depth: depth + 1 });
           } catch {
-            blocks.push({ name: incRaw, source: `[Could not read include "${incRaw}"]` });
+            blocks.push({ name: incRaw, source: `[Could not read include "${incRaw}"]`, unreadable: true });
           }
         }
         if (truncated) break;
