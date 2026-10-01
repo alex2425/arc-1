@@ -16,6 +16,7 @@
  */
 
 import { parseReleaseNumber, STATEFUL_SESSION_MIN_RELEASE } from './release.js';
+import { decodeXmlEntities } from './xml-entities.js';
 
 /** Base error for all ADT-related errors */
 export class AdtError extends Error {
@@ -106,20 +107,27 @@ export class AdtApiError extends AdtError {
    */
   resourceExistenceAfterDelete?: 'exists' | 'absent' | 'unknown';
 
+  /** The handler withheld unsafe diagnostics; generic cause/retry advice cannot be inferred. */
+  diagnosticsOmitted?: boolean;
+
   constructor(
     message: string,
     public readonly statusCode: number,
     public readonly path: string,
     public readonly responseBody?: string,
+    options: { plainText?: boolean } = {},
   ) {
-    // Extract a human-readable message, stripping raw XML/HTML — but only from a raw SAP body. A
-    // composed message is plain text, and its "<" (a "<id>" placeholder, SAP text like "<ZFOO_TOP>")
-    // must survive the tag stripper.
+    // Extract a human-readable message, stripping raw XML/HTML — but only from a raw SAP body.
     // Try the truncated message first; if that only yields a generic title (e.g., "Application Server Error"),
     // retry with the full responseBody which may contain deeper error details (e.g., <span id="msgText">).
-    const isMarkup = /^\s*</.test(message);
-    let clean = isMarkup ? AdtApiError.extractCleanMessage(message) : message.slice(0, 300) || 'Unknown error';
-    if (responseBody && responseBody.length > message.length && /^Application Server Error/.test(clean)) {
+    let clean = options.plainText ? message : AdtApiError.extractCleanMessage(message);
+    if (
+      !options.plainText &&
+      responseBody &&
+      responseBody.length > message.length &&
+      responseBody.startsWith(message) &&
+      /^Application Server Error/.test(clean)
+    ) {
       const deepClean = AdtApiError.extractCleanMessage(responseBody);
       if (deepClean !== clean) clean = deepClean;
     }
@@ -132,18 +140,28 @@ export class AdtApiError extends AdtError {
    *
    * SAP ADT returns errors as XML like:
    *   <exc:exception ...><exc:localizedMessage lang="EN">...</exc:localizedMessage></exc:exception>
-   * or HTML error pages. We extract the meaningful text and discard the markup.
+   * or HTML error pages. We extract the meaningful text and discard the markup; the text is
+   * entity-decoded once, as it leaves the markup.
    */
   static extractCleanMessage(raw: string): string {
     if (!raw || raw.length === 0) return 'Unknown error';
 
-    // 1. Try XML: extract <localizedMessage> or <message> content
+    // 1. Not a markup document, so plain text — use as-is (truncated). A composed message keeps its "<"
+    //    (a "<id>" placeholder, SAP text like "<ZFOO_TOP>"), and so does text already extracted from a
+    //    body: scanning those again would eat the literal `<x>` and decode a second time.
+    //    Callers rewrapping extracted text can explicitly set the constructor's plainText option.
+    // Independent scans avoid rescanning the tail for every HTML opener in malformed SAP text.
+    if (!/^\s*</.test(raw) && !(/<html[\s>]/i.test(raw) && /<\/html\s*>/i.test(raw))) {
+      return raw.slice(0, 300);
+    }
+
+    // 2. Try XML: extract <localizedMessage> or <message> content
     const xmlMessage = findFirstElementText(raw, ['localizedMessage', 'message']);
     if (xmlMessage) {
       return xmlMessage;
     }
 
-    // 2. Try HTML: extract SAP's error detail from <span id="msgText"> or <p class="detailText">
+    // 3. Try HTML: extract SAP's error detail from <span id="msgText"> or <p class="detailText">
     //    SAP 500 pages embed the actual error (e.g., "Syntax error in program ...") in these elements.
     const detail =
       findFirstElementText(raw, ['span'], { id: 'msgText' }) ??
@@ -154,19 +172,14 @@ export class AdtApiError extends AdtError {
       return title && title !== detail ? `${title}: ${detail}` : detail;
     }
 
-    // 3. Try HTML: extract <title> or <h1> content
+    // 4. Try HTML: extract <title> or <h1> content
     const htmlMessage = findFirstElementText(raw, ['title', 'h1']);
     if (htmlMessage) {
       return htmlMessage;
     }
 
-    // 4. If no XML/HTML tags at all, it's plain text — use as-is (truncated)
-    if (!raw.includes('<')) {
-      return raw.slice(0, 300);
-    }
-
     // 5. Fallback: strip all tags and use whatever text remains
-    const stripped = stripTagsAndCollapseWhitespace(raw);
+    const stripped = decodeXmlEntities(stripTagsAndCollapseWhitespace(raw));
     return stripped.length > 0 ? stripped.slice(0, 300) : 'SAP returned an error (no readable message)';
   }
 
@@ -224,14 +237,18 @@ export class AdtApiError extends AdtError {
    * Properties often contain line numbers, message IDs, and other diagnostic detail.
    */
   static extractProperties(xml: string): Record<string, string> {
-    if (!xml) return {};
-    const props: Record<string, string> = {};
+    return Object.fromEntries(AdtApiError.extractPropertyEntries(xml));
+  }
+
+  /** Preserve repeated properties when inspecting diagnostic confidentiality. */
+  static extractPropertyEntries(xml: string): Array<[string, string]> {
+    const entries: Array<[string, string]> = [];
     for (const entry of findElements(xml, ['entry'])) {
       const key = entry.attributes.key?.trim();
       const value = entry.text.trim();
-      if (key && value) props[key] = value;
+      if (key && value) entries.push([key, value]);
     }
-    return props;
+    return entries;
   }
 
   /**
@@ -246,7 +263,7 @@ export class AdtApiError extends AdtError {
     const props = AdtApiError.extractProperties(xml);
     const localizedMessages = findElementTexts(xml, ['localizedMessage']);
 
-    const messageId = props['T100KEY-MSGID'];
+    const messageId = props['T100KEY-MSGID'] ?? props['T100KEY-ID'];
     const messageNumber = props['T100KEY-MSGNO'] ?? props['T100KEY-NO'];
     const variables = [props['T100KEY-V1'], props['T100KEY-V2'], props['T100KEY-V3'], props['T100KEY-V4']].filter(
       (value): value is string => Boolean(value),
@@ -318,6 +335,7 @@ export class AdtApiError extends AdtError {
   }
 }
 
+/** An element whose content is plain text. `text` and the attribute values are entity-decoded. */
 interface DirectTextElement {
   name: string;
   attributes: Record<string, string>;
@@ -358,13 +376,19 @@ function findElements(
     const startTag = parseStartTag(input, lt, gt);
     cursor = gt + 1;
     if (!startTag || startTag.selfClosing || !names.includes(startTag.name)) continue;
-    if (!attributesMatch(startTag.attributes, requiredAttributes)) continue;
 
     const nextTag = input.indexOf('<', cursor);
     if (nextTag < 0 || input[nextTag + 1] !== '/') continue;
 
     const text = input.slice(cursor, nextTag).trim();
-    if (text) out.push({ name: startTag.name, attributes: startTag.attributes, text });
+    if (!text) continue;
+
+    // The one decode for SAP error bodies: they never pass through `parseXml`, so every caller
+    // gets text here and must not decode it again.
+    const attributes: Record<string, string> = {};
+    for (const [key, value] of Object.entries(startTag.attributes)) attributes[key] = decodeXmlEntities(value);
+    if (!attributesMatch(attributes, requiredAttributes)) continue;
+    out.push({ name: startTag.name, attributes, text: decodeXmlEntities(text) });
   }
 
   return out;
@@ -962,7 +986,7 @@ export function classifyAbapgitError(xmlBody: string): AbapGitErrorClassificatio
     xmlBody.match(/<(?:\w+:)?namespace[^>]*>([^<]+)</i)?.[1];
   const message = AdtApiError.extractCleanMessage(xmlBody);
   const props = AdtApiError.extractProperties(xmlBody);
-  const msgId = props['T100KEY-MSGID'];
+  const msgId = props['T100KEY-MSGID'] ?? props['T100KEY-ID'];
   const msgNo = props['T100KEY-MSGNO'] ?? props['T100KEY-NO'];
   const t100Key = msgId || msgNo ? `${msgId ?? '?'}/${msgNo ?? '?'}` : undefined;
 
