@@ -49,6 +49,13 @@ const cases = [
     xml: fixture('lockobject-emekkoe.xml'),
     patch: { source: '{"allowRFC":true}' },
   },
+  {
+    type: 'TTYP',
+    name: 'STRINGTAB',
+    path: '/ddic/tabletypes/STRINGTAB',
+    xml: fixture('tabletype-stringtab.xml'),
+    patch: { rowType: 'STRING' },
+  },
 ];
 
 function sap(
@@ -247,5 +254,101 @@ describe('metadata updates preserve edits committed before the lock', () => {
     expect(result.isError, JSON.stringify(result)).toBeUndefined();
     expect(result.content[0]!.text).toContain('Dry run');
     expect(calls.some((c) => c.url.includes('_action=LOCK') || c.method === 'PUT')).toBe(false);
+  });
+
+  describe('TTYP', () => {
+    const ttyp = cases.find((row) => row.type === 'TTYP')!;
+    const update = (args: Record<string, unknown>) =>
+      handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPWrite', {
+        action: 'update',
+        type: 'TTYP',
+        name: ttyp.name,
+        ...args,
+      });
+    const putBody = (calls: ReturnType<typeof sap>) => calls.find((c) => c.method === 'PUT')?.body;
+    // Row types and definitions as SAP_BASIS 758 returns them (docs/research/abap-types/types/ttyp.md).
+    const stringRow = '<ttyp:dataType>STRING</ttyp:dataType><ttyp:length>000000</ttyp:length>';
+    const int4Row = '<ttyp:dataType>INT4</ttyp:dataType><ttyp:length>000010</ttyp:length>';
+    const builtIn = '<ttyp:typeKind>predefinedAbapType</ttyp:typeKind><ttyp:typeName/><ttyp:builtInType>';
+    const int4Table = { ...ttyp, xml: ttyp.xml.replace(stringRow, int4Row) };
+    const refTable = {
+      ...ttyp,
+      xml: ttyp.xml.replace(
+        `${builtIn}<ttyp:dataType>STRING</ttyp:dataType>`,
+        '<ttyp:typeKind>refToClassOrInterfaceType</ttyp:typeKind><ttyp:typeName>OBJECT</ttyp:typeName><ttyp:builtInType><ttyp:dataType/>',
+      ),
+    };
+    const hashedTable = { ...ttyp, xml: ttyp.xml.replace('<ttyp:accessType>standard<', '<ttyp:accessType>hashed<') };
+
+    it('writes the stored description back escaped exactly once when only rowType is given', async () => {
+      // SAP sends stored text entity-encoded; re-escaping it undecoded would PUT "R&amp;amp;D".
+      const stored = 'R&amp;D &lt;Orders&gt; &quot;x&quot; literal &amp;lt;';
+      const calls = sap(ttyp, undefined, stored);
+      const result = await update({ rowType: 'STRING' });
+      expect(result.isError, JSON.stringify(result)).toBeUndefined();
+      expect(putBody(calls)).toContain(`adtcore:description="${stored}"`);
+    });
+
+    // A packed row (DEC 15,2): decimals are part of the stored row type, like the length.
+    it('a description-only update keeps stored decimals', async () => {
+      const decRow =
+        '<ttyp:dataType>DEC</ttyp:dataType><ttyp:length>000015</ttyp:length><ttyp:decimals>000002</ttyp:decimals>';
+      const calls = sap({
+        ...ttyp,
+        xml: ttyp.xml.replace(`${stringRow}<ttyp:decimals>000000</ttyp:decimals>`, decRow),
+      });
+      expect((await update({ description: 'New text' })).isError).toBeUndefined();
+      expect(putBody(calls)).toContain(builtIn + decRow);
+    });
+
+    it('an explicit rowTypeKind wins over the stored kind', async () => {
+      const calls = sap(int4Table);
+      expect((await update({ rowType: 'INT4', rowTypeKind: 'structure' })).isError).toBeUndefined();
+      expect(putBody(calls)).toContain(
+        '<ttyp:typeKind>dictionaryType</ttyp:typeKind><ttyp:typeName>INT4</ttyp:typeName>',
+      );
+    });
+
+    // INT4 is SAP's name for a built-in that ARC-1 does not auto-detect, and its length is part of the row type.
+    it.each([
+      ['a description-only update keeps the stored row type', { description: 'New text' }, 'New text', int4Row],
+      ['a restated row type keeps its stored kind and length', { rowType: 'int4' }, 'Colleague description', int4Row],
+      ['a new row type takes neither', { rowType: 'STRING' }, 'Colleague description', stringRow],
+    ])('%s', async (_title, args, description, row) => {
+      const calls = sap(int4Table);
+      const result = await update(args);
+      expect(result.isError, JSON.stringify(result)).toBeUndefined();
+      expect(putBody(calls)).toContain(`adtcore:description="${description}"`);
+      expect(putBody(calls)).toContain(builtIn + row);
+    });
+
+    it.each([
+      ['a ref row type', refTable, 'its refToClassOrInterfaceType row type'],
+      ['a hashed table', hashedTable, 'its access type, keys or initial row count'],
+    ])('rewrites %s only when rowType is given', async (_label, table, lost) => {
+      const calls = sap(table);
+      const refused = await update({ description: 'New text' });
+      expect(refused.isError).toBe(true);
+      expect(refused.content[0]!.text).toContain(`without "rowType"`);
+      expect(refused.content[0]!.text).toContain(`cannot keep ${lost}`);
+      expect(putBody(calls)).toBeUndefined();
+      expect(calls.some((c) => c.url.includes('_action=UNLOCK'))).toBe(true);
+      const replaced = await update({ rowType: 'BAPIRET2' });
+      expect(replaced.isError, JSON.stringify(replaced)).toBeUndefined();
+      expect(putBody(calls)).toContain('<ttyp:typeName>BAPIRET2</ttyp:typeName>');
+    });
+
+    it.each([
+      ['explains an unreadable shape', { ...ttyp, xml: '<tableType/>' }, undefined, /could not read .*\(Invalid TTYP/],
+      ['reports a failed read as SAP returned it', ttyp, 'read', /status 400/],
+    ] as const)('%s and writes nothing', async (_title, table, failure, message) => {
+      const calls = sap(table, failure);
+      const result = await update({ rowType: 'STRING', description: 'New text' });
+      expect(result.isError).toBe(true);
+      expect(result.content[0]!.text).toMatch(message);
+      expect(result.content[0]!.text.includes('will not overwrite it blind')).toBe(failure === undefined);
+      expect(putBody(calls)).toBeUndefined();
+      expect(calls.some((c) => c.url.includes('_action=UNLOCK'))).toBe(true);
+    });
   });
 });
