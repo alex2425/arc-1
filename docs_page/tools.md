@@ -980,6 +980,7 @@ Moves a method's METHODS clause from its current visibility section to a target 
 
 - Interface method redefinitions must remain public; protected/private moves are refused before saving.
 - Idempotent: if the method is already in the target section, it's a no-op (no write).
+- Methods SAP marks as `REDEFINITION` must retain their inherited visibility; moving them is refused before saving, even with `lintBeforeWrite=false`. If an existing draft has the wrong section, check the superclass declaration and repair the definition with `edit_class_definition`.
 - The target section header must already exist; if not, ARC-1 refuses with a hint to add it via `edit_class_definition` first.
 
 ```jsonc
