@@ -1,5 +1,21 @@
 # Updating ARC-1
 
+## v1.5.0 — upgrade checks
+
+Start with the [1.5.0 upgrade checklist](release-notes.md#150-upgrade-checklist).
+No new server setting is required; refresh your MCP client's tool list after upgrading.
+
+### v1.5.0 — XML text and cached summaries
+
+ARC-1 now decodes SAP XML entities once. If your extension decodes values already parsed by ARC-1,
+remove that extra decoding; raw XML handled by your own code is unaffected. Text previously saved
+in SAP as a literal `&amp;` is not repaired automatically—update it once with the intended text.
+
+With `ARC1_CACHE=sqlite`, an existing SRVB summary may retain encoded text until its ETag changes.
+For an immediate refresh, stop every ARC-1 process sharing the cache, remove the cache file, then
+restart. Use `ARC1_CACHE_FILE`, or `.arc1-cache.db` in the process working directory by default.
+This clears the local cache, not SAP source; it is unnecessary if you do not see stale summaries.
+
 <a id="xsuaa-callback-hardening"></a>
 
 ## v1.4.0 — XSUAA callback hardening
@@ -188,7 +204,7 @@ See the full [Authorization & Roles](authorization.md) doc for the complete mode
 ## Before you update
 
 1. **Check what changed** — start with the annotated [Release Notes](release-notes.md): every release with its impact and the action it needs (usually none). The raw [CHANGELOG.md](https://github.com/arc-mcp/arc-1/blob/main/CHANGELOG.md) and the [Releases page](https://github.com/arc-mcp/arc-1/releases) list every merged PR.
-2. **Pin to a version** — in production, use exact version tags (for example `:1.4.0`), never `:latest`. Prevents surprise upgrades. <!-- x-release-please-version -->
+2. **Pin to a version** — in production, use exact version tags (for example `:1.5.0`), never `:latest`. Prevents surprise upgrades. <!-- x-release-please-version -->
 3. **Test first** — update a dev/staging instance before production. Verify MCP clients still connect and tools work as expected.
 4. **Read the startup auth line after upgrade** — a drift-free instance will log the same `auth: MCP=[...] SAP=[...]` summary before and after. If it's different, the upgrade changed something you didn't expect.
 
@@ -204,10 +220,10 @@ See the full [Authorization & Roles](authorization.md) doc for the complete mode
 npx arc-1@latest
 
 # Pinned
-npx arc-1@1.4.0
+npx arc-1@1.5.0
 
 # Global install
-npm install -g arc-1@1.4.0
+npm install -g arc-1@1.5.0
 ```
 <!-- x-release-please-end -->
 
@@ -221,7 +237,7 @@ If you pin in MCP client config, update the `args`:
 
 <!-- x-release-please-start-version -->
 ```json
-{ "command": "npx", "args": ["-y", "arc-1@1.4.0"] }
+{ "command": "npx", "args": ["-y", "arc-1@1.5.0"] }
 ```
 <!-- x-release-please-end -->
 
@@ -232,7 +248,7 @@ If you pin in MCP client config, update the `args`:
 <!-- x-release-please-start-version -->
 ```bash
 # 1. Pull the new image
-docker pull ghcr.io/arc-mcp/arc-1:1.4.0
+docker pull ghcr.io/arc-mcp/arc-1:1.5.0
 
 # 2. Stop & remove the running container
 docker stop arc1 && docker rm arc1
@@ -240,7 +256,7 @@ docker stop arc1 && docker rm arc1
 # 3. Start with the new image (same env vars / config)
 docker run -d --name arc1 -p 8080:8080 \
   --env-file .env \
-  ghcr.io/arc-mcp/arc-1:1.4.0
+  ghcr.io/arc-mcp/arc-1:1.5.0
 
 # 4. Verify
 docker logs arc1 | head -20
