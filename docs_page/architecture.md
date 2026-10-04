@@ -269,7 +269,8 @@ flowchart TD
 
 API-key and OIDC mode expect the client to send `Authorization: Bearer ...` to
 `/mcp`. XSUAA mode additionally exposes MCP OAuth endpoints through the SDK auth
-router, including protected-resource metadata for `/mcp`.
+router, including protected-resource metadata for `/mcp`. With `SAP_XSUAA_AUTH=true`,
+startup is also refused when the XSUAA binding cannot be loaded.
 
 ### SAP identity modes
 
