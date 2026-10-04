@@ -128,6 +128,12 @@ With an active list, one logical request is decided exactly once:
 - IN-list chunking does **not** re-decide: the union of all chunks is authorized once and the
   already-authorized statements are then executed.
 
+Classic CDS views, CDS view entities (including root entities), and transactional projection views
+share the same lineage checks. Their graph must identify the requested source and expand to proven
+terminal tables. A childless view, or one SAP reports without a database object (such as a transient
+analytical query), is denied. SAP's SQL restrictions still apply after the policy permits a query.
+CDS view-entity **replacement objects** remain a separate, unsupported catalog-mapping case.
+
 ### Failure codes
 
 | Code | Meaning |
@@ -157,6 +163,8 @@ While the list is active, these are refused rather than guessed at:
 
 Joins, unions, nested subqueries, CTEs, parameterized CDS roots, hierarchy sources and aggregates
 **are** supported.
+This describes caller SQL parsing, not every CDS graph shape: CDS definitions using set operations
+can contain structural `SELECT` nodes and currently fail closed ([COMPAT-10](roadmap.md#compat-10)).
 
 ### Impact on ARC-1's own features
 
@@ -222,6 +230,11 @@ the entity used as the SQL entry point, not inherited from wrapped entities. It 
 remediate **SAP Note 3772411**: a default-off feature fixes nothing, and `SAP_ALLOW_WRITES=false` does
 not neutralize a database-side mutation reached through a vulnerable SQL Console host expression.
 Patch or apply SAP's workaround independently.
+
+The SAP dependency graph can omit implicit customizing-table reads inside CDS currency/unit
+conversion functions. Those dependencies are not checked by this policy, in both classic CDS and
+view entities; see [SEC-18](roadmap.md#sec-18). Do not treat the graph as a complete account of every
+table the database may read.
 
 ### Seeing the effective policy
 
@@ -495,7 +508,7 @@ Then assign role collections in BTP Cockpit. The server says what the instance c
 | Table preview blocked after `SAP_ALLOW_DATA_PREVIEW=true` | User lacks `data` scope | Grant `data`; `sql` also implies `data` |
 | Package allowlist seems ignored for reads | ARC-1 package allowlist is write-only | Enforce read restrictions in SAP roles |
 | `DATA_SOURCE_BLOCKED` | A direct or transitive table/CDS alias matches the experimental list | Use a permitted source, or remove the exact entry only after security review |
-| `DATA_SOURCE_UNRESOLVED` | Strict SQL or live lineage analysis could not prove the request safe | Use one supported static source/`TABLE_QUERY`; inspect the reported reason and dependency path |
+| `DATA_SQL_UNSUPPORTED` / `DATA_LINEAGE_UNRESOLVED` | Strict SQL or live lineage analysis could not prove the request safe | Use one supported static source/`TABLE_QUERY`; inspect the reported reason and dependency path |
 | Action is hidden from tool list | User scope, server flag, backend feature, or `SAP_DENY_ACTIONS` pruned it | Run `arc1 config show` and check startup feature logs |
 
 ---
@@ -514,7 +527,7 @@ Then assign role collections in BTP Cockpit. The server says what the instance c
 | `allowGitWrites=false` | Server ceiling | Set `SAP_ALLOW_GIT_WRITES=true` and `SAP_ALLOW_WRITES=true` |
 | `allowDataPreview=false` | Server ceiling | Set `SAP_ALLOW_DATA_PREVIEW=true` |
 | `allowFreeSQL=false` | Server ceiling | Set `SAP_ALLOW_FREE_SQL=true` |
-| `DATA_SOURCE_BLOCKED` / `DATA_SOURCE_UNRESOLVED` | Experimental source policy | Follow the returned path/reason; do not disable the list merely to make an unsupported query run |
+| `DATA_SOURCE_BLOCKED` / `DATA_SQL_UNSUPPORTED` / `DATA_LINEAGE_UNRESOLVED` / `DATA_POLICY_UNAVAILABLE` | Experimental source policy | Follow the returned path/reason; do not disable the list merely to make an unsupported query run |
 | `Operations on package ... are blocked` | Server/profile safety | Adjust `SAP_ALLOWED_PACKAGES` or API-key profile choice |
 | `denied by server policy (SAP_DENY_ACTIONS)` | Deny list | Remove or narrow the deny pattern |
 | `No authorization for object ...` / SAP 403 | SAP authorization | Fix SAP user roles / PFCG / package auth |
