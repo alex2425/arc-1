@@ -1124,7 +1124,7 @@ The existing actions below are unchanged.
 | `objectType` | string | No | For `references`: keep only results of this ADT type, slash format (`CLAS/OC`, `PROG/P`, `FUGR/FF`). A bare prefix (`CLAS`) matches every subtype. Applied client-side. |
 | `maxResults` | number | No | For `references`: max entries (default 100, max 1000). `total` counts every match of the filter. |
 | `line` | number | No | Line number (1-based) |
-| `column` | number | No | Column number (1-based) |
+| `column` | number | No | ADT cursor column (0-based integer) |
 | `source` | string | No | Current source code |
 
 **Experimental relations parameters (when available):**
@@ -1171,13 +1171,23 @@ not enumerate subclasses or prove a complete inheritance/implementation list.
 
 **Examples:**
 ```
-SAPNavigate(action="definition", uri="/sap/bc/adt/programs/programs/ztest", line=10, column=5)
+SAPNavigate(action="definition", uri="/sap/bc/adt/programs/programs/ztest/source/main", line=10, column=5, source="...")
 SAPNavigate(action="references", uri="/sap/bc/adt/oo/classes/zcl_order")
 SAPNavigate(action="references", type="CLAS", name="ZCL_ORDER")
 SAPNavigate(action="references", type="CLAS", name="ZCL_ORDER", objectType="PROG/P")
 SAPNavigate(action="completion", uri="/sap/bc/adt/programs/programs/ztest", line=10, column=15, source="...")
 SAPNavigate(action="hierarchy", name="ZCL_ORDER")
 ```
+
+For `definition`, pass the source URI and current source text, with integer ADT cursor coordinates:
+line starts at 1, column at 0. Place the cursor on the identifier. Returned target coordinates use
+the same convention. Object metadata URIs and `type`+`name` are insufficient.
+The source can contain unsaved changes; ARC-1 does not replace it with a backend read. A returned
+target URI may include a cursor fragment; an explicit new line/column replaces that fragment.
+
+`completion` currently fails on SAP_BASIS 750 and 758 because its request and response handling do
+not match ADT. See [FEAT-80](roadmap.md#feat-80) for the separate repair; this definition fix does not
+restore completion.
 
 ---
 
