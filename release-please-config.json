@@ -6,7 +6,7 @@
       "extra-files": [
         {
           "type": "generic",
-          "path": "src/server/server.ts",
+          "path": "src/version.ts",
           "glob": false
         },
         {
@@ -42,6 +42,16 @@
         {
           "type": "json",
           "path": ".claude-plugin/plugin.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": ".cursor-plugin/plugin.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "plugin.json",
           "jsonpath": "$.version"
         }
       ],

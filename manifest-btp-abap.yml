@@ -9,7 +9,8 @@
 #   1. BTP ABAP Environment instance provisioned
 #   2. Service key created only to populate the destination OAuth settings
 #   3. Destination service instance: cf create-service destination lite arc1-destination
-#   4. XSUAA service instance: cf create-service xsuaa application arc1-xsuaa -c xs-security.json
+#   4. XSUAA service instance: create it with the route-specific
+#      xs-security.landscape.json from docs_page/xsuaa-setup.md (not the raw template)
 #
 # Create a destination named ABAP_PP with:
 #   Type=HTTP, ProxyType=Internet, Authentication=OAuth2UserTokenExchange,
@@ -43,6 +44,7 @@ applications:
       SAP_ALLOW_WRITES: "true"
       SAP_ALLOW_DATA_PREVIEW: "false"
       SAP_ALLOW_FREE_SQL: "true"
+      SAP_BLOCKED_DATA_SOURCES: ""
       SAP_ALLOW_TRANSPORT_WRITES: "true"
       SAP_ALLOW_GIT_WRITES: "false"
       # Experimental read-only UI. Keep disabled unless explicitly testing it.

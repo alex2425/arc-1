@@ -24,7 +24,7 @@ Protect your centralized arc1 MCP server with API keys. This is the simplest way
 ### 1. Generate an API Key
 
 ```bash
-# Generate a random 32-character API key
+# Generate 32 random bytes, encoded as Base64
 openssl rand -base64 32
 # Example output: K7mQ3xR9vL2pN8wY5tJ6hB4cF1gD0eA=
 ```
@@ -61,6 +61,9 @@ curl -s -o /dev/null -w "%{http_code}" http://localhost:8080/mcp
 # Should return 200 (with key)
 curl -s -o /dev/null -w "%{http_code}" \
   -H "Authorization: Bearer K7mQ3xR9vL2pN8wY5tJ6hB4cF1gD0eA=" \
+  -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
+  -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
   http://localhost:8080/mcp
 
 # Health check (no auth required)
@@ -111,10 +114,14 @@ Profiles are fixed names built into ARC-1. `ARC1_API_KEYS` selects one profile p
 | Key | Profile | Can Do | Cannot Do |
 |-----|---------|--------|-----------|
 | `$VIEWER_KEY` | `viewer` | Read source, search, navigate, lint, diagnose | Write, data preview, SQL, transports, git |
-| `$DEV_KEY` | `developer` | All of viewer + write source in `$TMP` + transport mutations + git mutations if server flags allow them | Data preview, freestyle SQL, writes outside `$TMP` |
+| `$DEV_KEY` | `developer` | All of viewer + write source in `$TMP` + transport mutations + gated abapGit workflows/egress if server flags allow them | Data preview, freestyle SQL, writes outside `$TMP`; gCTS mutations remain quarantined |
 | `$SQL_KEY` | `developer-sql` | All of developer + data preview + freestyle SQL | Writes outside `$TMP` (server ceiling still applies) |
 
 Important: `developer`, `developer-data`, and `developer-sql` API-key profiles are intentionally capped to `$TMP`. There is no `developer-z` profile and no `key:developer:Z*` syntax. If a key must write to `Z*` packages, use a tightly scoped `admin` key with `SAP_ALLOWED_PACKAGES='Z*,$TMP'`, or use OIDC/XSUAA for per-user authorization.
+
+Some accepted abapGit push/branch operations return error/incomplete because the bridge exposes no
+authoritative postcondition. Inspect repository/remote state before retrying; an API-key profile does
+not weaken that fail-closed contract.
 
 ### 3. Test Per-Key Access
 
@@ -122,12 +129,14 @@ Important: `developer`, `developer-data`, and `developer-sql` API-key profiles a
 # Viewer key — should succeed for read operations
 curl -X POST -H "Authorization: Bearer $VIEWER_KEY" \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
   http://localhost:8080/mcp
 
 # Developer key — should show additional tools (SAPWrite, SAPActivate, etc.)
 curl -X POST -H "Authorization: Bearer $DEV_KEY" \
   -H "Content-Type: application/json" \
+  -H "Accept: application/json, text/event-stream" \
   -d '{"jsonrpc":"2.0","method":"tools/list","id":1}' \
   http://localhost:8080/mcp
 ```
@@ -150,7 +159,7 @@ Each profile also carries a partial SafetyConfig that intersects with the server
 
 ### VS Code / Cursor
 
-In `.vscode/mcp.json` or Cursor MCP settings:
+In VS Code `.vscode/mcp.json` (`servers`). Cursor uses `.cursor/mcp.json` with `mcpServers` instead:
 
 ```json
 {
@@ -168,8 +177,8 @@ In `.vscode/mcp.json` or Cursor MCP settings:
 
 ### Copilot Studio
 
-1. Go to **Settings** → **Connectors** → **MCP Servers**
-2. Click **Add MCP Server**
+1. Open your agent’s **Tools → Add a tool → New tool → Model Context Protocol** (see [Microsoft’s current wizard](https://learn.microsoft.com/en-us/microsoft-copilot-studio/mcp-add-existing-server-to-agent)).
+2. Enter a server name and description
 3. URL: `https://arc1.company.com/mcp`
 4. Authentication: **API Key**
 5. Header name: `Authorization`

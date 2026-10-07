@@ -1,61 +1,101 @@
 # ENHO — Enhancement Implementation
 
-## TL;DR
-Canonical TADIR R3TR `ENHO` (Enhancement Implementation — BAdI implementations,
-explicit/implicit enhancement source plug-ins, enhanced classes). Spelling is correct.
-URL `/sap/bc/adt/enhancements/enhoxhb/<name>` + Accept
-`application/vnd.sap.adt.enh.enhoxhb.v4+xml` is the **BAdI-specific** form and exists only from
-7.58. NW 7.50 advertises `/sap/bc/adt/enhancements/enhoxh/<name>` with
-`application/vnd.sap.adt.enh.enho.v1+xml` and 404s on `enhoxhb`, so the read must try both
-(discovery-first). On-prem only in ARC-1.
+Use `SAPRead(type="ENHO", name="...")` on on-prem systems. The R3TR type covers
+BAdIs, source-code plug-ins and other enhancement technologies; it does not identify
+one ADT resource. There is no public slash alias or enhancement write operation.
 
-## TADIR ground truth
-- **R3TR type**: `ENHO`.
-- **LIMU sub-objects**: ENHO has internal sub-elements (BAdI implementations, source plug-ins)
-  but TADIR doesn't carry them as separate LIMU rows in the way FUGR carries FUNC.
-- **abap-file-formats support**: ✅ released — `file-formats/enho/`.
+## Verified read routes (2026-10-01, issue #896)
 
-## ADT slash subtypes
-| Slash code | Meaning | URL prefix | Verified on |
-|---|---|---|---|
-| `ENHO/XH` | Enhancement Implementation (source-code plug-in / class enh.) | `/sap/bc/adt/enhancements/enhoxh/<name>` | live 7.50 2026-08-22 (tadir_lookup + ADT read) |
-| `ENHO/XHB` | BAdI implementation | `/sap/bc/adt/enhancements/enhoxhb/<name>` | 7.58 fixture (`tests/fixtures/xml/enhancement-implementation.xml`) |
-
-## SAP docs & notes
-- "Enhancement Framework" (SAP Help — ABAP Workbench Tools).
-- BAdI / Implicit / Explicit enhancement spots.
-
-## Other MCP servers / cross-reference
-- abap-file-formats: serializes `enho` (✅ verified in this audit's gh api dump).
-- mcp-abap-abap-adt-api: `ENHO`.
-
-## Live verification
-### a4h (S/4HANA 2023)
-- Probe `knownObjects: []` per `src/probe/catalog.ts:190` — no SAP-shipped ENHO universally
-  guaranteed; customer-defined.
-
-### 7.50 (NW 7.50)
-- `enhoxh` available, `enhoxhb` **absent** (404) — live 7.50 2026-08-22 and the recorded NPL
-  probe fixture (`tests/fixtures/probe/npl-750-sp02-dev-edition/responses/GET__sap_bc_adt_enhancements_enhoxhb.json`).
-- The ENHO resource has no `/source/main`; the plug-in coding comes from the enhanced object's
-  `…/source/main/enhancements?context=<main program>` feed (base64 in `<enh:source>`).
-
-## ARC-1 current surface
-| Location | Form used | Correct? |
+| Repository subtype | Collection / Accept | Observed behavior |
 |---|---|---|
-| `handleSAPRead` (`src/handlers/read.ts`) | `case 'ENHO'` → `getEnhancementImplementation` + `withEnhancementSource` | ✅ |
-| `client.getEnhancementImplementation` | `fetchEnhancementObject(http, name, ENHO_COLLECTIONS)` — `enhoxhb` then `enhoxh`, discovery-ordered | ✅ |
-| `src/adt/enhancements.ts` | collections, feed URL, parsers | ✅ |
-| `src/probe/catalog.ts` | still probes `enhoxhb` only — accurate for what the fixtures recorded, but reports ENHO "unavailable" on 7.50; needs re-recorded fixtures to change | ⚠️ known |
-| `objectBasePath` | n/a (read-only path; no URL builder entry) | acceptable — read uses dedicated client method |
+| `ENHO/XHB` | `enhoxhb` / `application/vnd.sap.adt.enh.enhoxhb.v4+xml` | BAdI metadata on SAP_BASIS 758 SP02 and 816 SP01; root `enho:objectData`. |
+| `ENHO/XHH` | `enhoxhh` / `application/vnd.sap.adt.enh.enhoxhh.v3+xml` | Hook metadata on 758/816; root `enho:enhancement`. ABAP is at the same object's `/source/main` (`text/plain`). |
+| `ENHO/XH` | `enhoxh` / `application/vnd.sap.adt.enh.enho.v1+xml` | Legacy/generic route, not proof of a specific enhancement technology. On 750 it serves BAdI `objectData`; `WDR_TEST_ENH_08_01` on 758/816 fails inside SAP even at this route. |
 
-## Verdict
-- **Status**: fixed 2026-08-22 (was: wrong URL on every release below 7.58)
-- **Evidence**: live-verified — see [docs/research/2026-08-22-enho-adt-surface.md](../../2026-08-22-enho-adt-surface.md)
-- **Issue**: the single hard-coded `enhoxhb` URL made ENHO unreadable on 7.50 (404), and the
-  implementation coding was not returned at all.
+All paths are under `/sap/bc/adt/enhancements/`, followed by the encoded object
+name. Discovery advertised all three collections on 758/816 and only `enhoxh`
+on 750. Collection presence alone does not prove every object can be read.
 
-## Recommendation
-- Read through `src/adt/enhancements.ts` (discovery-ordered candidates), never a hard-coded URL.
-- **Breaking change**: no — the response gains fields (`uri`, `enhancedObject`, `sourceCodePlugins`).
-- **Test gap to close**: capture a real `enhoxh` v1 metadata payload as a fixture.
+### Routing and payload
+
+The original BAdI GET remains first, preserving its one-request success path and
+JSON shape. Only HTTP 400/404/500 triggers one bounded repository search. ARC-1
+requires a unique recognized subtype for the exact name. SAP 750 decorates search
+names with a display label, so an exact relative URI matching the constructed,
+known object path also qualifies. ARC-1 never follows a returned URI, probes all
+collections, or retries with another identity. Unknown or ambiguous results keep
+the original failure; denied searches and source errors propagate.
+
+XHH returns `source`, `enhancedObject` and `hookImplementations` in addition to the
+common metadata. Hook entries retain IDs, spots, programs, methods, overwrite
+flags, full enhancement locations and enclosure links. Links are navigation data,
+not authorization to fetch another object. Source bytes are not XML-decoded.
+Legacy BAdI `isActive` / `isDefault` attributes map to the same boolean fields as
+modern `active` / `default` attributes. See the reduced [hook fixture](../../../../tests/fixtures/xml/enhancement-hook.xml).
+
+ENHO uses SAP's unversioned developer view. Explicit `active`/`inactive` requests
+are refused rather than silently ignored; omit `version` or use `auto`. No atomic
+metadata/source snapshot or inactive-draft contract is claimed. There is no ENHO
+source cache, grep, method extraction or write support.
+
+### Live observations and limits
+
+Tests used ARC-1's production `handleToolCall` over direct HTTPS/Basic, client 001,
+with no SAP mutations. Build hashes and raw comparisons are retained with the PR's
+local evidence; mocks are separate from these observations.
+
+- 758/816: `/AIF/ANS_RESTART_EI` kept the existing BAdI payload with one GET.
+- 758/816: `/MFND/CORE_UPD_BDS_CONNECTION` and `/SMFND/DEMO_DEL_BOOKING` exposed
+  hook locations and source equal to a direct `/source/main` read. The old BAdI
+  route failed with 400/500. Each corrected read made four GETs.
+- 750: `/BOBF/CONF_ADT_CHECKABLE` exposed a BAdI through the generic XH route;
+  its search name included ` (Enhancement Implementation)` and its flags used
+  `isActive` / `isDefault`.
+- 758/816: `WDR_TEST_ENH_08_01` still returned SAP 500 at `enhoxh`. ARC-1 keeps
+  that status and points to SAP GUI (SE80/SE19) or Eclipse's SAP GUI integration.
+  Its underlying enhancement technology was not captured. Issue #896 reports
+  class enhancements; this object's generic XH subtype does not prove that case.
+- Not verified: the reporter's exact objects, inactive drafts, PP, MCP transport,
+  BTP, or working class-enhancement metadata. A route correction cannot repair a
+  backend transformation error.
+
+[SAP's source-code plug-in documentation](https://help.sap.com/docs/ABAP_PLATFORM_NEW/c238d694b825421f940829321ffa326a/4ec1abd36e391014adc9fffe4e204223.html)
+describes ADT editing from 7.53 and creation from 7.54, and excludes class/function
+group enhancements from that support. These are authoring limits, not a promise
+about all read endpoints. Enhancement authoring remains [FEAT-03](../../../../docs_page/roadmap.md#feat-03).
+
+## Relation Explorer identity evidence — SAP_BASIS 758 (2026-09-10)
+
+This dated section concerns read-only relationship roots, not new SAPRead operations, writes, or a global slash alias. The metadata root and `adtcore:type` attribute below were retained from an actual metadata **GET**, not a create template. Namespace prefixes are preserved. Authors, descriptions and unrelated fields were removed; identity values were not invented or rewritten.
+
+### ENHO/XHB
+
+- Observed object: `ZABAPGIT_REPOS`; GET `/sap/bc/adt/enhancements/enhoxhb/zabapgit_repos`.
+- Recorded: 2026-09-09T22:07:49.315Z; metadata QName: `enho:objectData`.
+- [Sanitized wire fixture](../../../../tests/fixtures/relations/enho-xhb.json) also preserves one observed ENV edge and original-body SHA-256 values. It is a projection, not a complete network.
+
+```xml
+<enho:objectData adtcore:name="ZABAPGIT_REPOS" adtcore:type="ENHO/XHB" adtcore:version="active" xmlns:enho="http://www.sap.com/adt/enhancements/enho" xmlns:adtcore="http://www.sap.com/adt/core">
+<adtcore:packageRef adtcore:uri="/sap/bc/adt/packages/%24test_abapgit" adtcore:type="DEVC/K" adtcore:name="$TEST_ABAPGIT"/>
+</enho:objectData>
+```
+
+Qualification and limitations: [per-type research](../../2026-09-10-live-relations-types.md). CI binds every qualified native identity to this document and replays the independent recorded fixtures. This proves the observed 758 shapes, not support on other releases or relationship completeness.
+
+## NW 7.50 SP0032, customer system (2026-08-22/23)
+
+Closes the "working class-enhancement metadata" gap above for one release:
+
+- Every representation dumps: `enhoxh/{name}` answers 500 for HOOK_IMPL and CLASENH alike, while
+  the same URL answers 406 for `text/plain` — the resource exists, the handler does not.
+  ARC-1 then falls back to `/vit/wb/object_type/enhoxh/object_name/{NAME}`, which returns the
+  common workbench envelope (package, author, master language, timestamps).
+- `enhoxhb` and `enhoxhh` are absent on 7.50; discovery lists only `enhoxh`/`enhsxs` (same on a
+  second 7.50 system, ECC EhP8 SP31, per the recorded probe fixtures).
+- Hook coding is still reachable: it is served by the ENHANCED object, not by the ENHO resource,
+  via `{objectUri}/source/main/enhancements?context={MAIN PROGRAM}` (base64 in `<enh:source>`).
+- Class enhancements have NO coding reader there: eight feed URL shapes return the empty root, the
+  generated `{ENH}=====E`/`=====EIMP` includes return 500, and `ENHCROSS`/`ENHA_TMDIR` are empty
+  system-wide. `ENHINCINX~METHOD` still separates an overwrite exit from the pre/post pair.
+
+Full measurement (129 anchors across 45 implementations): docs/research/2026-08-22-enho-adt-surface.md

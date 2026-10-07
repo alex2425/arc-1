@@ -7,6 +7,7 @@
  */
 
 import type { BTPProxyConfig } from '@arc-mcp/xsuaa-auth/btp';
+import { DEFAULT_CONCURRENT_DATA_RESULTS, DEFAULT_DATA_PREVIEW_RESPONSE_BYTES } from './data-result-context.js';
 import type { SafetyConfig } from './safety.js';
 import { unrestrictedSafetyConfig } from './safety.js';
 
@@ -53,8 +54,12 @@ export interface AdtClientConfig {
   client: string;
   /** SAP language (default: "EN") */
   language: string;
+  /** Outbound SAP User-Agent; omitted uses arc-1/version. */
+  userAgent?: string;
   /** Skip TLS verification */
   insecure: boolean;
+  /** Gzip non-empty data-preview POST bodies for approved WAF compatibility. */
+  gzipDataPreviewBody: boolean;
   /** Cookie-based auth (alternative to basic auth) */
   cookies: Record<string, string>;
   /** Path to cookie file — enables hot-reload on stale auth */
@@ -119,6 +124,15 @@ export interface AdtClientConfig {
    *  constructed with this config. The server constructs one at startup so principal-propagation
    *  per-user clients all share the same cap. Takes precedence over `maxConcurrent`. */
   adtSemaphore?: import('./semaphore.js').Semaphore;
+  /** Cumulative decompressed response bytes allowed per data-result scope. */
+  maxDataPreviewResponseBytes: number;
+  /** Private fallback data-result concurrency when no shared semaphore is supplied. */
+  maxConcurrentDataResults: number;
+  /** Process-wide data-result semaphore shared by every server-created ADT client. */
+  dataResultSemaphore?: import('./semaphore.js').Semaphore;
+  /** Existing SAP transport (login cookies, CSRF token) to reuse instead of building one. Object-resolution
+   *  caches stay on the AdtClient, so a request-local client over a shared transport never sees stale routes. */
+  http?: import('./http.js').AdtHttpClient;
 }
 
 /** Create default ADT client config */
@@ -130,9 +144,12 @@ export function defaultAdtClientConfig(): AdtClientConfig {
     client: '100',
     language: 'EN',
     insecure: false,
+    gzipDataPreviewBody: false,
     cookies: {},
     safety: unrestrictedSafetyConfig(),
     features: defaultFeatureConfig(),
     verbose: false,
+    maxDataPreviewResponseBytes: DEFAULT_DATA_PREVIEW_RESPONSE_BYTES,
+    maxConcurrentDataResults: DEFAULT_CONCURRENT_DATA_RESULTS,
   };
 }

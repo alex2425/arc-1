@@ -40,6 +40,7 @@ import type {
   ServerDrivenObjectMetadata,
   TransactionInfo,
 } from './types.js';
+import { decodeXmlEntities } from './xml-entities.js';
 
 /**
  * Escape the five predefined XML entities (`& < > " '`) for safe interpolation into XML.
@@ -102,8 +103,8 @@ const ARRAY_TAGS = new Set([
   'accept',
   'orglvlinfo',
   'badiImplementation',
-  // Object enhancement feed ({objectUri}/source/main/enhancements) — one entry per bound ENHO,
-  // each with one or more source-code plug-ins.
+  // Object enhancement feed ({objectUri}/source/main/enhancements) — SAP emits one
+  // <enh:elements> container PER plug-in, so both tags must be arrays.
   'enhancementImplementations',
   'sourceCodePlugin',
 ]);
@@ -116,14 +117,21 @@ const parser = new XMLParser({
   isArray: (name) => ARRAY_TAGS.has(name),
   parseAttributeValue: false, // Keep attributes as strings
   parseTagValue: false, // Keep tag values as strings (prevents "001" → 1)
-  // SAP ADT responses use only standard XML entities (&amp; &lt; &gt; &quot;).
-  // Dump listings (ST22) can contain thousands of entity references in stack traces.
-  // fast-xml-parser v5 defaults to maxTotalExpansions=1000 which is too low.
-  // Disable custom entity processing — standard entities are handled regardless.
-  processEntities: false,
+  // Use the native entity boundary: unlike value processors, it skips literal CDATA.
+  // Decode only predefined/numeric references, with no recursive DOCTYPE expansion or ST22 cap.
+  entityDecoder: {
+    decode: decodeXmlEntities,
+    addInputEntities: () => {},
+    setExternalEntities: () => {},
+    setXmlVersion: () => {},
+    reset: () => {},
+  },
 });
 
-/** Parse raw XML string to a JS object */
+/**
+ * Parse raw XML string to a JS object. Every attribute and text value is entity-DECODED
+ * (`R&amp;D` → `R&D`): never decode a parsed value again, and `escapeXmlAttr` it on the way back.
+ */
 export function parseXml(xml: string): Record<string, unknown> {
   return parser.parse(xml) as Record<string, unknown>;
 }
@@ -135,14 +143,6 @@ export function parseXml(xml: string): Record<string, unknown> {
  * <adtcore:objectReferences>
  *   <adtcore:objectReference uri="..." type="PROG/P" name="ZTEST" packageName="$TMP" description="..."/>
  * </adtcore:objectReferences>
- *
- * The shared parser runs with `processEntities: false` (intentional — dump XML
- * can exceed fast-xml-parser's `maxTotalExpansions` cap), so XML attribute
- * values like descriptions arrive with `&gt;` / `&amp;` / `&lt;` / `&quot;` /
- * `&apos;` un-decoded. We decode the user-visible free-text field
- * (`description`) at the boundary via `decodeXmlEntities()`. Object names,
- * types, URIs, and package names don't carry free text — leaving them
- * undecoded is intentional.
  */
 export function parseSearchResults(xml: string): AdtSearchResult[] {
   const parsed = parseXml(xml);
@@ -150,7 +150,7 @@ export function parseSearchResults(xml: string): AdtSearchResult[] {
   return refs.map((ref: Record<string, unknown>) => ({
     objectType: String(ref['@_type'] ?? ''),
     objectName: String(ref['@_name'] ?? ''),
-    description: decodeXmlEntities(String(ref['@_description'] ?? '')),
+    description: String(ref['@_description'] ?? ''),
     packageName: String(ref['@_packageName'] ?? ''),
     uri: String(ref['@_uri'] ?? ''),
   }));
@@ -240,9 +240,10 @@ export function parseSubpackageNodestructure(xml: string): string[] {
  * After namespace stripping, both converge but with different casing.
  * We try both patterns with fallback.
  */
-export function parseTableContents(xml: string): { columns: string[]; rows: Record<string, string>[] } {
-  const parsed = parseXml(xml);
-
+function parseTableContentsObject(parsed: Record<string, unknown>): {
+  columns: string[];
+  rows: Record<string, string>[];
+} {
   // Try old format first: abap > values > COLUMNS > COLUMN
   let columns = getDeepArray(parsed, ['abap', 'values', 'COLUMNS', 'COLUMN']);
   if (columns.length === 0) {
@@ -297,14 +298,12 @@ export interface DataPreviewMeta {
   executedQueryString?: string;
 }
 
-/**
- * Parse the scalar metrics from a datapreview response — `totalRows`, `queryExecutionTime`,
- * `executedQueryString`. All optional: absent fields are omitted. Reads the same body
- * `parseTableContents` does; surfaced so SAPQuery can report real row counts + server-side timing.
- */
-export function parseDataPreviewMeta(xml: string): DataPreviewMeta {
-  if (!xml || xml.trim().length === 0) return {};
-  const parsed = parseXml(xml);
+export interface DataPreviewResult extends DataPreviewMeta {
+  columns: string[];
+  rows: Record<string, string>[];
+}
+
+function parseDataPreviewMetaObject(parsed: Record<string, unknown>): DataPreviewMeta {
   const td = (parsed.tableData ?? parsed) as Record<string, unknown>;
   const meta: DataPreviewMeta = {};
 
@@ -323,6 +322,28 @@ export function parseDataPreviewMeta(xml: string): DataPreviewMeta {
     meta.executedQueryString = executed.trim().replace(/\s+/g, ' ');
   }
   return meta;
+}
+
+/** Parse data-preview rows and metrics from one shared fast-xml-parser object tree. */
+export function parseDataPreviewResult(xml: string): DataPreviewResult {
+  if (!xml || xml.trim().length === 0) return { columns: [], rows: [] };
+  const parsed = parseXml(xml);
+  return { ...parseTableContentsObject(parsed), ...parseDataPreviewMetaObject(parsed) };
+}
+
+export function parseTableContents(xml: string): { columns: string[]; rows: Record<string, string>[] } {
+  if (!xml || xml.trim().length === 0) return { columns: [], rows: [] };
+  return parseTableContentsObject(parseXml(xml));
+}
+
+/**
+ * Parse the scalar metrics from a datapreview response — `totalRows`, `queryExecutionTime`,
+ * `executedQueryString`. All optional: absent fields are omitted. Reads the same body
+ * `parseTableContents` does; surfaced so SAPQuery can report real row counts + server-side timing.
+ */
+export function parseDataPreviewMeta(xml: string): DataPreviewMeta {
+  if (!xml || xml.trim().length === 0) return {};
+  return parseDataPreviewMetaObject(parseXml(xml));
 }
 
 /**
@@ -532,7 +553,15 @@ export function parseDiscoveryDocument(xml: string): Map<string, string[]> {
   if (!xml?.trim()) return new Map();
 
   try {
-    const parsed = parseXml(xml);
+    return parseDiscoveryObject(parseXml(xml));
+  } catch {
+    return new Map();
+  }
+}
+
+/** Map an already-parsed discovery document without parsing its XML a second time. */
+export function parseDiscoveryObject(parsed: Record<string, unknown>): Map<string, string[]> {
+  try {
     const service = (parsed.service ?? {}) as Record<string, unknown>;
     const workspaces = Array.isArray(service.workspace)
       ? service.workspace
@@ -675,6 +704,7 @@ export function parseDataElementMetadata(xml: string): DataElementInfo {
   // Find the dataElement node — after NS strip: dtel:dataElement → dataElement
   const dtelNodes = findDeepNodes(parsed, 'dataElement');
   const dtel = dtelNodes[0] ?? {};
+  const flag = (value: unknown) => String(value ?? '').toLowerCase() === 'true';
 
   return {
     name: String(wbobj['@_name'] ?? ''),
@@ -685,11 +715,21 @@ export function parseDataElementMetadata(xml: string): DataElementInfo {
     length: String(dtel.dataTypeLength ?? ''),
     decimals: String(dtel.dataTypeDecimals ?? ''),
     shortLabel: String(dtel.shortFieldLabel ?? ''),
+    shortLength: String(dtel.shortFieldLength ?? ''),
     mediumLabel: String(dtel.mediumFieldLabel ?? ''),
+    mediumLength: String(dtel.mediumFieldLength ?? ''),
     longLabel: String(dtel.longFieldLabel ?? ''),
+    longLength: String(dtel.longFieldLength ?? ''),
     headingLabel: String(dtel.headingFieldLabel ?? ''),
+    headingLength: String(dtel.headingFieldLength ?? ''),
     searchHelp: String(dtel.searchHelp ?? ''),
+    searchHelpParameter: String(dtel.searchHelpParameter ?? ''),
+    setGetParameter: String(dtel.setGetParameter ?? ''),
     defaultComponentName: String(dtel.defaultComponentName ?? ''),
+    deactivateInputHistory: flag(dtel.deactivateInputHistory),
+    changeDocument: flag(dtel.changeDocument),
+    leftToRightDirection: flag(dtel.leftToRightDirection),
+    deactivateBIDIFiltering: flag(dtel.deactivateBIDIFiltering),
     package: String(pkgRef['@_name'] ?? ''),
   };
 }
@@ -1016,7 +1056,7 @@ export function parseMessageClass(xml: string): MessageClassInfo {
   const msgNodes = Array.isArray(mc.messages) ? (mc.messages as Array<Record<string, unknown>>) : [];
   const messages = msgNodes.map((m) => ({
     number: String(m['@_msgno'] ?? ''),
-    shortText: decodeXmlEntities(String(m['@_msgtext'] ?? '')),
+    shortText: String(m['@_msgtext'] ?? ''),
   }));
 
   return {
@@ -1089,24 +1129,6 @@ export function parseBspFolderListing(xml: string, appName: string): BspFileNode
 
 // ─── Helpers ────────────────────────────────────────────────────────
 
-/**
- * Decode standard XML entities in attribute values.
- * fast-xml-parser with processEntities:false + parseAttributeValue:false
- * keeps raw encoded strings — we decode them for human-readable output.
- *
- * `&amp;` is decoded LAST so chained entities like `&amp;lt;` resolve to the
- * literal `&lt;` rather than `<`. Closes CodeQL alert `js/double-escaping`
- * (alert #8).
- */
-export function decodeXmlEntities(s: string): string {
-  return s
-    .replace(/&lt;/g, '<')
-    .replace(/&gt;/g, '>')
-    .replace(/&quot;/g, '"')
-    .replace(/&apos;/g, "'")
-    .replace(/&amp;/g, '&');
-}
-
 /** Safely get a nested array from parsed XML.
  *  Absent, empty (`<alerts/>` → `''` on 7.50) and single-node containers all collapse to an array. */
 export function getNestedArray(
@@ -1163,16 +1185,9 @@ export function parseNamedItems(xml: string): NamedItem[] {
     const x = Array.isArray(v) ? v[0] : v;
     return typeof x === 'string' ? x : typeof x === 'number' ? String(x) : '';
   };
-  // Some items carry entity-encoded markup (e.g. "&lt;p&gt;Target: &lt;b&gt;DEV&lt;/b&gt;&lt;/p&gt;").
-  // The shared parser leaves entities encoded — decode, strip tags, collapse whitespace.
+  // Some items carry markup (e.g. "gCTS generated<p>Target: <b>DEV</b></p>") — strip tags, collapse whitespace.
   const clean = (v: unknown): string =>
     str(v)
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .replace(/&quot;/g, '"')
-      .replace(/&apos;/g, "'")
-      .replace(/&#39;/g, "'")
-      .replace(/&amp;/g, '&') // decode &amp; last so encoded entities aren't double-decoded
       .replace(/<[^>]*>/g, ' ')
       .replace(/\s+/g, ' ')
       .trim();
@@ -1186,8 +1201,9 @@ export function parseNamedItems(xml: string): NamedItem[] {
 
 /**
  * Read the system default ATC check variant from an `<atc:customizing>` response — the
- * `<property name="systemCheckVariant" value="…"/>` entry. This is the variant ATC runs when
- * `checkVariant` is empty. Returns undefined when the property is absent.
+ * `<property name="systemCheckVariant" value="…"/>` entry. This is the system's CONFIGURED ATC
+ * variant; SAP does NOT apply it on an empty `checkVariant` (that runs `DEFAULT`), so `runAtcCheck`
+ * sends it explicitly. Returns undefined when the property is absent.
  */
 export function parseAtcSystemCheckVariant(xml: string): string | undefined {
   const parsed = parseXml(xml);
@@ -1530,12 +1546,8 @@ function parseLineRange(href: string): LineRange | null {
  * Live evidence: fixtures `tests/fixtures/xml/objectstructure-clas-a4h-758.xml`
  * (single-element shape) and `objectstructure-clas-npl-750.xml` (split shape).
  *
- * Implementation note: this parser is regex-driven, not XMLParser-driven. The
- * `objectstructure` response is large (~40KB for `CL_ABAP_TYPEDESCR`) and the
- * existing `removeNSPrefix: true` parser config would strip the `adtcore:type`
- * attribute we need for the OO/OM merge. The element shape is regular enough
- * that scoped regexes are cheaper and more readable than reconfiguring the
- * shared parser.
+ * Scoped regexes preserve the `adtcore:type` prefix used to merge OO/OM entries;
+ * the shared XML parser's `removeNSPrefix` setting would strip it.
  */
 export function parseClassStructure(xml: string, className?: string): ClassStructure {
   if (!xml.trim()) {
@@ -1595,6 +1607,7 @@ export function parseClassStructure(xml: string, className?: string): ClassStruc
   // 7.50 split shape: per-name accumulators.
   type PartialMethod = {
     name: string;
+    redefinition?: boolean;
     visibility?: 'public' | 'protected' | 'private';
     level?: 'instance' | 'static';
     abstract: boolean;
@@ -1640,6 +1653,7 @@ export function parseClassStructure(xml: string, className?: string): ClassStruc
       // 7.58+ the single CLAS/OM element carries everything.
       if (visibility && (!entry.visibility || type === 'CLAS/OO')) entry.visibility = visibility;
       if (level && (!entry.level || type === 'CLAS/OO')) entry.level = level;
+      if (/\bredefinition="true"/.test(attrs)) entry.redefinition = true;
       if (isAbstract) entry.abstract = true;
       if (isConstructor) entry.constructor = true;
       if (defBlock) {
@@ -1690,6 +1704,7 @@ export function parseClassStructure(xml: string, className?: string): ClassStruc
     if (!m.definition) continue;
     methods.push({
       name: m.name,
+      ...(m.redefinition ? { redefinition: true } : {}),
       visibility: m.visibility ?? 'public',
       level: m.level ?? 'instance',
       abstract: m.abstract,

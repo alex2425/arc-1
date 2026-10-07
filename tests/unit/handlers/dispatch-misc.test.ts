@@ -3,6 +3,7 @@
  * The undici mock + AdtClient + createClient live in ./setup-undici-mock.ts — import that helper
  * and keep all other src-module imports dynamic (see its header for the ordering rules).
  */
+import { readFileSync } from 'node:fs';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { AdtApiError } from '../../../src/adt/errors.js';
@@ -13,6 +14,7 @@ import { mockResponse } from '../../helpers/mock-fetch.js';
 import { features, featuresOff } from './handler-test-config.js';
 import { AdtClient, createClient, mockFetch } from './setup-undici-mock.js';
 
+const catalog = readFileSync(new URL('../../fixtures/xml/replacement-catalog-scarr.xml', import.meta.url), 'utf8');
 const { handleToolCall, hasRequiredScope, TOOL_SCOPES } = await import('../../../src/handlers/dispatch.js');
 const { resetCachedFeatures, setCachedFeatures } = await import('../../../src/handlers/feature-cache.js');
 const { normalizeObjectType, stripLlmEmptyValues, normalizeTypeArgsForValidation } = await import(
@@ -451,6 +453,228 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
   });
 
   describe('error guidance', () => {
+    it.each([
+      ['SAPRead', { type: 'TABLE_CONTENTS', name: 'USR02' }],
+      ['SAPQuery', { sql: 'SELECT * FROM USR02' }],
+    ])('preserves the experimental policy reason for %s and classifies it in audit', async (tool, args) => {
+      const auditSpy = vi.spyOn(logger, 'emitAudit');
+      try {
+        const safety = { ...unrestrictedSafetyConfig(), blockedDataSources: ['USR02'] };
+        const client = new AdtClient({ baseUrl: 'http://sap:8000', safety });
+        const result = await handleToolCall(
+          client,
+          { ...DEFAULT_CONFIG, allowDataPreview: true, allowFreeSQL: true, blockedDataSources: ['USR02'] },
+          tool,
+          args,
+        );
+        const text = result.content[0]?.text ?? '';
+        expect(result.isError).toBe(true);
+        expect(text).toContain('DATA_SOURCE_BLOCKED');
+        expect(text).toContain('request denied before data execution');
+        expect(text).toContain('USR02');
+        expect(text).not.toContain('Set SAP_ALLOW_DATA_PREVIEW');
+
+        const endEvent = auditSpy.mock.calls
+          .map(([event]) => event)
+          .find(
+            (event) =>
+              typeof event === 'object' &&
+              event !== null &&
+              (event as { event?: string; status?: string }).event === 'tool_call_end' &&
+              (event as { event?: string; status?: string }).status === 'error',
+          ) as { errorClass?: string } | undefined;
+        expect(endEvent?.errorClass).toBe('DataSourcePolicyError:DATA_SOURCE_BLOCKED');
+      } finally {
+        auditSpy.mockRestore();
+      }
+    });
+
+    it('keeps lineage failures actionable without leaking SAP diagnostics in minimal-error mode', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(
+        new AdtApiError('locked by SECRETUSER in DEVK900001', 423, '/sap/bc/adt/repository/informationsystem/search'),
+      );
+      const safety = { ...unrestrictedSafetyConfig(), blockedDataSources: ['USR02'] };
+      const client = new AdtClient({ baseUrl: 'http://sap:8000', safety });
+
+      const result = await handleToolCall(
+        client,
+        {
+          ...DEFAULT_CONFIG,
+          allowDataPreview: true,
+          allowFreeSQL: true,
+          blockedDataSources: ['USR02'],
+          minimalErrors: true,
+        },
+        'SAPQuery',
+        { sql: 'SELECT * FROM SCARR' },
+      );
+      const text = result.content[0]?.text ?? '';
+
+      expect(result.isError).toBe(true);
+      // Minimal mode keeps exactly what the model needs to act...
+      expect(text).toContain('DATA_LINEAGE_UNRESOLVED');
+      expect(text).toContain('executed=false');
+      expect(text).toMatch(/decisionId=dsp_[0-9a-f]+/);
+      // ...and nothing that is policy-sensitive or backend-derived.
+      expect(text).not.toMatch(/SECRETUSER|DEVK900001|informationsystem/i);
+      expect(text).not.toContain('HTTP 423');
+      expect(text).not.toContain('SCARR');
+      expect(text).not.toContain('SAP_BLOCKED_DATA_SOURCES');
+    });
+
+    it('explains unavailable policy metadata safely in minimal-error mode', async () => {
+      mockFetch.mockImplementation(async (url: string) =>
+        String(url).includes('/datapreview/')
+          ? mockResponse(404, 'unavailable')
+          : mockResponse(
+              200,
+              '<?xml version="1.0"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"><adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/tables/SCARR" adtcore:type="TABL/DT" adtcore:name="SCARR"/></adtcore:objectReferences>',
+              { 'x-csrf-token': 'T' },
+            ),
+      );
+      const safety = { ...unrestrictedSafetyConfig(), blockedDataSources: ['USR02'] };
+      const client = new AdtClient({ baseUrl: 'http://sap:8000', safety });
+      // A non-table entry means discovery is loaded while proving the table collection is absent.
+      client.http.setDiscoveryMap(new Map([['/sap/bc/adt/ddic/structures', ['text/plain']]]));
+
+      const result = await handleToolCall(
+        client,
+        {
+          ...DEFAULT_CONFIG,
+          allowDataPreview: true,
+          allowFreeSQL: true,
+          blockedDataSources: ['USR02'],
+          minimalErrors: true,
+        },
+        'SAPQuery',
+        { sql: 'SELECT * FROM SCARR' },
+      );
+      const text = result.content[0]?.text ?? '';
+
+      expect(result.isError).toBe(true);
+      expect(text).toContain('DATA_POLICY_UNAVAILABLE');
+      expect(text).not.toContain('7.52');
+      expect(text).toContain('executed=false');
+      expect(text).toContain('Retrying unchanged');
+      expect(text).not.toMatch(/SCARR|USR02|SAP_BLOCKED_DATA_SOURCES|\/ddic\/tables/i);
+    });
+
+    it('keeps internal data-operation denials minimal while preserving the feature guidance', async () => {
+      mockFetch.mockReset();
+      const safety = { ...unrestrictedSafetyConfig(), blockedDataSources: ['TADIR'] };
+      const client = new AdtClient({ baseUrl: 'http://sap:8000', safety });
+
+      const result = await handleToolCall(
+        client,
+        {
+          ...DEFAULT_CONFIG,
+          allowDataPreview: true,
+          allowFreeSQL: true,
+          blockedDataSources: ['TADIR'],
+          minimalErrors: true,
+        },
+        'SAPSearch',
+        { searchType: 'tadir_lookup', names: ['ZFOO'], source: 'db' },
+      );
+      const text = result.content[0]?.text ?? '';
+
+      expect(result.isError).toBe(true);
+      expect(text).toContain('DATA_SOURCE_BLOCKED');
+      expect(text).toContain('executed=false');
+      // Registry guidance may name the operation's documented source, never the rule or the variable.
+      expect(text).toContain('Affected: SAPSearch(searchType="tadir_lookup"');
+      expect(text).toContain('Retry with source="adt"');
+      expect(text).not.toContain('Source path');
+      expect(text).not.toContain('SAP_BLOCKED_DATA_SOURCES');
+    });
+
+    it('minimal mode redacts the client message but never the audit record', async () => {
+      const auditSpy = vi.spyOn(logger, 'emitAudit');
+      try {
+        mockFetch.mockReset();
+        const safety = { ...unrestrictedSafetyConfig(), blockedDataSources: ['USR02'] };
+        const client = new AdtClient({ baseUrl: 'http://sap:8000', safety });
+
+        const result = await handleToolCall(
+          client,
+          {
+            ...DEFAULT_CONFIG,
+            allowDataPreview: true,
+            allowFreeSQL: true,
+            blockedDataSources: ['USR02'],
+            minimalErrors: true,
+          },
+          'SAPQuery',
+          { sql: 'SELECT * FROM USR02' },
+        );
+        const text = result.content[0]?.text ?? '';
+        expect(text).toContain('DATA_SOURCE_BLOCKED');
+        expect(text).not.toContain('USR02');
+
+        const decision = auditSpy.mock.calls
+          .map(([event]) => event as unknown as Record<string, unknown>)
+          .find((event) => event?.event === 'data_source_policy_decision');
+
+        // The protected record keeps the complete normalized decision.
+        expect(decision).toBeDefined();
+        expect(decision?.decision).toBe('deny');
+        expect(decision?.code).toBe('DATA_SOURCE_BLOCKED');
+        expect(decision?.executed).toBe(false);
+        expect(decision?.matchedSource).toBe('USR02');
+        expect(decision?.sourcePath).toEqual(['USR02']);
+        expect(decision?.policyFingerprint).toMatch(/^[0-9a-f]{64}$/);
+        expect(String(decision?.decisionId)).toMatch(/^dsp_/);
+        // …and no SQL text or row data.
+        expect(JSON.stringify(decision)).not.toContain('SELECT');
+      } finally {
+        auditSpy.mockRestore();
+      }
+    });
+
+    it('emits exactly one allow decision per logical request', async () => {
+      const auditSpy = vi.spyOn(logger, 'emitAudit');
+      try {
+        mockFetch.mockReset();
+        mockFetch.mockImplementation(async (url: string, opts: RequestInit) => {
+          const u = String(url);
+          if (u.includes('/repository/informationsystem/search')) {
+            return mockResponse(
+              200,
+              '<?xml version="1.0"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">' +
+                '<adtcore:objectReference adtcore:uri="/sap/bc/adt/ddic/tables/scarr" adtcore:type="TABL/DT" adtcore:name="SCARR"/>' +
+                '</adtcore:objectReferences>',
+            );
+          }
+          if (String(opts.body).includes('FROM DD02L AS d')) return mockResponse(200, catalog);
+          return mockResponse(
+            200,
+            '<?xml version="1.0"?><dataPreview:tableData xmlns:dataPreview="http://www.sap.com/adt/dataPreview"/>',
+            { 'x-csrf-token': 'T' },
+          );
+        });
+        const safety = { ...unrestrictedSafetyConfig(), blockedDataSources: ['USR02'] };
+        const client = new AdtClient({ baseUrl: 'http://sap:8000', safety });
+
+        await handleToolCall(
+          client,
+          { ...DEFAULT_CONFIG, allowDataPreview: true, allowFreeSQL: true, blockedDataSources: ['USR02'] },
+          'SAPQuery',
+          { sql: "SELECT * FROM SCARR WHERE CARRID IN ('A','B','C','D','E','F','G','H','I','J')" },
+        );
+
+        const decisions = auditSpy.mock.calls
+          .map(([event]) => event as unknown as Record<string, unknown>)
+          .filter((event) => event?.event === 'data_source_policy_decision');
+        // One decision for the whole logical request, even though chunking may split the SQL.
+        expect(decisions).toHaveLength(1);
+        expect(decisions[0]?.decision).toBe('allow');
+        expect(decisions[0]?.directRoots).toEqual(['SCARR']);
+      } finally {
+        auditSpy.mockRestore();
+      }
+    });
+
     it('404 error includes SAPSearch hint', async () => {
       mockFetch.mockReset();
       // Make the mock reject with a 404 AdtApiError
@@ -475,6 +699,134 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
       });
       expect(result.isError).toBe(true);
       expect(result.content[0]?.text).toContain('SAP_CLIENT');
+    });
+
+    it.each([
+      [
+        '/sap/bc/adt/datapreview/freestyle?rowNumber=10',
+        'SAPQuery',
+        { sql: "SELECT MANDT FROM T000 WHERE MANDT = '001'" },
+      ],
+      [
+        '/sap/bc/adt/datapreview/ddic?rowNumber=10&ddicEntityName=T000',
+        'SAPRead',
+        { type: 'TABLE_CONTENTS', name: 'T000', sqlFilter: "MANDT = '001'" },
+      ],
+    ])('gives cautious WAF guidance for a bare data-preview 403 at %s', async (path, tool, args) => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(new AdtApiError('Forbidden', 403, path, 'Forbidden'));
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, tool, args);
+      const text = result.content[0]?.text ?? '';
+
+      expect(result.isError).toBe(true);
+      expect(text).toMatch(/possible upstream WAF|possible.*body inspection/i);
+      expect(text).toContain('rejected CSRF/session pair');
+      expect(text).toContain('gateway logs');
+      expect(text).toContain('scoped WAF rule exclusion');
+      expect(text).toContain('SAP_GZIP_DATAPREVIEW_BODY');
+      expect(text).not.toContain('SAP_PASSWORD');
+    });
+
+    it('keeps the cautious WAF guidance in minimal-error mode without exposing the response body', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(
+        new AdtApiError('403 Forbidden', 403, '/sap/bc/adt/datapreview/freestyle?rowNumber=10', '403 Forbidden'),
+      );
+
+      const result = await handleToolCall(createClient(), { ...DEFAULT_CONFIG, minimalErrors: true }, 'SAPQuery', {
+        sql: "SELECT MANDT FROM T000 WHERE MANDT = '001'",
+      });
+      const text = result.content[0]?.text ?? '';
+
+      expect(result.isError).toBe(true);
+      expect(text).toMatch(/possible upstream WAF|possible.*body inspection/i);
+      expect(text).toContain('request ID');
+      expect(text).toContain('gateway logs');
+      expect(text).toContain('rejected CSRF/session pair');
+      expect(text).toContain('SAP_GZIP_DATAPREVIEW_BODY');
+      expect(text).not.toContain('403 Forbidden');
+      expect(text).not.toContain('SAP_PASSWORD');
+    });
+
+    it('does not label a structured SAP authorization fault on data preview as a WAF', async () => {
+      const xml =
+        '<exc:exception><type id="ExceptionNotAuthorized"/><localizedMessage>No authorization for S_TABU_NAM</localizedMessage></exc:exception>';
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(
+        new AdtApiError('Forbidden', 403, '/sap/bc/adt/datapreview/freestyle?rowNumber=10', xml),
+      );
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPQuery', {
+        sql: "SELECT MANDT FROM T000 WHERE MANDT = '001'",
+      });
+      const text = result.content[0]?.text ?? '';
+
+      expect(text).toContain('SU53');
+      expect(text).not.toContain('WAF');
+      expect(text).not.toContain('SAP_GZIP_DATAPREVIEW_BODY');
+    });
+
+    it('keeps normal authorization guidance for an unfiltered, bodyless DDIC preview 403', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(
+        new AdtApiError('Forbidden', 403, '/sap/bc/adt/datapreview/ddic?rowNumber=10&ddicEntityName=T000', 'Forbidden'),
+      );
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+        type: 'TABLE_CONTENTS',
+        name: 'T000',
+      });
+      const text = result.content[0]?.text ?? '';
+
+      expect(text).toContain('Authorization error');
+      expect(text).not.toContain('WAF');
+      expect(text).not.toContain('SAP_GZIP_DATAPREVIEW_BODY');
+    });
+
+    it.each([
+      [403, '/sap/bc/adt/programs/programs/ZTEST/source/main'],
+      [403, '/sap/bc/adt/datapreview/freestyle-extra'],
+      [404, '/sap/bc/adt/datapreview/freestyle'],
+      [500, '/sap/bc/adt/datapreview/freestyle'],
+    ])('does not add WAF guidance for status %s at %s', async (status, path) => {
+      mockFetch.mockReset();
+      mockFetch.mockRejectedValueOnce(new AdtApiError('Forbidden', status, path, 'Forbidden'));
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+        type: 'PROG',
+        name: 'ZTEST',
+      });
+      const text = result.content[0]?.text ?? '';
+
+      expect(text).not.toContain('WAF');
+      expect(text).not.toContain('SAP_GZIP_DATAPREVIEW_BODY');
+    });
+
+    it('shows SAP error text entity-decoded, and none of it in minimal-error mode', async () => {
+      const body =
+        '<?xml version="1.0" encoding="utf-8"?><exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework">' +
+        '<namespace id="com.sap.adt"/><type id="uriMappingError"/>' +
+        '<message lang="EN">Invalid URI: /x?a=1&amp;b=2 &lt;tag&gt;</message>' +
+        '<localizedMessage lang="EN">Invalid URI: /x?a=1&amp;b=2 &lt;tag&gt;</localizedMessage>' +
+        '<localizedMessage lang="EN">Second &amp; &amp;lt;last&amp;gt;</localizedMessage>' +
+        '<properties><entry key="T100KEY-V1">/x?a=1&amp;b=2</entry></properties></exc:exception>';
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(400, body));
+
+      const shown = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', { type: 'PROG', name: 'ZTEST' });
+      const text = shown.content[0]?.text ?? '';
+      expect(text).toContain('Invalid URI: /x?a=1&b=2 <tag>');
+      expect(text).toContain('Second & &lt;last&gt;');
+      expect(text).toContain('V1=/x?a=1&b=2');
+      expect(text).not.toContain('&amp;');
+
+      const hidden = await handleToolCall(createClient(), { ...DEFAULT_CONFIG, minimalErrors: true }, 'SAPRead', {
+        type: 'PROG',
+        name: 'ZTEST',
+      });
+      expect(hidden.content[0]?.text).toContain('ARC1_MINIMAL_ERRORS=true');
+      expect(hidden.content[0]?.text).not.toContain('Invalid URI');
     });
   });
 
@@ -591,7 +943,8 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
       const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', { type: 'PROG', name: 'ZA_TEST' });
       expect(result.isError).toBe(true);
       expect(result.content[0]?.text).toContain('already exists');
-      expect(result.content[0]?.text).toContain('action="update"');
+      expect(result.content[0]?.text).toContain('Inspect its identity, package and source');
+      expect(result.content[0]?.text).toContain('Do not blindly repeat create or overwrite');
     });
 
     it('400 activation dependency message returns activation hint', async () => {
@@ -905,6 +1258,19 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
       expect(result.content[0]?.text).toBeTruthy();
     });
 
+    it('forwards the advertised top-level version to SAPRead', async () => {
+      // 'inactive', not 'active': an omitted version also defaults to ?version=active.
+      const result = await handleToolCall(createClient(), { ...DEFAULT_CONFIG, toolMode: 'hyperfocused' }, 'SAP', {
+        action: 'read',
+        type: 'PROG',
+        name: 'ZHELLO',
+        version: 'inactive',
+      });
+      expect(result.isError).toBeUndefined();
+      const sourceCall = mockFetch.mock.calls.find((call: any[]) => String(call[0]).includes('/source/main'));
+      expect(String(sourceCall?.[0])).toContain('/programs/programs/ZHELLO/source/main?version=inactive');
+    });
+
     it('returns error for unknown SAP action', async () => {
       const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAP', {
         action: 'invalid_action',
@@ -916,11 +1282,42 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
     it('routes SAP(search) with params', async () => {
       const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAP', {
         action: 'search',
+        version: 'auto',
         params: { query: 'ZCL*' },
       });
       // Should succeed (mock returns data)
       expect(result.isError).toBeUndefined();
     });
+
+    it.each([
+      { version: 'active', serviceVersion: undefined, expected: '0001' },
+      { version: 'auto', serviceVersion: '0002', expected: '0002' },
+    ])(
+      'keeps read version=$version separate from service version=$expected',
+      async ({ version, serviceVersion, expected }) => {
+        mockFetch.mockImplementation(async (url) =>
+          String(url).includes('/publishjobs')
+            ? mockResponse(
+                200,
+                '<asx:abap xmlns:asx="http://www.sap.com/abapxml"><asx:values><DATA><SEVERITY>OK</SEVERITY></DATA></asx:values></asx:abap>',
+              )
+            : mockResponse(200, '<serviceBinding published="true" bindingCreated="true"/>', { 'x-csrf-token': 'T' }),
+        );
+        const result = await handleToolCall(createClient(), { ...DEFAULT_CONFIG, toolMode: 'hyperfocused' }, 'SAP', {
+          action: 'activate',
+          type: 'SRVB',
+          name: 'ZUI_TEST_O4',
+          version,
+          params: { action: 'publish_srvb', service_type: 'odatav4', version: serviceVersion },
+        });
+        expect(result.isError, result.content[0]?.text).toBeUndefined();
+        const posts = mockFetch.mock.calls.filter(
+          ([url, options]) => options?.method === 'POST' && String(url).includes('/publishjobs'),
+        );
+        expect(posts).toHaveLength(1);
+        expect(new URL(String(posts[0]![0])).searchParams.get('serviceversion')).toBe(expected);
+      },
+    );
   });
 
   describe('normalizeObjectType', () => {
@@ -1288,6 +1685,7 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
 
     it('adds a BDEF base-extensible hint for behavior extension create failures', async () => {
       mockFetch.mockReset();
+      mockFetch.mockResolvedValueOnce(mockResponse(200, '', { 'x-csrf-token': 'T' }));
       mockFetch.mockResolvedValue(
         mockResponse(
           400,

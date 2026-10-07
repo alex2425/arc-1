@@ -597,6 +597,14 @@ sessions stable.
 Multi-target dispatch rejects the hidden hyperfocused `SAP` alias and any plugin/custom tool name,
 even if a client calls an unlisted tool directly.
 
+Reviewed ATC selection extension (#770/#772): `SAPDiagnose.atc objects[]` is permitted on
+pinned and aggregate routes with at most 20 input entries and at most two worklists sharing
+one deadline. Every entry uses the call's one selected target and SAP identity; nested target
+selection is forbidden. This is covered by the existing ATC workload decision, including Basic
+targets under ADR-0007. It adds no repository mutation, parallel per-object jobs, or identity
+fallback. SAP authorization, global request/rate limits and `SAP_DENY_ACTIONS` still apply;
+the semaphore limits concurrent HTTP requests, not total ATC findings or SAP job duration.
+
 For 17–256 targets, the model obtains exact IDs and meaningful labels from `SAPTargets`; descriptions
 are deliberately not duplicated into every SAP-contacting tool schema. There is no standalone HTTP
 target catalog or browser HTML target page in v1. Copyable pinned and aggregate client-configuration
@@ -914,8 +922,8 @@ multi-target is enabled; deployment must also avoid rolling/blue-green overlap.
 
 - Add proposed ADR-0006, qualify ADR-0005, and add ADR-0007 for the explicit shared Basic identity
   exception; reflect both boundaries in the auto-loaded `AGENTS.md` rule.
-- Update the old evaluation/hub pages that still describe target-bound XSUAA roles or one instance
-  per system as the only permitted design.
+- Update the old evaluation and deployment pages that still describe target-bound XSUAA roles or
+  one instance per system as the only permitted design.
 - Commit this plan, ADR, administration page, and documentation qualification before starting code
   or asking Wouter to review the new PR. An uncommitted working-tree plan is not a reviewable spec.
 - Record the exact PR #543 merge-base/commits in the new PR description.
@@ -1186,7 +1194,6 @@ Files:
 - `docs_page/principal-propagation-setup.md`
 - `docs_page/architecture.md`
 - `docs/multi-destination-evaluation.md`
-- External `arc-mcp/mcp-hub` documentation: <https://github.com/arc-mcp/mcp-hub>
 - `docs_page/index.md`, `docs_page/roadmap.md`, `docs/compare/00-feature-matrix.md`
 - `mkdocs.yml`
 

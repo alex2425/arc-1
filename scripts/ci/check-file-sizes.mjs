@@ -28,14 +28,20 @@ const BUDGETS = {
   // write.ts is now a thin SAPWrite orchestrator (prologue + ctx + action dispatch) after the
   // Stage D split into src/handlers/write/{create,update-delete,class-surgery,rap}.ts. The action
   // submodules ride the default src budget; keep this tight so the dispatcher can't reabsorb them.
-  'src/handlers/write.ts': 360,
+  'src/handlers/write.ts': 300,
   // tools.ts holds every tool's JSON schema. The #520 description trim (write-mode tools/list
   // 87→66 KB to clear the Copilot-for-Eclipse gateway limit) shrank it; lowered to match. The
   // CLIENT-SAFETY size guard is scripts/ci/check-tool-schema-budget.ts — trim there before raising this.
   // +text-pool SAPWrite actions/description (edit_text_symbols/edit_selection_texts).
   // +per-action SAPWrite description (one line per action, incl. the destructive/refusing ones).
   // +3 for SAPTransport action="diff" (action list + offset/limit properties).
-  'src/handlers/tools.ts': 1730,
+  // +30 for the inline shortTexts object schema and retained refObjectDescription guidance. Keeping
+  // this public schema beside SAPWrite avoids a one-constant module whose only purpose was the ratchet.
+  // +5 for the optional relations projection hook; its implementation stays in relation-tool.ts.
+  // +30 for SAPDiagnose ATC objects[]; keep its small item schema with the tool (no new module).
+  // Combined #769/#772: 1791 lines, retaining 4 lines of headroom.
+  // +4: parent function group for SAPTransport check/history.
+  'src/handlers/tools.ts': 1774,
   // +shared parseNamedItems relocated here from transport.ts (now used by ATC variants too) +
   // parseAtcSystemCheckVariant (FEAT-68 ATC variant listing) + parseFunctionModuleProperties and
   // the pre-7.52 projectexplorer function-group parser.
@@ -44,16 +50,47 @@ const BUDGETS = {
   // are the CTS-id shape guard and the safe percent-decode — an unvalidated href tail returned
   // "reference" as a transport id, and a malformed escape threw away the whole feed
   // (docs/plans/2026-08-03-transport-diff.md).
-  'src/adt/xml-parser.ts': 1820,
+  // -25: parseXml decodes entities itself, so the per-parser decodes went away.
+  // -43: the ENHO payload parser moved to the enhancement domain module (src/adt/enhancements.ts).
+  'src/adt/xml-parser.ts': 1726,
   // diagnostics.ts gained the ABAP trace-request engine (#508) + the OData perf probe + CDS Show-SQL (#509)
   // + ST05 SQL-trace control (#510) + clientWait split. Split out a perf/trace module if it grows much further.
-  'src/adt/diagnostics.ts': 1845,
+  // +88 for dump paging: SAP caps the dumps feed at 100 entries and ignores $skip, so listDumps walks
+  // the inclusive `to` bound, refuses to guess when a second holds a full page, and rejects bounds
+  // SAP would silently discard or roll over to another day.
+  'src/adt/diagnostics.ts': 1933,
   // The ADT client facade aggregates every read/write op; set_api_state (#506) + runQueryWithMetrics
   // (SAPQuery metrics) + getEffectiveUser (BTP JWT-derived user, G-5) + getSourceAtObjectUrl
   // (post-activation cache promotion) + get/writeClassTextElements (class text pool) pushed it past
   // the default. Keep tight headroom.
   // + getFunctionModuleProperties and the getFunctionGroup pre-7.52 objectstructure fallback.
-  'src/adt/client.ts': 1730,
+  // + the #739 data-result scope/budget plumbing (main raised this to 1730 for it).
+  // +10 on top of that for runQueryBatch, the single freestyle-SQL entry point that authorizes a
+  // whole logical request once and then executes its statements inside one response-memory scope.
+  // Authorization and the POSTs must stay inside one private client operation, so this genuinely
+  // belongs on the facade; the two parts that did not were extracted first (lineage evaluation to
+  // data-source-policy.ts, the statement-execution loop to table-query.ts).
+  // -5 after removing the forwarding-only guard factory and its extra import/configuration lines.
+  // TABL write-route cache removed (never cache subtype routes for mutations); +9 for refusing TABL
+  // mutations whose subtype cannot be verified on 7.50/7.51 (the resolver's error text).
+  // +30: three enhancement read ops on the facade — spot metadata (ENHS), the enhanced object's
+  // enhancement feed, and the repository object structure that locates a FORM's include.
+  'src/adt/client.ts': 1727,
+  // The single live ADT integration suite covers every read/write surface against a real system;
+  // it passed the 3000-line default test budget with the ATC check-variant binding cases
+  // (docs/research/2026-08-19-atc-default-check-variant.md). Split by domain before raising again.
+  'tests/integration/adt.integration.test.ts': 3100,
+  // The two largest unit suites each gained the enhancement-framework cases (subtype routing,
+  // workbench fallback, anchors, exit types). Split by domain before raising either again.
+  'tests/unit/adt/client.test.ts': 3110,
+  'tests/unit/handlers/read.test.ts': 3101,
+  // Typed attempt accounting, scoped response ownership, and stateful-context teardown must stay at
+  // the transport choke point. Relation parsing/traversal and feature algorithms live elsewhere.
+  'src/adt/http.ts': 1561, // +12: #907 bounded legacy negotiation; selector lives in its own module.
+  // #817: reject absent CTS documents at the existing list/get parser boundary.
+  'src/adt/transport.ts': 1507, // Keep the safe CTS explanation in minimal-error mode.
+  // +3 for passing existing exact discovery evidence into the pure opt-in schema projection.
+  'src/server/server.ts': 1493, // Shared HTTP transport + monotonic renewal for new requests (R21).
 };
 
 const DEFAULT_SRC = 1500;
@@ -74,7 +111,10 @@ function countLines(path) {
 // NUL-delimited so paths with spaces/non-ASCII are never quoted-and-mangled (git's default
 // core.quotePath would wrap "tests/.../zäh.ts" in quotes, and a naive .endsWith('.ts') would
 // then silently skip it — voiding the ratchet for that file).
-const files = execSync('git ls-files -z src tests bin', { encoding: 'utf8' })
+// Include the maintained relation-validation entry points, not unrelated research scripts.
+const files = execSync('git ls-files -z src tests bin scripts/smoke-live-relations.ts scripts/bench-context-parsing.ts', {
+  encoding: 'utf8',
+})
   .split('\0')
   .filter((f) => f.endsWith('.ts') || f.endsWith('.mjs'));
 

@@ -13,7 +13,9 @@ import {
 } from '@modelcontextprotocol/sdk/types.js';
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { z } from 'zod';
+import { AdtClient } from '../../../src/adt/client.js';
 import { AdtApiError } from '../../../src/adt/errors.js';
+import * as adtFeatures from '../../../src/adt/features.js';
 import { AdtHttpClient } from '../../../src/adt/http.js';
 import type { ResolvedFeatures } from '../../../src/adt/types.js';
 import { MemoryCache } from '../../../src/cache/memory.js';
@@ -21,10 +23,13 @@ import { getToolRegistry } from '../../../src/handlers/dispatch.js';
 import { resetCachedFeatures, setCachedFeatures } from '../../../src/handlers/feature-cache.js';
 import { getToolDefinitions } from '../../../src/handlers/tools.js';
 import { defineTool } from '../../../src/public/index.js';
+import { SYSTEM_LABEL_MAX_LENGTH } from '../../../src/server/config.js';
 import { opaqueDestinationValue } from '../../../src/server/destination-discovery.js';
-import { targetConnectionFingerprint } from '../../../src/server/destination-registry.js';
+import { DestinationRegistry, targetConnectionFingerprint } from '../../../src/server/destination-registry.js';
 import { logger } from '../../../src/server/logger.js';
+import { MULTI_TARGET_SERVER_INSTRUCTIONS } from '../../../src/server/multi-target-server.js';
 import { registerPluginTool } from '../../../src/server/plugin-loader.js';
+import { dataResultAdmissionEnvelope, runtimeMemoryEnvelope } from '../../../src/server/runtime-memory.js';
 import {
   buildAdtConfig,
   canUseSharedSingleTargetCredentials,
@@ -34,10 +39,12 @@ import {
   formatStartupAuthPreflightToolError,
   getConfiguredToolDefinitions,
   logAuthSummary,
+  probeClientFeatures,
   resolveNullableOptionals,
   resolvePpDestinationName,
   resolveSingleTargetOverlapState,
   runStartupAuthPreflight,
+  runStartupAuthPreflightWithClient,
   VERSION,
 } from '../../../src/server/server.js';
 import { DEFAULT_CONFIG } from '../../../src/server/types.js';
@@ -54,27 +61,109 @@ function requestHandler(server: Server, method: string): RequestHandler {
   return handler;
 }
 
+async function initializeServer(
+  config: Parameters<typeof createServer>[0],
+  options: Parameters<typeof createServer>[1] = {},
+) {
+  const server = createServer(config, options);
+  const client = new Client({ name: 'arc1-server-test', version: '1.0.0' });
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+
+  try {
+    await server.connect(serverTransport);
+    await client.connect(clientTransport);
+    return { version: client.getServerVersion(), instructions: client.getInstructions() };
+  } finally {
+    await client.close();
+    await server.close();
+  }
+}
+
 describe('MCP Server', () => {
+  it('computes the data-result admission envelope without unsafe-number rounding', () => {
+    expect(dataResultAdmissionEnvelope(2 * 1024 * 1024, 2)).toBe(4 * 1024 * 1024);
+    expect(dataResultAdmissionEnvelope(Number.MAX_SAFE_INTEGER, 2)).toBe('18014398509481982');
+  });
+
+  it('reports the non-secret Cloud Foundry memory inputs and effective V8 heap limit', () => {
+    expect(runtimeMemoryEnvelope({ MEMORY_AVAILABLE: '512', OPTIMIZE_MEMORY: 'true' }, 396 * 1024 * 1024)).toEqual({
+      cfMemoryAvailableMiB: 512,
+      optimizeMemory: true,
+      v8HeapSizeLimitMiB: 396,
+    });
+    expect(runtimeMemoryEnvelope({ MEMORY_AVAILABLE: 'invalid' }, 4 * 1024 * 1024 * 1024)).toEqual({
+      cfMemoryAvailableMiB: undefined,
+      optimizeMemory: false,
+      v8HeapSizeLimitMiB: 4096,
+    });
+  });
+
   it.each([
     ['default', DEFAULT_CONFIG, 'arc-1'],
     ['custom', { ...DEFAULT_CONFIG, serverName: 'arc1-erp-dev' }, 'arc1-erp-dev'],
   ])('advertises the %s server name and version in the initialize handshake', async (_label, config, expectedName) => {
-    const server = createServer(config);
-    const client = new Client({ name: 'arc1-server-test', version: '1.0.0' });
-    const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
-
-    try {
-      await server.connect(serverTransport);
-      await client.connect(clientTransport);
-      expect(client.getServerVersion()).toEqual({ name: expectedName, version: VERSION });
-    } finally {
-      await client.close();
-      await server.close();
-    }
+    expect((await initializeServer(config)).version).toEqual({ name: expectedName, version: VERSION });
   });
 
-  it('has a valid version string', () => {
-    expect(VERSION).toMatch(/^\d+\.\d+\.\d+/);
+  it('prepends a system label to the single-target instructions without changing their body', async () => {
+    const baseline = (await initializeServer(DEFAULT_CONFIG)).instructions;
+    const labeled = (await initializeServer({ ...DEFAULT_CONFIG, systemLabel: 'ERP production (read-only)' }))
+      .instructions;
+
+    expect(baseline).toMatch(/^ARC-1 gives this SAP ABAP system/);
+    expect(baseline).not.toContain('Connected SAP system:');
+    expect(labeled).toBe(`Connected SAP system: ERP production (read-only).\n\n${baseline}`);
+  });
+
+  it.each(['standard', 'hyperfocused'] as const)(
+    'preserves evidence-led reviews and targeted method reads in %s',
+    async (toolMode) => {
+      const { instructions } = await initializeServer({ ...DEFAULT_CONFIG, toolMode });
+      expect(instructions).toContain('Understanding an object: SAPContext(action="deps") returns available KTD');
+      expect(instructions).toContain('Native relationship maps: SAPNavigate(action="relations") when listed');
+      expect(instructions).toContain(
+        'Use SAPRead afterwards for exact implementation, method bodies or known references',
+      );
+      expect(instructions).toContain('One method: SAPRead(type="CLAS", method="name")');
+      expect(instructions).toContain('Source behavior is not a specification');
+      expect(instructions).toContain(
+        'For draft reviews/test design, first SAPContext(action="deps") for available KTD (type+name), unless requirements are supplied',
+      );
+      expect(instructions).toContain(
+        'Test expectations follow those requirements; show current behavior separately, even when it is a defect',
+      );
+      expect(instructions).toContain('If a targeted requirements lookup yields no evidence or lead');
+      expect(instructions).toContain('finish with observed source behavior and unverified intent/compliance');
+      expect(instructions).toContain('Do not broaden the policy search');
+      expect(instructions).toContain('Unavailable or failed syntax/ATC/test checks are not passes');
+    },
+  );
+
+  it('keeps the maximum system label below the client instruction ceiling', async () => {
+    const instructions = (
+      await initializeServer({ ...DEFAULT_CONFIG, systemLabel: 'x'.repeat(SYSTEM_LABEL_MAX_LENGTH) })
+    ).instructions;
+    expect(instructions?.length).toBeLessThan(2_048);
+  });
+
+  it('rejects an overlong system label even when ServerConfig is constructed directly', () => {
+    expect(() => createServer({ ...DEFAULT_CONFIG, systemLabel: 'x'.repeat(SYSTEM_LABEL_MAX_LENGTH + 1) })).toThrow(
+      `ARC1_SYSTEM_LABEL must be at most ${SYSTEM_LABEL_MAX_LENGTH} characters`,
+    );
+  });
+
+  it('keeps multi-target instructions authoritative over a single-target system label', async () => {
+    const registry = DestinationRegistry.unavailable({
+      code: 'REGISTRY_DISCOVERY_ERROR',
+      message: 'safe test failure',
+    });
+    const metadata = await initializeServer(
+      { ...DEFAULT_CONFIG, systemLabel: 'SHOULD NOT APPEAR' },
+      { multiTarget: { mode: 'aggregate', registry, instanceConfig: DEFAULT_CONFIG } },
+    );
+
+    expect(metadata.instructions).toBe(MULTI_TARGET_SERVER_INSTRUCTIONS);
+    expect(metadata.instructions).not.toContain('SHOULD NOT APPEAR');
   });
 
   // tools/list must never wait on SAP. Clients cancel it on their own schedule (Cline at ~5s) and
@@ -595,6 +684,29 @@ describe('createServer request handlers', () => {
 
     expect(markSpy).toHaveBeenCalledTimes(1);
   });
+
+  it('marks a shared HTTP transport stale once across per-request servers', async () => {
+    const markSpy = vi.spyOn(AdtHttpClient.prototype, 'markCookiesStale').mockImplementation(() => undefined);
+    const defaultHttp = new AdtClient({ baseUrl: 'http://sap:8000', username: 'admin', password: 'secret' }).http;
+    const startupAuthPreflightPromise = Promise.resolve({
+      status: 'inconclusive' as const,
+      blocking: false,
+      endpoint: '/sap/bc/adt/core/discovery',
+      checkedAt: '2026-09-27T00:00:00.000Z',
+      statusCode: 401,
+      reason: 'stale cookie file',
+    });
+
+    // HTTP builds one Server (and AdtClient) per request over the same transport; mark it only once.
+    for (let request = 0; request < 2; request++) {
+      const server = createServer(DEFAULT_CONFIG, { startupAuthPreflightPromise, defaultHttp });
+      const handler = requestHandler(server, CallToolRequestSchema.shape.method.value);
+      await handler({ method: 'tools/call', params: { name: 'UnknownTool', arguments: {} } }, {});
+    }
+
+    expect(markSpy).toHaveBeenCalledTimes(1);
+    expect(markSpy.mock.contexts[0]).toBe(defaultHttp);
+  });
 });
 
 describe('createServer tools/list — plugin tools (FEAT-61)', () => {
@@ -765,6 +877,20 @@ describe('buildAdtConfig', () => {
     });
 
     expect(cfg.disableSaml).toBe(true);
+  });
+
+  it('propagates gzipDataPreviewBody into ADT config', () => {
+    const enabled = buildAdtConfig({
+      ...DEFAULT_CONFIG,
+      gzipDataPreviewBody: true,
+    });
+    const disabled = buildAdtConfig({
+      ...DEFAULT_CONFIG,
+      gzipDataPreviewBody: false,
+    });
+
+    expect(enabled.gzipDataPreviewBody).toBe(true);
+    expect(disabled.gzipDataPreviewBody).toBe(false);
   });
 
   it('passes cookieFile and cookieString through to shared ADT config', () => {
@@ -1027,7 +1153,7 @@ describe('startup auth preflight', () => {
   });
 
   it('returns blocking failure on 401/403 auth errors', async () => {
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(
       new AdtApiError('Unauthorized', 401, '/sap/bc/adt/core/discovery', 'Unauthorized'),
     );
 
@@ -1044,8 +1170,26 @@ describe('startup auth preflight', () => {
     expect(result.statusCode).toBe(401);
   });
 
+  it('can run on an existing client so direct callers retain its auth state', async () => {
+    const fetchCsrfToken = vi.fn(async () => '/sap/bc/adt/discovery');
+    const client = { http: { fetchCsrfToken } } as unknown as import('../../../src/adt/client.js').AdtClient;
+
+    const result = await runStartupAuthPreflightWithClient(
+      {
+        ...DEFAULT_CONFIG,
+        ppEnabled: false,
+        url: 'http://sap.example.com:8000',
+      },
+      client,
+    );
+
+    expect(result.status).toBe('ok');
+    expect(fetchCsrfToken).toHaveBeenCalledOnce();
+    expect(result.endpoint).toBe('/sap/bc/adt/discovery');
+  });
+
   it('returns inconclusive and non-blocking on non-auth failures', async () => {
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(new Error('connect ECONNREFUSED'));
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(new Error('connect ECONNREFUSED'));
 
     const result = await runStartupAuthPreflight({
       ...DEFAULT_CONFIG,
@@ -1061,7 +1205,7 @@ describe('startup auth preflight', () => {
 
   it('downgrades 401 to inconclusive (non-blocking) when in cookie-auth mode', async () => {
     const fixture = writeCookieFixture('.example.com\tTRUE\t/\tFALSE\t0\tSAP_SESSIONID\txyz789\n');
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(
       new AdtApiError('Unauthorized', 401, '/sap/bc/adt/core/discovery', 'stale cookie'),
     );
 
@@ -1084,7 +1228,7 @@ describe('startup auth preflight', () => {
 
   it('keeps 403 blocking even in cookie-auth mode', async () => {
     const fixture = writeCookieFixture('.example.com\tTRUE\t/\tFALSE\t0\tSAP_SESSIONID\txyz789\n');
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(
       new AdtApiError('Forbidden', 403, '/sap/bc/adt/core/discovery', 'forbidden'),
     );
 
@@ -1105,7 +1249,7 @@ describe('startup auth preflight', () => {
   });
 
   it('keeps 401 blocking when not in cookie-auth mode', async () => {
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(
       new AdtApiError('Unauthorized', 401, '/sap/bc/adt/core/discovery', 'wrong creds'),
     );
 
@@ -1127,7 +1271,7 @@ describe('startup auth preflight', () => {
   // promising "no restart needed" would be a lie. Only SAP_COOKIE_FILE gets
   // the non-blocking downgrade.
   it('keeps 401 blocking when only cookieString is set (no hot-reload promise)', async () => {
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(
       new AdtApiError('Unauthorized', 401, '/sap/bc/adt/core/discovery', 'stale cookie'),
     );
 
@@ -1149,7 +1293,7 @@ describe('startup auth preflight', () => {
 
   it('downgrade applies even when both cookieFile and cookieString are set (file wins)', async () => {
     const fixture = writeCookieFixture('.example.com\tTRUE\t/\tFALSE\t0\tSAP_SESSIONID\txyz789\n');
-    vi.spyOn(AdtHttpClient.prototype, 'get').mockRejectedValue(
+    vi.spyOn(AdtHttpClient.prototype, 'fetchCsrfToken').mockRejectedValue(
       new AdtApiError('Unauthorized', 401, '/sap/bc/adt/core/discovery', 'stale cookie'),
     );
 
@@ -1169,6 +1313,24 @@ describe('startup auth preflight', () => {
     } finally {
       fixture.cleanup();
     }
+  });
+});
+
+describe('direct client feature bootstrap', () => {
+  afterEach(() => {
+    vi.restoreAllMocks();
+  });
+
+  it('installs discovery evidence on the exact client that was probed', async () => {
+    const discoveryMap = new Map([['/sap/bc/adt/programs/programs', ['application/vnd.sap.adt.programs.v2+xml']]]);
+    vi.spyOn(adtFeatures, 'probeFeatures').mockResolvedValue({ discoveryMap } as ResolvedFeatures);
+    const setDiscoveryMap = vi.fn();
+    const client = { http: { setDiscoveryMap } } as unknown as import('../../../src/adt/client.js').AdtClient;
+
+    await probeClientFeatures(DEFAULT_CONFIG, client);
+
+    expect(setDiscoveryMap).toHaveBeenCalledOnce();
+    expect(setDiscoveryMap).toHaveBeenCalledWith(discoveryMap);
   });
 });
 

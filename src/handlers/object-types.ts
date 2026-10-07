@@ -1,9 +1,11 @@
 /**
- * Object-type normalization + ADT URL building (pure utilities, no project-internal imports).
+ * Object-type normalization + ADT URL building (static utilities, with server-driven paths from the shared registry).
  *
  * Slash-form alias maps, friendly aliases, canonical-type normalization, the objectBasePath/URL builders,
  * LLM arg-stripping, and class-include helpers.
  */
+
+import { SDO_REGISTRY } from '../adt/server-driven.js';
 
 // ─── Object URL Mapping ──────────────────────────────────────────────
 
@@ -58,6 +60,7 @@ export const SLASH_TYPE_MAP: Record<string, string> = {
   'VIEW/DV': 'VIEW', // docs/research/abap-types/types/view.md
   'SKTD/TYP': 'SKTD', // docs/research/abap-types/types/sktd.md
   'TTYP/DA': 'TTYP', // docs/research/abap-types/types/ttyp.md — live a4h 758 + 816 return adtcore:type="TTYP/DA"
+  'ENQU/DL': 'ENQU', // docs/research/abap-types/types/enqu.md — live 758 + 816 return adtcore:type="ENQU/DL"
 };
 
 /**
@@ -90,6 +93,7 @@ export const SLASH_TYPE_EVIDENCE: Record<string, string> = {
   'VIEW/DV': 'docs/research/abap-types/types/view.md',
   'SKTD/TYP': 'docs/research/abap-types/types/sktd.md',
   'TTYP/DA': 'docs/research/abap-types/types/ttyp.md',
+  'ENQU/DL': 'docs/research/abap-types/types/enqu.md',
 };
 
 const FRIENDLY_TYPE_ALIAS_MAP: Record<string, string> = {
@@ -127,6 +131,7 @@ export const KNOWN_BASE_TYPES = new Set([
   'VIEW',
   'SKTD',
   'TTYP',
+  'ENQU',
 ]);
 
 /** Normalize ADT type codes and aliases to ARC-1 canonical short types. */
@@ -134,6 +139,12 @@ export function normalizeObjectType(type: string): string {
   const normalized = String(type).trim().toUpperCase();
   if (!normalized) return '';
   return FRIENDLY_TYPE_ALIAS_MAP[normalized] ?? SLASH_TYPE_MAP[normalized] ?? normalized;
+}
+
+/** Object search accepts SAP slash subtypes; only friendly aliases may collapse. */
+export function normalizeSearchObjectType(type: string): string {
+  const normalized = type.trim().toUpperCase();
+  return FRIENDLY_TYPE_ALIAS_MAP[normalized] ?? normalized;
 }
 
 /** TABL subtypes that SAPWrite preserves (instead of collapsing to bare 'TABL' via
@@ -261,6 +272,10 @@ export function normalizeTypeArgsForValidation(
           cleaned.objectType === undefined ? undefined : normalizeObjectType(String(cleaned.objectType ?? '')),
       };
     case 'SAPWrite': {
+      const action = String(cleaned.action ?? '');
+      // A text-pool PUT replaces the selected part; an explicit empty string clears it.
+      // Null/omitted source remains a missing-source error; other actions keep normal stripping.
+      if (action === 'edit_text_symbols' && typeof args.source === 'string') cleaned.source = args.source;
       // SAPWrite preserves TABL/DT and TABL/DS so the create path can route by subtype.
       const normType = cleaned.type === undefined ? undefined : normalizeWriteObjectType(String(cleaned.type ?? ''));
       // Drop an inapplicable `include`: it is only meaningful for a CLAS local-include
@@ -269,7 +284,6 @@ export function normalizeTypeArgsForValidation(
       // which validateSapWriteInput would otherwise hard-reject even though the requested
       // intent is valid. A garbage include VALUE on a real CLAS include path is still
       // rejected by the z.enum check downstream (issue #360).
-      const action = String(cleaned.action ?? '');
       const includeApplies =
         normType === 'CLAS' && (action === 'update' || action === 'edit_method' || action === 'edit_class_definition');
       if (!includeApplies) delete cleaned.include;
@@ -306,13 +320,14 @@ export function normalizeTypeArgsForValidation(
             )
           : cleaned.objects,
       };
-    case 'SAPSearch':
-      return {
-        ...cleaned,
-        objectType:
-          cleaned.objectType === undefined ? undefined : normalizeObjectType(String(cleaned.objectType ?? '')),
-      };
     case 'SAPNavigate':
+      // Strict-schema clients fill in optional fields for unrelated actions (#360).
+      // Relations-only controls must not break ordinary navigation or reach its handler.
+      if (cleaned.action !== 'relations') {
+        delete cleaned.direction;
+        delete cleaned.depth;
+        delete cleaned.expandPackages;
+      }
       // Only normalize `type` (for URL building). `objectType` is passed to SAP's
       // where-used scope API in slash format (e.g., CLAS/OC) — normalizing it would break the filter.
       return {
@@ -320,9 +335,35 @@ export function normalizeTypeArgsForValidation(
         type: cleaned.type === undefined ? undefined : normalizeObjectType(String(cleaned.type ?? '')),
       };
     case 'SAPDiagnose':
+      // Strict-schema clients may supply an empty placeholder on single-object
+      // or unrelated actions. An actual empty ATC batch remains a validation error.
+      if (
+        Array.isArray(cleaned.objects) &&
+        cleaned.objects.length === 0 &&
+        (cleaned.action !== 'atc' ||
+          cleaned.name !== undefined ||
+          cleaned.type !== undefined ||
+          cleaned.url !== undefined)
+      ) {
+        delete cleaned.objects;
+      }
       return {
         ...cleaned,
         type: cleaned.type === undefined ? undefined : normalizeObjectType(String(cleaned.type ?? '')),
+        objects: Array.isArray(cleaned.objects)
+          ? cleaned.objects.map((obj) => {
+              if (typeof obj !== 'object' || obj === null || Array.isArray(obj)) return obj;
+              const item = obj as Record<string, unknown>;
+              return {
+                ...item,
+                type: typeof item.type === 'string' ? normalizeObjectType(item.type.trim()) : item.type,
+                name:
+                  typeof item.name === 'string'
+                    ? item.name.trim().replace(/[a-z]/g, (char) => char.toUpperCase())
+                    : item.name,
+              };
+            })
+          : cleaned.objects,
       };
     case 'SAPContext':
       return {
@@ -357,11 +398,16 @@ export function functionGroupObjectUrl(group: string): string {
   return `/sap/bc/adt/functions/groups/${encodeURIComponent(normalizedGroup.toLowerCase())}`;
 }
 
+export function functionGroupIncludeObjectUrl(group: string, name: string): string {
+  return `${functionGroupObjectUrl(group)}/includes/${encodeURIComponent(name.toLowerCase())}`;
+}
+
 export function functionModuleObjectUrl(group: string, name: string): string {
   return `${functionGroupObjectUrl(group)}/fmodules/${encodeURIComponent(name.toLowerCase())}`;
 }
 
 export function objectBasePath(type: string): string {
+  if (Object.hasOwn(SDO_REGISTRY, type)) return `${SDO_REGISTRY[type as keyof typeof SDO_REGISTRY].href}/`;
   switch (type) {
     case 'PROG':
       return '/sap/bc/adt/programs/programs/';
@@ -421,6 +467,9 @@ export function objectBasePath(type: string): string {
       // DDIC table types. Live a4h 758 + 816 confirm GET/POST/DELETE here; XML-metadata
       // (no source/main). docs/research/abap-types/types/ttyp.md.
       return '/sap/bc/adt/ddic/tabletypes/';
+    case 'ENQU':
+      // DDIC lock objects: XML metadata, no source/main. Live 8.16: docs/research/abap-types/types/enqu.md.
+      return '/sap/bc/adt/ddic/lockobjects/sources/';
     case 'MSAG':
       return '/sap/bc/adt/messageclass/';
     case 'DEVC':
@@ -524,10 +573,10 @@ export function normalizeClassWriteInclude(include: unknown): ClassWriteInclude 
 
 /**
  * Auto-detect which class include a method specifier targets, based on the
- * local-class prefix on the LHS of `<localclass>~<method>`. Used by
- * `edit_method` so callers can pass `lhc_project~approve_project` and have
- * ARC-1 transparently route the read+write to `/includes/implementations`
- * instead of `/source/main`.
+ * local-class prefix on the LHS of `<localclass>~<method>`. Used by method-level
+ * reads and `edit_method` so callers can pass `lhc_project~approve_project` and
+ * have ARC-1 transparently route to `/includes/implementations` instead of
+ * `/source/main`.
  *
  * Prefix → include mapping (intentionally narrow; extend via explicit
  * `include` parameter when a code-base uses other conventions):
@@ -549,9 +598,4 @@ export function detectLocalHandlerInclude(method: string): ClassWriteInclude | u
   if (/^(lhc|lcl)_/.test(lhs)) return 'implementations';
   if (/^ltc_/.test(lhs)) return 'testclasses';
   return undefined;
-}
-
-/** Strip the leading "=== <include> ===\n" header that `client.getClass(name, include)` prepends. */
-export function stripIncludeHeader(source: string): string {
-  return source.replace(/^=== \w+ ===\n/, '');
 }

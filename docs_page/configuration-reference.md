@@ -35,7 +35,7 @@ For the full per-deployment-mode breakdown (npx vs local vs Docker vs BTP, and t
 
 **Boolean values.** Most boolean flags accept either `"true"` or `"1"`. One exception: `ARC1_LOG_HTTP_DEBUG` accepts only `"true"` ([known inconsistency](#logging-and-observability)).
 
-**Comma-separated lists.** `SAP_ALLOWED_PACKAGES`, `SAP_ALLOWED_TRANSPORTS`, `SAP_DENY_ACTIONS`, and `ARC1_ALLOWED_ORIGINS` are split on `,` and `.trim()`-ed. Quote shell-sensitive entries (`*`, `$TMP`, glob characters): `-e SAP_ALLOWED_PACKAGES='Z*,$TMP'`. In `.env` files no extra quoting is needed.
+**Comma-separated lists.** `SAP_ALLOWED_PACKAGES`, `SAP_ALLOWED_TRANSPORTS`, `SAP_DENY_ACTIONS`, `SAP_BLOCKED_DATA_SOURCES`, and `ARC1_ALLOWED_ORIGINS` are split on `,` and `.trim()`-ed. Quote shell-sensitive entries (`*`, `$TMP`, glob characters): `-e SAP_ALLOWED_PACKAGES='Z*,$TMP'`. In `.env` files no extra quoting is needed.
 
 ---
 
@@ -49,15 +49,34 @@ The bare minimum needed to reach a SAP system. None of these affect what tool ca
 | `--client` | `SAP_CLIENT` | `100` | Logon client number. Sent as `sap-client` in every ADT request and as the `client` field during authentication. Wrong value → "Logon not possible (incorrect client)". |
 | `--language` | `SAP_LANGUAGE` | `EN` | SAP logon language. Affects message texts, DDIC short descriptions, and any other language-dependent server response. |
 | `--insecure` | `SAP_INSECURE` | `false` | When `true`, skips TLS certificate verification on the SAP HTTP client. **Dev only** — masks man-in-the-middle attacks and corp-CA misconfiguration in production. |
+| `--gzip-datapreview-body` | `SAP_GZIP_DATAPREVIEW_BODY` | `false` | Compatibility fallback for a reverse proxy/WAF that falsely blocks legitimate SQL-shaped request bodies. When explicitly enabled, gzip-encodes only non-empty POST bodies on the exact ADT collection paths `/sap/bc/adt/datapreview/freestyle` and `/sap/bc/adt/datapreview/ddic`, and sends `Content-Encoding: gzip`. Request decompression is verified on SAP_BASIS 758 and 816; the available 750 test system advertises but does not bind data preview, so validate with one query after enabling on another release. ARC-1 never enables or retries with gzip automatically. This does not enable data preview/free SQL or bypass ARC-1 scopes/SAP authorization, but it can make these bodies opaque to a WAF that scans raw bytes; prefer an approved, narrowly scoped gateway rule exclusion and enable this only with the security owner's approval. In multi-target mode this is one global server policy and therefore applies to every destination. |
 | `--system-type` | `SAP_SYSTEM_TYPE` | `auto` | Forces ARC-1's release/feature gating to behave as if the target is `btp` (Steampunk/Public Cloud) or `onprem`. `auto` (default) lets ARC-1 detect via probes. Override when auto-detection is wrong (e.g. mirrored systems). |
+| `--user-agent` | `SAP_USER_AGENT` | `arc-1/<version>` | Outbound SAP HTTP User-Agent, including CSRF bootstrap and stateful/proxy requests. Optional deployment identifier; printable ASCII, at most 256 characters, surrounding spaces trimmed. Unset/empty uses the default. No caller identity is added. Applies to every destination in multi-target mode. |
 | `--abap-release` | `SAP_ABAP_RELEASE` | — | Manual `SAP_BASIS` release override for local tooling that needs a release number (e.g. abaplint's syntax-feature gating). Examples: `758` for S/4HANA 2023, `816` for ABAP Platform 2025 (SAP renumbered 75x→8xx). ARC-1's runtime probe still wins when available — this is the fallback. |
+
+For SAP ICM request logs, the Basis team can include `%{user-agent}i` in an existing
+[HTTP logging format](https://help.sap.com/saphelp_em92/helpdata/en/48/442541e0804bb8e10000000a42189b/content.htm).
+For example, set `SAP_USER_AGENT=arc-1/team-dev` in local environment configuration,
+or `SAP_USER_AGENT: "arc-1/team-dev"` in CF `.mtaext` properties, and restart/redeploy.
+This identifies ARC-1 traffic; it is sender-supplied, spoofable metadata, never an authorization
+signal. Do not include credentials or personal data. This option applies to ARC-1's SAP HTTP transport,
+not OAuth token requests made by authentication libraries. Proxy header forwarding is unit-tested;
+end-to-end Cloud Connector forwarding and SAP ICM log capture remain unverified.
 
 ### TLS / proxy notes
 
-ARC-1 uses [undici](https://github.com/nodejs/undici) for all SAP HTTP. It respects standard `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY` env vars. For custom CA certificates, set `NODE_EXTRA_CA_CERTS=/path/to/ca.pem` (read by Node, not by ARC-1 directly). For Docker mounts of CA bundles, see [docker.md](docker.md#self-signed-or-internal-ca-certificates).
+ARC-1 uses [undici](https://github.com/nodejs/undici) for SAP HTTP. Ordinary direct ADT traffic does
+**not yet** honor `HTTPS_PROXY` / `HTTP_PROXY` / `NO_PROXY`; that work is tracked as
+[COMPAT-06](roadmap.md#compat-06). BTP Destination Service / Cloud Connector connectivity is a separate
+platform-managed proxy path and is unaffected. For custom CA certificates, set
+`NODE_EXTRA_CA_CERTS=/path/to/ca.pem` (read by Node, not by ARC-1 directly). For Docker mounts of CA
+bundles, see [docker.md](docker.md#self-signed-or-internal-ca-certificates).
 
 !!! danger "Avoid `SAP_INSECURE=true` outside isolated development"
     `SAP_INSECURE=true` disables all SAP TLS verification — it accepts *any* certificate (masking man-in-the-middle), not just self-signed ones, and ARC-1 logs nothing when it is on. The bundled `manifest.yml` / `mta.yaml` keep it `"false"`; use `NODE_EXTRA_CA_CERTS` for an internal CA instead of disabling verification.
+
+!!! warning "Treat data-preview gzip as a reviewed WAF exception"
+    A bare 403 does not prove a WAF block; a rejected CSRF/session pair can produce the same generic status. Confirm the matched gateway rule in its audit log, and prefer a rule exclusion narrowed to the exact authenticated ADT route, method, variable, and rule. `SAP_GZIP_DATAPREVIEW_BODY=true` is the fallback when that infrastructure cannot be changed promptly: it deliberately changes the wire representation and can prevent a raw-byte body scanner from seeing the SQL/filter text. It does not alter ARC-1's `SAP_ALLOW_DATA_PREVIEW`, `SAP_ALLOW_FREE_SQL`, user-scope, or SAP-authorization checks. Startup logs expose the resolved gzip state and warn if both data-preview gates make it unreachable.
 
 ---
 
@@ -70,6 +89,11 @@ ARC-1 has two independent authentication boundaries:
 
 The full coexistence matrix is in [enterprise-auth.md](enterprise-auth.md#coexistence-matrix). Below is what each env var does.
 
+The credential-bearing flags remain for compatibility, but do not pass passwords, cookie strings,
+API keys, tokens, or inline service-key JSON in argv: shell history, process listings, and CI logs may
+retain them. Use the environment variables or protected file forms shown below, populated by your
+secret store.
+
 ### Layer B — ARC-1 → SAP
 
 Pick one primary method. Combining methods that conflict (e.g. basic + cookies + PP) fails fast at startup unless an escape-hatch flag is set.
@@ -79,7 +103,11 @@ Pick one primary method. Combining methods that conflict (e.g. basic + cookies +
 | Flag | Env var | Effect |
 |---|---|---|
 | `--user` | `SAP_USER` | Username sent in `Authorization: Basic` on shared-client ADT requests. With `SAP_PP_ENABLED=true`, API-key / non-JWT requests may still use this technical user unless `SAP_PP_STRICT=true` was set explicitly. A failed JWT PP request never falls back to this identity. |
-| `--password` | `SAP_PASSWORD` | Password for the above. Redacted from all logs. |
+| `--password` | `SAP_PASSWORD` | Password for the above. Redacted from ARC-1 logs; prefer the environment variable because command-line argv is outside that redaction boundary. |
+
+Single-target HTTP mode reuses SAP login cookies across calls. Changing the SAP password alone
+does not ensure the next call re-authenticates; follow
+[shared-login credential rotation](security-guide.md#shared-sap-login-lifetime-and-credential-rotation).
 
 #### B2. Cookie auth (dev-only SSO bridge)
 
@@ -116,7 +144,7 @@ Full reference: [btp-destination-setup.md](btp-destination-setup.md) · [multi-t
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
 | `--pp-enabled` | `SAP_PP_ENABLED` | `false` | Enables ARC-1's per-user destination path. For on-premise SAP this resolves a `PrincipalPropagation` destination through Connectivity Service and Cloud Connector. For BTP ABAP Environment this resolves an `OAuth2UserTokenExchange` destination and uses the returned ABAP bearer token. Without it, every SAP call uses the shared technical client. |
-| `--pp-strict` | `SAP_PP_STRICT` | `true` when PP is enabled | JWT PP failures always return an error and never change to the shared identity. Explicit `true` gives the recommended strict topology and rejects API-key / non-JWT tool calls. Explicit `false` enables supported mixed operation, in which API keys use the shared client; it never enables JWT fallback. Separate instances are recommended, not required. |
+| `--pp-strict` | `SAP_PP_STRICT` | `true` when PP is enabled | JWT PP failures always return an error and never change to the shared identity. Set `true` explicitly to reject non-JWT calls; the derived default alone does not enforce that rejection. Explicit `true` gives the recommended strict topology and rejects API-key / non-JWT tool calls. Explicit `false` enables supported mixed operation, in which API keys use the shared client; it never enables JWT fallback. Separate instances are recommended, not required. |
 | `--pp-allow-shared-cookies` | `SAP_PP_ALLOW_SHARED_COOKIES` | `false` | Escape hatch. Without it, setting `SAP_COOKIE_FILE`/`SAP_COOKIE_STRING` together with `SAP_PP_ENABLED=true` fails at startup (cookies belong to one user, PP wants per-user). With `true`, cookies stay on the shared client only and PP traffic runs cookie-free. |
 
 Full reference: [principal-propagation-setup.md](principal-propagation-setup.md).
@@ -142,7 +170,7 @@ Set nothing. Stdio only. Anyone who can pipe stdin to the process is "authentica
 | Flag | Env var | Effect |
 |---|---|---|
 | `--api-keys` | `ARC1_API_KEYS` | Comma-separated `key:profile` pairs. Each profile maps to a scope set (read/write/data/sql/transports/git/admin) **and** a partial SafetyConfig intersected with the server ceiling. Valid profiles: `viewer`, `viewer-data`, `viewer-sql`, `developer`, `developer-data`, `developer-sql`, `admin`. Caller sends `Authorization: Bearer <key>` (or `X-API-Key: <key>`); ARC-1 looks the key up and applies that profile's scopes for the request. |
-| `--allow-http-no-auth` | `ARC1_ALLOW_HTTP_NO_AUTH` | Unsafe local/dev escape hatch. HTTP transport refuses to start without API key, OIDC, or XSUAA auth unless this is explicitly `true`. Never use on a network-reachable instance. |
+| `--allow-http-no-auth` | `ARC1_ALLOW_HTTP_NO_AUTH` | Unsafe local/dev escape hatch. HTTP transport refuses to start without API key, OIDC, or XSUAA auth unless this is explicitly `true`. It never overrides `SAP_XSUAA_AUTH=true`: a missing XSUAA binding still refuses startup. Never use on a network-reachable instance. |
 
 Full reference: [api-key-setup.md](api-key-setup.md). The single-key `ARC1_API_KEY` env var was removed in v0.7 — see [updating.md](updating.md#v07-authorization-refactor-breaking-change).
 
@@ -162,7 +190,7 @@ Full reference: [oauth-jwt-setup.md](oauth-jwt-setup.md).
 
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
-| `--xsuaa-auth` | `SAP_XSUAA_AUTH` | `false` | When `true`, ARC-1 reads XSUAA credentials from `VCAP_SERVICES`, validates incoming JWTs against XSUAA's keys, and exposes OAuth metadata (RFC 8414), Protected Resource Metadata (RFC 9728), and Dynamic Client Registration endpoints. Required for BTP CF deployments. |
+| `--xsuaa-auth` | `SAP_XSUAA_AUTH` | `false` | When `true`, ARC-1 reads XSUAA credentials from `VCAP_SERVICES`, validates incoming JWTs against XSUAA's keys, and exposes OAuth metadata (RFC 8414), Protected Resource Metadata (RFC 9728), and Dynamic Client Registration endpoints. Required for BTP CF deployments. HTTP startup fails if the XSUAA binding is missing or unreadable — even when API keys or OIDC are also configured. |
 | `--oauth-dcr-ttl-seconds` | `ARC1_OAUTH_DCR_TTL_SECONDS` | `0` (never expire) | Lifetime of a dynamically-registered OAuth `client_id` (Anthropic-style stateless DCR). Default `0` = never expire: there is no per-client revocation at any TTL, so a finite value only produces periodic `invalid_client` re-auth outages (some clients — Eclipse Copilot, Copilot CLI — don't self-heal). Set a positive value to opt into expiry; positive values are clamped to `[60 s, 90 d]`. Only consulted when XSUAA auth is on. |
 | `--dcr-signing-secret` | `ARC1_DCR_SIGNING_SECRET` | unset (falls back to XSUAA `clientsecret`) | Dedicated secret for HMAC-signing DCR `client_id`s. Set this (typically via `cf set-env`) to keep cached `client_id`s valid across `cf deploy` operations that recreate the XSUAA binding. Re-setting the value invalidates every outstanding registration (explicit revocation). Recommended: `openssl rand -base64 48` (≥32 bytes). ARC-1 emits a soft `[warn]` at startup if the trimmed value is shorter than 16 bytes, if it's empty/whitespace-only (falls back to legacy mode instead of crashing), or if set without `--xsuaa-auth=true` (orphan secret, unused). |
 
@@ -182,14 +210,15 @@ ARC-1 starts **fully restrictive**. Every capability below is a positive opt-in.
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
 | `--allow-writes` | `SAP_ALLOW_WRITES` | `false` | Master switch for every mutation: `SAPWrite` (create/update/delete), `SAPActivate`, package CRUD, FLP mutations. When `false`, every mutating tool call is rejected at the safety layer regardless of caller scopes. Also required (in addition to the specific flag below) for transport and git writes. |
-| `--allow-data-preview` | `SAP_ALLOW_DATA_PREVIEW` | `false` | Enables `SAPRead(type=TABLE_CONTENTS)`. When off, that one read action is rejected — every other SAPRead type still works. |
+| `--allow-data-preview` | `SAP_ALLOW_DATA_PREVIEW` | `false` | Enables `SAPRead(type=TABLE_CONTENTS)` and the structured `TABLE_QUERY` path. When off, those data reads are rejected; ordinary object/source reads still work. |
 | `--allow-free-sql` | `SAP_ALLOW_FREE_SQL` | `false` | Enables `SAPQuery` (freestyle ABAP SQL via `/sap/bc/adt/datapreview/freestyle`). When off, `SAPQuery` is rejected. |
-| `--allow-transport-writes` | `SAP_ALLOW_TRANSPORT_WRITES` | `false` | Enables `SAPTransport.create` / `release` / `delete` / `reassign`. **Requires `SAP_ALLOW_WRITES=true`** — without it, transport mutations fail even with this flag on, because users without `write` scope are treated as no-mutation users. Transport *reads* (list / get / check / history) are always available. |
-| `--allow-git-writes` | `SAP_ALLOW_GIT_WRITES` | `false` | Enables `SAPGit.clone` / `pull` / `push` / `commit` against gCTS and abapGit. Same `SAP_ALLOW_WRITES` precondition as transport writes. Git reads always available. |
+| `--blocked-data-sources` | `SAP_BLOCKED_DATA_SOURCES` | empty (off) | **Experimental.** Exact comma-separated table/CDS identities denied on `SAPQuery`, `TABLE_QUERY` and `TABLE_CONTENTS`, directly and transitively. Unset, empty and ASCII-whitespace-only mean off; once non-empty, **every comma-separated field is mandatory** (`,` `,,,` `,USR02` `USR02,` `USR02,,PA0002` all fail startup). Entries are validated as raw ASCII before case folding, uppercased, deduplicated preserving first-occurrence order, limited to 128 characters, and never silently stripped. A non-empty list activates strict SQL parsing plus live CDS/replacement lineage checks before every data request; direct or transitive matches are denied and unresolved/unsupported lineage fails closed. Allowed-table proof needs fixed metadata reads of `DD02L` and `DDLDEPENDENCY` under the caller identity; missing or ambiguous metadata fails closed. A missing data-preview endpoint returns `DATA_POLICY_UNAVAILABLE`. See [Authorization & Roles](authorization.md#experimental-data-source-blocklist). |
+| `--allow-transport-writes` | `SAP_ALLOW_TRANSPORT_WRITES` | `false` | Enables `SAPTransport.create` / `release` / `release_recursive` / `delete` / `remove_object` / `reassign`. **Requires `SAP_ALLOW_WRITES=true`** — without it, transport mutations fail even with this flag on, because users without `write` scope are treated as no-mutation users. Transport *reads* (`list` / `get` / `diff` / `check` / `history` / `layers` / `targets`) remain available. |
+| `--allow-git-writes` | `SAP_ALLOW_GIT_WRITES` | `false` | With `SAP_ALLOW_WRITES=true`, permits gated abapGit mutations and the egress-capable `external_info` action; caller scope still applies, and package-affecting repository actions enforce the real server-side package allowlist. Some accepted abapGit mutations intentionally return error/incomplete when no authoritative postcondition exists—inspect state before retrying. gCTS reads remain available, but every gCTS mutation is quarantined before HTTP mutation until the staged/preflight/deploy/confirm/rollback contract is implemented. |
 | `--allowed-packages` | `SAP_ALLOWED_PACKAGES` | `$TMP` | Allowlist for **writes only**. Comma-separated. Four pattern kinds: <ul><li>**Exact** — `ZFOO` matches only `ZFOO`.</li><li>**Prefix wildcard** — `Z*` / `Y*` / `/COMPANY/*` match by literal string prefix.</li><li>**DEVCLASS subtree** — `ZFOO/**` matches `ZFOO` *and* every transitive sub-package per `TDEVC.PARENTCL`. The subtree is resolved lazily on first write via ADT's `POST /sap/bc/adt/repository/nodestructure` endpoint (the canonical primitive for "direct children of a package" used by Eclipse ADT and `abap-adt-api`) and cached in-memory for 10 minutes; ARC-1 also invalidates the cache on `SAPManage.create_package` / `delete_package` / `change_package`. Resolution failure (network, 5xx, permissions) is fail-closed — the write is denied with the original error surfaced. Namespaces work: `/COMPANY/THING/**`.</li><li>**`*`** — unrestricted (matches anything).</li></ul>Writes to a package outside this list fail at the safety layer. **Reads are never package-gated.** |
-| `--allowed-transports` | `SAP_ALLOWED_TRANSPORTS` | `[]` | Advanced: specific CTS transport ID whitelist. Empty (default) = no per-transport filter. |
-| `--deny-actions` | `SAP_DENY_ACTIONS` | `[]` | Fine-grained per-action denylist. Grammar: `Tool`, `Tool.action`, `Tool.glob*`. Example: `SAPWrite.delete,SAPManage.flp_*`. Accepts a CSV string or a `path/to/file.json` containing an array. Denylisted actions are both hidden from tool listings and blocked at call time. See [authorization.md → Advanced deny actions](authorization.md#advanced-deny-actions). |
-| `--check-before-write` | `SAP_CHECK_BEFORE_WRITE` | `false` | When `true`, ARC-1 runs an ADT server-side `checkruns` syntax check before save. Warnings are appended to the response (non-blocking); errors still fail. Adds one round-trip per write. Activation remains the definitive check — this is an early-feedback option. |
+| `--allowed-transports` | `SAP_ALLOWED_TRANSPORTS` | `[]` | Advanced: CTS ID allowlist. Empty (default) = legacy unrestricted/no per-transport filter; `*` is explicit unrestricted. Exact/prefix entries can constrain single-ID mutations, but deliberately block `release_recursive`: SAP may attach/fold a concurrent child into the live subtree, so only empty or explicit `*` can authorize that action. Use either only when every current/concurrent child is intended to be released. |
+| `--deny-actions` | `SAP_DENY_ACTIONS` | `[]` | Fine-grained per-action denylist. Grammar: `Tool`, `Tool.action`, `Tool.glob*`. Example: `SAPWrite.delete,SAPManage.flp_*`. Accepts a CSV string or a JSON-array file path starting with `/`, `./`, `../`, `~/`, or a Windows drive letter (`C:\arc1\deny.json` / `C:/arc1/deny.json`). Denylisted actions are both hidden from tool listings and blocked at call time. See [authorization.md → Advanced deny actions](authorization.md#advanced-deny-actions). |
+| `--check-before-write` | `SAP_CHECK_BEFORE_WRITE` | `false` | When `true`, ARC-1 runs an ADT server-side `checkruns` syntax check before save. Syntax findings are appended as non-blocking feedback; check-request failures are ignored. Neither stops the save. Adds one round-trip per write. Activation remains the definitive check — this is an early-feedback option. |
 
 ### Recipes
 
@@ -198,6 +227,7 @@ ARC-1 starts **fully restrictive**. Every capability below is a positive opt-in.
 | Read/search only (default) | nothing |
 | Read + table preview | `SAP_ALLOW_DATA_PREVIEW=true` |
 | Read + table preview + freestyle SQL | `SAP_ALLOW_DATA_PREVIEW=true SAP_ALLOW_FREE_SQL=true` |
+| Approved data/SQL plus experimental source brake | `SAP_ALLOW_DATA_PREVIEW=true SAP_ALLOW_FREE_SQL=true SAP_BLOCKED_DATA_SOURCES=USR02,PA0002` |
 | Writes to `$TMP`/`Z*` | `SAP_ALLOW_WRITES=true SAP_ALLOWED_PACKAGES='$TMP,Z*'` |
 | Writes confined to one team's DEVCLASS subtree | `SAP_ALLOW_WRITES=true SAP_ALLOWED_PACKAGES='$TMP,ZFOO/**'` (uses `TDEVC.PARENTCL` — names of children don't need to share a prefix) |
 | Writes + CTS transports | `SAP_ALLOW_WRITES=true SAP_ALLOW_TRANSPORT_WRITES=true` |
@@ -206,6 +236,9 @@ ARC-1 starts **fully restrictive**. Every capability below is a positive opt-in.
 | Block specific mutations even with writes on | `SAP_DENY_ACTIONS=SAPWrite.delete,SAPManage.flp_*` |
 
 Shell-quote package patterns with `*` or `$TMP`: `-e SAP_ALLOWED_PACKAGES='*'` or `-e SAP_ALLOWED_PACKAGES='Z*,$TMP'`. In `.env` files no extra quoting needed.
+
+!!! warning "Experimental blocklist boundary"
+    `SAP_BLOCKED_DATA_SOURCES` is a deny emergency brake, not an isolation allowlist: every source not listed remains eligible. It only ever narrows an already-enabled capability — the `SAP_ALLOW_DATA_PREVIEW` / `SAP_ALLOW_FREE_SQL` gate runs *before* it, so it can never enable data access. When active, ARC-1 accepts only SQL its pinned ABAP parser can prove is one complete static `SELECT`/`WITH`; it refuses ABAP comments, host/dynamic sources, privileged/client/connection clauses, association paths, `SELECT SINGLE`, caller `INTO` targets, malformed syntax, classic DDIC views, CDS table functions, and filtered `TABLE_CONTENTS`. Joins, unions, subqueries, CTEs, parameterized CDS roots and hierarchy sources are supported. Use structured `TABLE_QUERY` for filtered reads. **Blocklist mode performs additional SAP metadata requests and is slower by design**; there is no cross-request cache, so every request revalidates live lineage and the metadata check is not transactionally atomic with the later data POST. Directly blocked sources are denied with zero SAP calls. Under principal propagation, a caller lacking metadata authorization can get `DATA_LINEAGE_UNRESOLVED` for a query SAP itself would allow. Blocking a table ARC-1 uses internally disables the feature that reads it (see the impact matrix in [Authorization & Roles](authorization.md#experimental-data-source-blocklist)). Generic extension `ctx.http.get()` calls are outside this boundary. The setting is global in multi-target mode. Empty/unset preserves existing behavior with zero new metadata calls. Keep SAP roles and CDS DCL as the primary controls, and apply SAP Note 3772411 independently.
 
 API-key profile note: `developer`, `developer-data`, and `developer-sql` profiles are intentionally capped to `$TMP` regardless of `SAP_ALLOWED_PACKAGES`. For Z-package writes via API keys use a tightly scoped `admin` key with a narrow server-side `SAP_ALLOWED_PACKAGES`, or use OIDC/XSUAA for per-user scopes.
 
@@ -217,12 +250,12 @@ The `(tool, action) → (scope, opType)` mapping lives at [src/authz/policy.ts](
 
 | Op type | Admin-facing flag | Example actions |
 |---|---|---|
-| Read | (always allowed) | `SAPRead` (except TABLE_CONTENTS), `SAPSearch`, many others |
+| Read | (always allowed) | `SAPRead` (except TABLE_CONTENTS/TABLE_QUERY), `SAPSearch`, many others |
 | Search / Intelligence / Test / Lock | (always allowed) | `SAPSearch`, `SAPNavigate`, `SAPLint`, `SAPContext`, unit tests, internal CRUD lock |
-| Query | `SAP_ALLOW_DATA_PREVIEW` | `SAPRead(type=TABLE_CONTENTS)` |
+| Query | `SAP_ALLOW_DATA_PREVIEW` | `SAPRead(type=TABLE_CONTENTS|TABLE_QUERY)` |
 | FreeSQL | `SAP_ALLOW_FREE_SQL` | `SAPQuery` |
 | Create / Update / Delete / Activate / Workflow | `SAP_ALLOW_WRITES` | `SAPWrite`, `SAPActivate`, FLP mutations |
-| Transport | `SAP_ALLOW_WRITES` + `SAP_ALLOW_TRANSPORT_WRITES` | `SAPTransport.create`/`release`/`delete` |
+| Transport | `SAP_ALLOW_WRITES` + `SAP_ALLOW_TRANSPORT_WRITES` | `SAPTransport.create`/`release`/`release_recursive`/`delete`/`remove_object`/`reassign` |
 
 ---
 
@@ -234,14 +267,25 @@ How ARC-1 itself listens for MCP traffic.
 |---|---|---|---|
 | `--transport` | `SAP_TRANSPORT` | `stdio` | `stdio` (subprocess over stdin/stdout) or `http-streamable` (long-lived HTTP server). The Docker image overrides this to `http-streamable` by default. |
 | `--server-name` | `ARC1_SERVER_NAME` | `arc-1` | Server name advertised in the MCP `initialize` handshake. Give each direct-connect instance a unique name when running several ARC-1 instances so clients can derive a target-specific tool prefix without numeric collision suffixes. |
+| `--system-label` | `ARC1_SYSTEM_LABEL` | empty | Optional human-readable label of the connected SAP system (for example `ERP production (read-only)`). It is normalized to one line, limited to 160 characters, and prepended to the single-target MCP instructions so a model can distinguish instances even when a client replaces the handshake name with an opaque connector ID. Ignored in multi-target mode, whose target-aware instructions remain authoritative. |
 | `--http-addr` | `ARC1_HTTP_ADDR` / `SAP_HTTP_ADDR` | `0.0.0.0:8080` | Bind address for HTTP streamable. Use `127.0.0.1:3000` to restrict to localhost. `SAP_HTTP_ADDR` is the legacy fallback name. |
 | `--port` | `ARC1_PORT` | `8080` | Simpler alternative when only the port needs to change. Wins over `ARC1_HTTP_ADDR`'s port if both are set. Valid range `1–65535`. |
 | `--ui[=MODE]` | `ARC1_UI` | `off` | Experimental read-only browser console. `off` disables it. `local` starts a loopback sidecar UI at `ARC1_UI_ADDR` for stdio/Claude-style local use. `web` mounts `/ui` and `/ui/api/*` on the HTTP server and requires an admin API key, OIDC, or XSUAA auth. `true` maps to `local` for stdio and `web` for HTTP. |
 | `--ui-addr` / `--ui-port` | `ARC1_UI_ADDR` / `ARC1_UI_PORT` | `127.0.0.1:8711` | Bind address for `ARC1_UI=local`. Local mode must stay on loopback; use `ARC1_UI=web` with `SAP_TRANSPORT=http-streamable` for Docker or CF exposure. |
 | `--ui-open` | `ARC1_UI_OPEN` | `false` | Opens the local sidecar UI in the system browser after startup. Intended for developer machines only. |
 | `--allowed-origins` | `ARC1_ALLOWED_ORIGINS` | (empty) | Comma-separated CORS allowlist for **browser-based** MCP clients. Exact match only (no wildcards — the response sets `Access-Control-Allow-Credentials: true`). Preflight allows the MCP protocol headers (`mcp-session-id`, `mcp-protocol-version`, `last-event-id`). Empty disables CORS entirely. Native clients (Claude Desktop / Cursor / VS Code Copilot / Copilot Studio) don't need this. See [security-guide.md §11](security-guide.md#11-network-security). |
-| — | `ARC1_PUBLIC_URL` | (auto from `VCAP_APPLICATION`, else bind host:port) | Public URL ARC-1 advertises in OAuth metadata (issuer, `authorize`/`token`/`register`/`revoke` URLs, protected-resource metadata, `WWW-Authenticate` headers). Set this when ARC-1 is reached through a reverse proxy on a different hostname or under a base-path prefix — without it, MCP clients receive metadata pointing at the underlying host and bypass the proxy. Path prefix supported (e.g. `https://gateway.example.com/arc1`); the well-known endpoints are also served at that prefix. Trailing slash stripped. |
+| — | `ARC1_PUBLIC_URL` | (auto from `VCAP_APPLICATION`, else bind host:port) | Public URL ARC-1 advertises in OAuth metadata (issuer, `authorize`/`token`/`register`/`revoke` URLs, protected-resource metadata, `WWW-Authenticate` headers). Set this when ARC-1 is reached through a reverse proxy on a different hostname or under a base-path prefix — without it, MCP clients receive metadata pointing at the underlying host and bypass the proxy. Path prefix supported (e.g. `https://gateway.example.com/arc1`); the well-known endpoints are also served at that prefix. Trailing slash stripped. With XSUAA, also register the [exact public callbacks](xsuaa-setup.md#custom-public-url). |
 | `--max-concurrent` | `ARC1_MAX_CONCURRENT` | `10` | Maximum concurrent in-flight SAP HTTP requests, **server-wide across all users** (not per-client). One shared `Semaphore` gates every `AdtClient`, including per-user PP clients. Honors `Retry-After` on `429`/`503` (clamped to 60 s, single retry). Size against `rdisp/wp_no_dia`. See [Rate Limiting Guide](rate-limiting.md). |
+| `--max-datapreview-response-bytes` | `ARC1_MAX_DATAPREVIEW_RESPONSE_BYTES` | `2097152` (2 MiB) | Cumulative successful data-preview response allowance for one complete tool call, including automatic query chunks and internal table reads. Counts decompressed transfer bytes before UTF-8/string conversion. A result that crosses it fails with `DATA_RESPONSE_TOO_LARGE`; retry with lower `maxRows`, fewer columns, or a restrictive non-overlapping key-range `WHERE`. `maxRows` is separately clamped to 10,000, but wide rows can reach this byte limit much earlier. |
+| `--max-concurrent-data-results` | `ARC1_MAX_CONCURRENT_DATA_RESULTS` | `2` | Process-wide data-result calls admitted concurrently across single-target, PP, pinned, and aggregate routes. The FIFO lease is held through SAP fetch, XML parsing, tool-result serialization, and terminal audit, while ordinary source/metadata reads do not use it. If increasing the byte allowance, benchmark bounded peak RSS and normally lower this value proportionally. |
+
+Both data-result values must be positive base-10 safe integers. An explicitly empty, malformed,
+fractional, signed, zero, negative, exponent-form, or unsafe value fails startup; `0` is not a
+disable switch. Their product is logged as the raw-body admission envelope (4 MiB by default), but
+that product is not a heap guarantee because XML parsing and JSON serialization amplify memory.
+For BTP Cloud Foundry, use the
+[data-preview RAM sizing model and parameter table](btp-administration.md#data-preview-ram-sizing)
+before increasing either value.
 
 The UI is experimental, off by default, and inspection-only in v1: sanitized config, safety/auth state, feature-probe status, cache counts/source metadata, and recent sanitized audit events. It does not expose writes, config mutation, cache mutation, feature probes, or cached ABAP source bodies. In HTTP mode, ARC-1 refuses `ARC1_UI=web` unless an admin API key, OIDC, or XSUAA auth is configured, and every `/ui/*` route requires an `admin`-scoped bearer token. When `ARC1_UI=off`, no `/ui` static or API routes are mounted. On BTP CF, use `mta-ui-approuter.mtaext` for browser login via SAP AppRouter.
 
@@ -264,7 +308,7 @@ and audit-event reference.
 
 ## Caching
 
-ARC-1 caches SAP source/metadata with ETag revalidation on every hit. See [caching.md](caching.md) for the full design.
+ARC-1 normally revalidates cached source with ETags; an activation can briefly make its promoted draft available without a GET, but never while `SAP_PP_ENABLED=true` (including mixed PP/API-key instances). See [cache security](caching.md#security).
 
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
@@ -282,20 +326,24 @@ All ARC-1 logging goes to **stderr** to keep stdout clean for MCP JSON-RPC. Neve
 
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
-| `--log-file` | `ARC1_LOG_FILE` | — | Path to an additional file sink. Stderr output is unchanged; the file gets the same stream. |
-| `--log-level` | `ARC1_LOG_LEVEL` | `info` | One of `debug` / `info` / `warn` / `error`. Filters every log line, including the audit stream's structured entries. |
+| `--log-file` | `ARC1_LOG_FILE` | — | Path to an additional audit-event file sink. Receives all audit levels, independent of stderr verbosity. |
+| `--log-level` | `ARC1_LOG_LEVEL` | `info` | One of `debug` / `info` / `warn` / `error`. Filters logger output on stderr, including audit events. Does not filter the file sink, UI audit buffer or BTP Audit Log categories. `SAP_VERBOSE=true` / `--verbose` forces `debug`. |
 | `--log-format` | `ARC1_LOG_FORMAT` | `text` | `text` (human-readable) or `json` (one JSON object per line — for shipping to ELK / Loki / CF log aggregator). |
 | `--minimal-errors` | `ARC1_MINIMAL_ERRORS` | `false` for stdio, `true` for HTTP | When `true`, client-facing tool errors hide SAP diagnostic details such as lock owners, transport IDs, T100 variables, and authorization object names. HTTP deployments default to minimal errors because they are commonly shared or remotely reachable; stdio keeps detailed local diagnostics. Server-side audit logs retain request correlation and status data; use SAP-native logs or a trusted admin retry for full diagnostics. Set `ARC1_MINIMAL_ERRORS=false` only for trusted debugging sessions. |
-| `--verbose` | `SAP_VERBOSE` | `false` | Alias for `--log-level=debug`. Slightly older flag, kept for compatibility. |
+| `--verbose` | `SAP_VERBOSE` | `false` | Forces debug stderr output even when another log level is configured. When false, `--log-level` / `ARC1_LOG_LEVEL` applies (default `info`). Does not change file or BTP Audit Log sink selection. |
 | — | `ARC1_LOG_HTTP_DEBUG` | `false` | When `"true"`, captures HTTP request/response body fields and headers on `http_request` audit events. Sensitive headers (`Authorization`, `Cookie`, CSRF tokens) are redacted immediately; payload bodies are length-capped and centrally redacted before sink writes. **Do not enable in production** — it still increases log volume and records payload-size/timing metadata. **Boolean parsing inconsistency:** unlike other booleans, this one accepts only the literal string `"true"` — `"1"` does **not** work. |
 
 ---
 
 ## ABAP feature toggles
 
-Each toggle gates a class of ADT tools that depend on a SAP component being installed or active. All default to `auto` — ARC-1 probes the SAP system once on startup and decides. Override to `on`/`off` when probing is wrong, slow, or you want deterministic behaviour in tests.
+Each toggle controls a SAP-dependent feature. All default to `auto`: single-target deployments
+probe at startup, while discovered multi-targets probe on demand during SAP tool calls. `off`
+skips the feature's probe and disables it; `on` skips the probe and assumes the feature is available.
 
-When a feature is `off` (either set explicitly or detected as unavailable), every tool action that depends on it is hidden from tool listings *and* rejected at call time with a clear error.
+Feature-dependent handlers use the resolved availability, but not every unavailable action is
+removed from tool listings. Feature toggles do not replace the instance's action policy or Cloud
+Connector resource mappings.
 
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
@@ -304,12 +352,21 @@ When a feature is `off` (either set explicitly or detected as unavailable), ever
 | `--feature-rap` | `SAP_FEATURE_RAP` | `auto` | RAP behavior definitions, services, drafts. Required for `SAPWrite` of BDEF/SRVD/SRVB and the RAP-specific code-intel and preflight tools. |
 | `--feature-amdp` | `SAP_FEATURE_AMDP` | `auto` | ABAP Managed Database Procedures. Required for AMDP-specific read/write paths. |
 | `--feature-ui5` | `SAP_FEATURE_UI5` | `auto` | UI5 application development tools (general). |
-| `--feature-ui5repo` | `SAP_FEATURE_UI5REPO` | `auto` | UI5 ABAP Repository OData service. Required for `SAPManage` UI5 repo upload/download actions. |
-| `--feature-flp` | `SAP_FEATURE_FLP` | `auto` | FLP `PAGE_BUILDER_CUST` OData service. Required for `SAPManage` FLP page/role mutations. |
+| `--feature-ui5repo` | `SAP_FEATURE_UI5REPO` | `auto` | UI5 ABAP Repository OData service used by `SAPRead` type `BSP_DEPLOY` to read deployed app metadata. |
+| `--feature-flp` | `SAP_FEATURE_FLP` | `auto` | FLP `PAGE_BUILDER_CUST` OData service used by `SAPManage` FLP catalog/group/tile reads and mutations. |
 | `--feature-transport` | `SAP_FEATURE_TRANSPORT` | `auto` | CTS transport endpoints. Required for `SAPTransport` (even reads). |
 | `--feature-hana` | `SAP_FEATURE_HANA` | `auto` | HANA-specific developer tools. |
 
-`auto` probes one specific endpoint per feature and classifies the response: 2xx/400/405/5xx → available; 401/403/404 → unavailable. The reason is surfaced in startup logs and in the `SAPManage.system_info` response.
+`auto` probes one specific endpoint per feature and classifies the response: 2xx/400/405/5xx →
+available; 401/403/404 → unavailable. On single-target `/mcp`, inspect the cached result using
+`SAPManage` with `action: "features"`. Discovered targets apply additional
+[authentication controls](multi-target-administration.md#basic-shared-identity-controls);
+`SAPManage` is not part of their tool surface.
+
+For restrictive BTP Cloud Connector mappings, `gcts`, `flp`, and `ui5repo` probe paths outside
+`/sap/bc/adt`. The three tracked profiles under `examples/btp/` set those features to `off`; see the
+[Cloud Connector path reference](btp-destination-setup.md#cloud-connector-url-path-reference) before
+changing them to `auto` or `on`.
 
 ---
 
@@ -334,8 +391,8 @@ in-process code** — see the security note on that page before enabling.
 
 | Flag | Env var | Default | Effect |
 |---|---|---|---|
-| `--plugins` | `ARC1_PLUGINS` | — (none) | CSV of **absolute LOCAL paths** to extension plugins, loaded at startup. Each entry is a `.js` code plugin (point at the built module, e.g. `/abs/dist/index.js`) or a bare `*.tool.json` manifest. **Not** npm package names; **no `$HOME`/shell expansion** (use a concrete absolute path). Empty entries are trimmed/ignored. Loading is **fail-fast** — a malformed plugin, a name collision, or a non-absolute path refuses server start; on POSIX, non-owner/world-writable files are also refused. Windows deployments rely on Windows ACLs for plugin-path protection. v1 plugin reads are open (GET/HEAD); non-ADT (OData/ICF) writes and `classRun` are separate default-off opt-ins (`SAP_ALLOW_PLUGIN_RAW_WRITES` / `SAP_ALLOW_PLUGIN_EXECUTE`); ADT object writes stay v2. |
-| `--allow-plugin-execute` | `SAP_ALLOW_PLUGIN_EXECUTE` | `false` | Opt-in: let plugin tools **execute ABAP console classes** (`ctx.run.classRun`, `IF_OO_ADT_CLASSRUN`). Refused unless this is `true` **and** `SAP_ALLOW_WRITES=true` **and** the tool declares `write` scope. A dedicated switch so enabling built-in writes never silently grants plugins code execution. Only `true`/`1` enable it; `false`/empty stay off. |
+| `--plugins` | `ARC1_PLUGINS` | — (none) | CSV of **absolute LOCAL paths** to extension plugins, loaded at startup. Each entry is a `.js` code plugin (point at the built module, e.g. `/abs/dist/index.js`) or a bare `*.tool.json` manifest. **Not** npm package names; **no `$HOME`/shell expansion** (use a concrete absolute path). Empty entries are trimmed/ignored. Loading is **fail-fast** — a malformed plugin, a name collision, or a non-absolute path refuses server start; on POSIX, non-owner/world-writable files are also refused. Windows deployments rely on Windows ACLs for plugin-path protection. v1 plugin reads are open (GET/HEAD); non-ADT (OData/ICF) writes and named class/report execution are separate default-off opt-ins (`SAP_ALLOW_PLUGIN_RAW_WRITES` / `SAP_ALLOW_PLUGIN_EXECUTE`); ADT object writes stay v2. |
+| `--allow-plugin-execute` | `SAP_ALLOW_PLUGIN_EXECUTE` | `false` | Opt-in: let plugin tools **execute ABAP classes or reports** (`ctx.run.classRun` / `ctx.run.programRun`). Refused unless this is `true` **and** `SAP_ALLOW_WRITES=true` **and** the tool declares `write` scope. A dedicated switch so enabling built-in writes never silently grants plugins code execution. Only `true`/`1` enable it; `false`/empty stay off. |
 | `--allow-plugin-raw-writes` | `SAP_ALLOW_PLUGIN_RAW_WRITES` | `false` | Opt-in: let plugin tools **write** (`ctx.http.post`/`put`/`delete`) to **non-ADT** paths (OData `/sap/opu/odata/…`, custom ICF `/sap/bc/http/…`). Refused unless this is `true` **and** `SAP_ALLOW_WRITES=true` **and** the tool declares `write` scope. Writes to `/sap/bc/adt/…` object endpoints are **always** refused (no `SAP_ALLOWED_PACKAGES` enforcement on a raw write — those are the v2 `ctx.write` vocabulary). `SAP_ALLOWED_PACKAGES` does not constrain OData/ICF calls. Only `true`/`1` enable it. |
 
 ---

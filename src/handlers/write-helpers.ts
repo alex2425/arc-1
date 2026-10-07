@@ -22,7 +22,15 @@ import {
   type ServiceBindingCreateParams,
 } from '../adt/ddic-xml.js';
 import { syntaxCheck } from '../adt/devtools.js';
-import { AdtSafetyError } from '../adt/errors.js';
+import { AdtError, AdtSafetyError } from '../adt/errors.js';
+import {
+  buildLockObjectXml,
+  getLockObject,
+  LOCKOBJECT_CONTENT_TYPE,
+  type LockObjectDefinition,
+  mergeLockObjectDefinition,
+  parseLockObjectDefinition,
+} from '../adt/lock-object.js';
 import { formatRapPreflightFindings, validateRapSource } from '../adt/rap-preflight.js';
 import { checkPackage } from '../adt/safety.js';
 import {
@@ -57,10 +65,18 @@ import { errorResult, type ToolResult, textResult } from './shared.js';
  */
 export function buildLintConfigOptions(config: ServerConfig, ruleOverrides?: RuleOverrides): LintConfigOptions {
   // Probe-detected system type is most accurate; fall back to CLI config
-  const systemType = getCachedFeatures()?.systemType ?? (config.systemType !== 'auto' ? config.systemType : undefined);
+  const cachedFeatures = getCachedFeatures();
+  const systemType = cachedFeatures?.systemType ?? (config.systemType !== 'auto' ? config.systemType : undefined);
+  const systemTypeSource = cachedFeatures?.systemType
+    ? (cachedFeatures.systemTypeSource ?? 'probe')
+    : config.systemType !== 'auto'
+      ? 'config'
+      : 'default';
   return {
     systemType,
-    abapRelease: getCachedFeatures()?.abapRelease ?? config.abapRelease,
+    systemTypeSource,
+    abapRelease: cachedFeatures?.abapRelease ?? config.abapRelease,
+    abapReleaseSource: cachedFeatures?.abapRelease ? 'probe' : config.abapRelease ? 'config' : 'unknown',
     configFile: config.abaplintConfig,
     ruleOverrides,
   };
@@ -93,7 +109,7 @@ const FUNCTION_MODULE_CONTENT_TYPE = 'application/vnd.sap.adt.functions.fmodules
 const FUNCTION_INCLUDE_CONTENT_TYPE = 'application/vnd.sap.adt.functions.fincludes.v2+xml';
 
 export function isMetadataWriteType(type: string): boolean {
-  return type === 'DOMA' || type === 'DTEL' || type === 'MSAG' || type === 'SRVB' || type === 'TTYP';
+  return type === 'DOMA' || type === 'DTEL' || type === 'MSAG' || type === 'SRVB' || type === 'TTYP' || type === 'ENQU';
 }
 
 /** Types that require a specific vendor content type for creation (not application/*) */
@@ -105,6 +121,7 @@ function needsVendorContentType(type: string): boolean {
     type === 'MSAG' ||
     type === 'SKTD' ||
     type === 'TTYP' ||
+    type === 'ENQU' ||
     type === 'FUGR' ||
     type === 'FUNC'
   );
@@ -125,25 +142,6 @@ export function createContentTypeForType(type: string, cloud = false, fugrInclud
   return needsVendorContentType(type) ? vendorContentTypeForType(type) : 'application/*';
 }
 
-/**
- * Check if a DTEL create has properties that SAP ignores on POST but accepts on PUT.
- * SAP's DTEL POST only stores the shell (name, description, package, typeKind, typeName, dataType, length).
- * Labels, searchHelp, setGetParameter, etc. require a follow-up PUT to take effect.
- */
-export function dtelNeedsPostCreateUpdate(props: Record<string, unknown>): boolean {
-  return Boolean(
-    props.shortLabel ||
-      props.mediumLabel ||
-      props.longLabel ||
-      props.headingLabel ||
-      props.searchHelp ||
-      props.searchHelpParameter ||
-      props.setGetParameter ||
-      props.defaultComponentName ||
-      props.changeDocument,
-  );
-}
-
 export function vendorContentTypeForType(type: string): string {
   switch (type) {
     case 'DOMA':
@@ -160,6 +158,8 @@ export function vendorContentTypeForType(type: string): string {
       return SKTD_V2_CONTENT_TYPE;
     case 'TTYP':
       return TABLETYPE_CONTENT_TYPE;
+    case 'ENQU':
+      return LOCKOBJECT_CONTENT_TYPE;
     case 'FUGR':
       return FUNCTION_GROUP_CONTENT_TYPE;
     case 'FUNC':
@@ -200,13 +200,18 @@ export function getMetadataWriteProperties(input: Record<string, unknown>): Reco
     rowTypeKind: input.rowTypeKind,
     domainName: input.domainName,
     shortLabel: input.shortLabel,
+    shortLength: input.shortLength,
     mediumLabel: input.mediumLabel,
+    mediumLength: input.mediumLength,
     longLabel: input.longLabel,
+    longLength: input.longLength,
     headingLabel: input.headingLabel,
+    headingLength: input.headingLength,
     searchHelp: input.searchHelp,
     searchHelpParameter: input.searchHelpParameter,
     setGetParameter: input.setGetParameter,
     defaultComponentName: input.defaultComponentName,
+    deactivateInputHistory: input.deactivateInputHistory,
     changeDocument: input.changeDocument,
     messages: input.messages,
     serviceDefinition: input.serviceDefinition,
@@ -221,6 +226,8 @@ export function getMetadataWriteProperties(input: Record<string, unknown>): Reco
     // /source/main. Preserve the ADT wire values exactly.
     processingType: input.processingType,
     updateTaskKind: input.updateTaskKind,
+    // ENQU carries its definition as JSON in "source" (the same shape SAPRead returns).
+    lockObjectSource: input.source,
   };
 
   return props;
@@ -247,70 +254,137 @@ export async function mergeMetadataWriteProperties(
   name: string,
   provided: Record<string, unknown>,
 ): Promise<Record<string, unknown>> {
-  try {
-    if (type === 'MSAG') {
-      const existing = await client.getMessageClassInfo(name);
-      return {
-        _description: existing.description,
-        _package: existing.package,
-        messages: provided.messages ?? existing.messages,
-      };
+  if (type === 'MSAG') {
+    const existing = await client.getMessageClassInfo(name);
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      messages: provided.messages ?? existing.messages,
+    };
+  }
+  if (type === 'DOMA') {
+    const existing = await client.getDomain(name);
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      dataType: provided.dataType ?? existing.dataType,
+      length: provided.length ?? existing.length,
+      decimals: provided.decimals ?? existing.decimals,
+      // When length changes but outputLength isn't given, follow the new length (mirrors the create
+      // default of `outputLength ?? length`) — otherwise SAP warns "Output length < calculated length".
+      outputLength: provided.outputLength ?? provided.length ?? existing.outputLength,
+      conversionExit: provided.conversionExit ?? existing.conversionExit,
+      signExists: provided.signExists ?? existing.signExists,
+      lowercase: provided.lowercase ?? existing.lowercase,
+      fixedValues: provided.fixedValues ?? existing.fixedValues,
+      valueTable: provided.valueTable ?? existing.valueTable,
+    };
+  }
+  if (type === 'DTEL') {
+    const existing = await client.getDataElement(name);
+    const shortLabel = provided.shortLabel ?? existing.shortLabel;
+    const mediumLabel = provided.mediumLabel ?? existing.mediumLabel;
+    const longLabel = provided.longLabel ?? existing.longLabel;
+    const headingLabel = provided.headingLabel ?? existing.headingLabel;
+    const searchHelp = provided.searchHelp ?? existing.searchHelp;
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      dataType: provided.dataType ?? existing.dataType,
+      length: provided.length ?? existing.length,
+      decimals: provided.decimals ?? existing.decimals,
+      typeKind: provided.typeKind ?? existing.typeKind,
+      typeName: provided.typeName ?? existing.typeName,
+      domainName: provided.domainName ?? existing.typeName, // DTEL stores domain in typeName
+      shortLabel,
+      shortLength: provided.shortLength ?? (shortLabel === existing.shortLabel ? existing.shortLength : undefined),
+      mediumLabel,
+      mediumLength: provided.mediumLength ?? (mediumLabel === existing.mediumLabel ? existing.mediumLength : undefined),
+      longLabel,
+      longLength: provided.longLength ?? (longLabel === existing.longLabel ? existing.longLength : undefined),
+      headingLabel,
+      headingLength:
+        provided.headingLength ?? (headingLabel === existing.headingLabel ? existing.headingLength : undefined),
+      searchHelp,
+      // A search-help parameter belongs to its search help: keep it only while that is unchanged.
+      searchHelpParameter:
+        provided.searchHelpParameter ??
+        (String(searchHelp).toUpperCase() === existing.searchHelp.toUpperCase()
+          ? existing.searchHelpParameter
+          : undefined),
+      setGetParameter: provided.setGetParameter ?? existing.setGetParameter,
+      defaultComponentName: provided.defaultComponentName ?? existing.defaultComponentName,
+      deactivateInputHistory: provided.deactivateInputHistory ?? existing.deactivateInputHistory,
+      changeDocument: provided.changeDocument ?? existing.changeDocument,
+      // No public inputs: carry SAP's stored bidi flags through the full-XML replace.
+      leftToRightDirection: existing.leftToRightDirection,
+      deactivateBIDIFiltering: existing.deactivateBIDIFiltering,
+    };
+  }
+  if (type === 'ENQU') {
+    // Merge over the developer view so consecutive unactivated edits accumulate.
+    const existing = await getLockObject(client.http, client.safety, name);
+    const source = provided.lockObjectSource;
+    const definition =
+      source === undefined || source === null || String(source).trim() === ''
+        ? {}
+        : parseLockObjectDefinition(String(source));
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      lockObjectDefinition: mergeLockObjectDefinition(existing, definition),
+    };
+  }
+  if (type === 'SRVB') {
+    const { source: existingRaw } = await client.getSrvb(name);
+    const existing = JSON.parse(existingRaw) as Record<string, unknown>;
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      serviceDefinition: provided.serviceDefinition ?? existing.serviceDefinition,
+      bindingType: provided.bindingType ?? existing.bindingType,
+      category: provided.category ?? normalizeSrvbCategory(existing.bindingCategory),
+      version: provided.version ?? existing.serviceVersion,
+      odataVersion: provided.odataVersion ?? existing.odataVersion,
+    };
+  }
+  if (type === 'TTYP') {
+    const existing = await client.getTableType(name).catch((err: unknown) => {
+      // SAP and transport failures are reported as they are; an unreadable shape has to say why the update stops.
+      if (err instanceof AdtError) throw err;
+      throw new Error(
+        `Cannot update TTYP ${name}: ARC-1 could not read its stored metadata ` +
+          `(${err instanceof Error ? err.message : String(err)}) and will not overwrite it blind. ` +
+          'Nothing was written. Change this table type in ADT or SE11.',
+      );
+    });
+    // The two row kinds buildTableTypeXml writes, as rowTypeKind values. Ref and range rows have none.
+    const storedKind =
+      existing.rowTypeKind === 'predefinedAbapType'
+        ? 'builtin'
+        : existing.rowTypeKind === 'dictionaryType'
+          ? 'structure'
+          : undefined;
+    const requested = String(provided.rowType ?? '').trim();
+    // Without rowType the caller keeps the stored definition, so ARC-1 must be able to write it back unchanged.
+    if (!requested && !(storedKind && existing.plainStandardTable)) {
+      const lost = storedKind ? 'its access type, keys or initial row count' : `its ${existing.rowTypeKind} row type`;
+      throw new Error(
+        `Cannot update TTYP ${name} without "rowType": ARC-1 rewrites a table type as a standard table with a ` +
+          `non-unique standard key and cannot keep ${lost}. Nothing was written. ` +
+          'Pass rowType to accept that rewrite, or change this table type in ADT or SE11.',
+      );
     }
-    if (type === 'DOMA') {
-      const existing = await client.getDomain(name);
-      return {
-        _description: existing.description,
-        _package: existing.package,
-        dataType: provided.dataType ?? existing.dataType,
-        length: provided.length ?? existing.length,
-        decimals: provided.decimals ?? existing.decimals,
-        // When length changes but outputLength isn't given, follow the new length (mirrors the create
-        // default of `outputLength ?? length`) — otherwise SAP warns "Output length < calculated length".
-        outputLength: provided.outputLength ?? provided.length ?? existing.outputLength,
-        conversionExit: provided.conversionExit ?? existing.conversionExit,
-        signExists: provided.signExists ?? existing.signExists,
-        lowercase: provided.lowercase ?? existing.lowercase,
-        fixedValues: provided.fixedValues ?? existing.fixedValues,
-        valueTable: provided.valueTable ?? existing.valueTable,
-      };
-    }
-    if (type === 'DTEL') {
-      const existing = await client.getDataElement(name);
-      return {
-        _description: existing.description,
-        _package: existing.package,
-        dataType: provided.dataType ?? existing.dataType,
-        length: provided.length ?? existing.length,
-        decimals: provided.decimals ?? existing.decimals,
-        typeKind: provided.typeKind ?? existing.typeKind,
-        typeName: provided.typeName ?? existing.typeName,
-        domainName: provided.domainName ?? existing.typeName, // DTEL stores domain in typeName
-        shortLabel: provided.shortLabel ?? existing.shortLabel,
-        mediumLabel: provided.mediumLabel ?? existing.mediumLabel,
-        longLabel: provided.longLabel ?? existing.longLabel,
-        headingLabel: provided.headingLabel ?? existing.headingLabel,
-        searchHelp: provided.searchHelp ?? existing.searchHelp,
-        searchHelpParameter: provided.searchHelpParameter,
-        setGetParameter: provided.setGetParameter,
-        defaultComponentName: provided.defaultComponentName ?? existing.defaultComponentName,
-        changeDocument: provided.changeDocument,
-      };
-    }
-    if (type === 'SRVB') {
-      const { source: existingRaw } = await client.getSrvb(name);
-      const existing = JSON.parse(existingRaw) as Record<string, unknown>;
-      return {
-        _description: existing.description,
-        _package: existing.package,
-        serviceDefinition: provided.serviceDefinition ?? existing.serviceDefinition,
-        bindingType: provided.bindingType ?? existing.bindingType,
-        category: provided.category ?? normalizeSrvbCategory(existing.bindingCategory),
-        version: provided.version ?? existing.serviceVersion,
-        odataVersion: provided.odataVersion ?? existing.odataVersion,
-      };
-    }
-  } catch {
-    // If we can't read existing metadata (e.g., object is new/inactive), fall through
+    // The stored kind and built-in length describe the stored row type: keep them only while it is unchanged.
+    const unchanged = !!storedKind && (!requested || requested.toUpperCase() === existing.rowType.toUpperCase());
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      rowType: requested || existing.rowType,
+      rowTypeKind: provided.rowTypeKind ?? (unchanged ? storedKind : undefined),
+      rowTypeLength: unchanged ? existing.rowTypeLength : undefined,
+      rowTypeDecimals: unchanged ? existing.rowTypeDecimals : undefined,
+    };
   }
   return provided;
 }
@@ -444,9 +518,11 @@ function buildCreateXmlBody(
     case 'INCL': {
       // With a parent group this is a FUGR STRUCTURAL include: a different collection
       // (/functions/groups/{g}/includes), a different envelope, and Content-Type
-      // …fincludes.v2+xml. No packageRef — it inherits the group's package, and SAP maintains
-      // the main program's INCLUDE line itself. Live-verified npl 7.50 + a4h 758 (dossier §8.2).
-      const fugrGroup = String(properties?.group ?? '').trim();
+      // …fincludes.v2+xml. No packageRef — it inherits the group's package. Default main-program
+      // INCLUDE insertion was verified for Z groups on 7.50/758; callers must check their group (#904).
+      const fugrGroup = String(properties?.group ?? '')
+        .trim()
+        .toUpperCase();
       if (fugrGroup) {
         const fugrGroupLc = encodeURIComponent(fugrGroup.toLowerCase());
         return `<?xml version="1.0" encoding="UTF-8"?>
@@ -618,9 +694,18 @@ function buildCreateXmlBody(
         package: pkg,
         rowType,
         rowTypeKind,
+        rowTypeLength: properties?.rowTypeLength as string | undefined,
+        rowTypeDecimals: properties?.rowTypeDecimals as string | undefined,
         language: masterLanguage,
         responsible: responsibleUser,
       });
+    }
+    case 'ENQU': {
+      // Update passes the merged definition; create parses the caller's JSON source.
+      const definition =
+        (properties?.lockObjectDefinition as LockObjectDefinition | undefined) ??
+        parseLockObjectDefinition(String(properties?.lockObjectSource ?? '{}'));
+      return buildLockObjectXml({ name, description, package: pkg, definition, masterLanguage, responsibleAttr });
     }
     case 'DTEL': {
       const typeKindRaw = String(properties?.typeKind ?? '');
@@ -637,14 +722,21 @@ function buildCreateXmlBody(
         length: properties?.length as string | number | undefined,
         decimals: properties?.decimals as string | number | undefined,
         shortLabel: properties?.shortLabel ? String(properties.shortLabel) : undefined,
+        shortLength: properties?.shortLength as string | number | undefined,
         mediumLabel: properties?.mediumLabel ? String(properties.mediumLabel) : undefined,
+        mediumLength: properties?.mediumLength as string | number | undefined,
         longLabel: properties?.longLabel ? String(properties.longLabel) : undefined,
+        longLength: properties?.longLength as string | number | undefined,
         headingLabel: properties?.headingLabel ? String(properties.headingLabel) : undefined,
+        headingLength: properties?.headingLength as string | number | undefined,
         searchHelp: properties?.searchHelp ? String(properties.searchHelp) : undefined,
         searchHelpParameter: properties?.searchHelpParameter ? String(properties.searchHelpParameter) : undefined,
         setGetParameter: properties?.setGetParameter ? String(properties.setGetParameter) : undefined,
         defaultComponentName: properties?.defaultComponentName ? String(properties.defaultComponentName) : undefined,
+        deactivateInputHistory: toBoolean(properties?.deactivateInputHistory),
         changeDocument: toBoolean(properties?.changeDocument),
+        leftToRightDirection: toBoolean(properties?.leftToRightDirection),
+        deactivateBIDIFiltering: toBoolean(properties?.deactivateBIDIFiltering),
         language: masterLanguage,
         responsible: responsibleUser,
       };
@@ -760,6 +852,7 @@ export const NAME_CASE_GUARD_ACTIONS = new Set([
   'update',
   'edit_method',
   'edit_unit',
+  'add_unit',
   'delete',
   'edit_text_symbols',
 ]);
@@ -801,8 +894,8 @@ export async function enforceAllowedPackageForObjectUrl(
  * (create gates the caller-supplied package like every create; update/delete resolve the object's true
  * package under the metadata Accept). The `source` param carries AFF JSON or DDL text per the type's
  * registry sourceFormat — the JSON ones are parse-validated before the
- * PUT; ABAP-specific pre-write steps (lint, RAP preflight, CDS guard) do not apply. Create leaves the
- * object inactive — callers follow with SAPActivate (never auto-activated).
+ * PUT; ABAP-specific pre-write steps (lint, RAP preflight, CDS guard) do not apply. SAP controls
+ * activation: APLO saves are immediately active; other types need SAPActivate.
  */
 export async function handleServerDrivenObjectWrite(
   client: AdtClient,
@@ -821,14 +914,18 @@ export async function handleServerDrivenObjectWrite(
   const transport = args.transport as string | undefined;
   const objUrl = serverDrivenObjectUrl(type, name);
   const metadataAccept = serverDrivenMetadataContentType(type);
+  const activationHint =
+    type === 'APLO'
+      ? 'APLO changes are active immediately; no activation is required.'
+      : `Next step: SAPActivate(type="${type}", name="${name}").`;
 
   const invalidate = (): void => {
     cachingLayer?.invalidate(type, name, 'all');
     invalidateInactiveList(cachingLayer, client, cacheSecurity);
   };
 
-  // SDO source is AFF JSON for most types but DDL text for others (DTSC, DSFD, DTDC) — only parse-validate
-  // the JSON ones. Validating DDL text as JSON would reject every valid source.
+  // Only parse-validate entries whose sourceFormat is 'json'. Validating DDL text as JSON
+  // would reject every valid source.
   const validateSource = (): { ok: true; source: string } | { ok: false; result: ToolResult } => {
     const src = String(args.source ?? '');
     if (serverDrivenSourceFormat(type) === 'json') {
@@ -853,25 +950,49 @@ export async function handleServerDrivenObjectWrite(
     case 'create': {
       const pkg = String(args.package ?? '$TMP');
       await checkPackage(client.safety, pkg, client.getPackageHierarchyResolver());
+      if (type === 'APLO' && name.length > 20) {
+        return errorResult('APLO names must be at most 20 characters. Nothing was created.');
+      }
       const description = String(args.description ?? name);
       // Validate BEFORE the create POST — validating after would leave an inactive orphan on SAP
       // that the caller never asked for and has to clean up by hand.
       const validated = hasSourceArg ? validateSource() : undefined;
       if (validated && !validated.ok) return validated.result;
+      // The job creation wizard requires this reference before the source PUT (notably on 758).
+      let creationProperties: Record<string, string> | undefined;
+      if (type === 'SAJC' || type === 'SAJT') {
+        const field = type === 'SAJC' ? 'className' : 'catalogName';
+        const reference = validated?.ok ? JSON.parse(validated.source)?.generalInformation?.[field] : undefined;
+        if (typeof reference !== 'string' || !reference.trim()) {
+          return errorResult(`Creating ${type} requires source.generalInformation.${field} in the AFF JSON source.`);
+        }
+        creationProperties = { [field]: reference };
+      }
       await createServerDrivenObject(client.http, client.safety, type, name, {
         package: pkg,
         description,
         transport,
+        creationProperties,
       });
-      let wroteSource = false;
-      if (validated?.ok) {
-        await updateServerDrivenObjectSource(client.http, client.safety, type, name, validated.source, { transport });
-        wroteSource = true;
+      try {
+        if (validated?.ok) {
+          await updateServerDrivenObjectSource(client.http, client.safety, type, name, validated.source, { transport });
+        }
+      } catch (cause) {
+        // The POST succeeded; both HTTP and network failures can leave the object with a partial source.
+        const err =
+          cause instanceof AdtError ? cause : new AdtError(cause instanceof Error ? cause.message : String(cause));
+        err.extraHint = `${type} ${name} was created in package ${pkg}${type === 'APLO' ? ' and is active' : ''}, but the follow-up source step failed. Check it with SAPRead before using SAPWrite(action="update") — do not repeat create.`;
+        throw err;
+      } finally {
+        try {
+          invalidate();
+        } catch {
+          // Cache bookkeeping must not replace the confirmed create outcome or its original failure.
+        }
       }
-      invalidate();
       return textResult(
-        `Created ${type} ${name} in package ${pkg}${wroteSource ? ' and wrote source' : ''}.\n` +
-          `Next step: SAPActivate(type="${type}", name="${name}").`,
+        `Created ${type} ${name} in package ${pkg}${validated?.ok ? ' and wrote source' : ''}.\n${activationHint}`,
       );
     }
     case 'update': {
@@ -885,18 +1006,25 @@ export async function handleServerDrivenObjectWrite(
       await enforceAllowedPackageForObjectUrl(client, objUrl, `Operations on ${type} '${name}'`, metadataAccept);
       await updateServerDrivenObjectSource(client.http, client.safety, type, name, v.source, { transport });
       invalidate();
-      return textResult(`Updated source of ${type} ${name}.\nNext step: SAPActivate(type="${type}", name="${name}").`);
+      return textResult(`Updated source of ${type} ${name}.\n${activationHint}`);
     }
     case 'delete': {
       await enforceAllowedPackageForObjectUrl(client, objUrl, `Operations on ${type} '${name}'`, metadataAccept);
-      await deleteServerDrivenObject(client.http, client.safety, type, name, { transport });
-      invalidate();
+      try {
+        await deleteServerDrivenObject(client.http, client.safety, type, name, { transport });
+      } finally {
+        try {
+          invalidate();
+        } catch {
+          // Best-effort cleanup must not mask partial deletion or prevent the audit event.
+        }
+      }
       return textResult(`Deleted ${type} ${name}.`);
     }
     default:
       return errorResult(
         `Action "${action}" is not supported for server-driven object type ${type}. ` +
-          'Supported: create, update, delete — then SAPActivate to activate.',
+          'Supported: create, update, delete.',
       );
   }
 }
@@ -1040,8 +1168,11 @@ export function runPreWriteLint(
       return {
         blocked: true,
         result: errorResult(
-          `Pre-write lint check failed for ${type} ${name}. Fix these errors before writing:\n${errorLines}\n\n` +
-            'Use SAPLint action="lint_and_fix" to auto-fix, or disable with --lint-before-write=false.',
+          `Pre-write lint check failed for ${type} ${name} (abaplint syntax ${JSON.stringify(result.syntaxVersion)}). ` +
+            `Fix these errors before writing:\n${errorLines}\n\n` +
+            'For parser/version findings, check SAPLint action="list_rules" and the target SAP release before ' +
+            'changing valid source. Use SAPLint action="lint_and_fix" for fixable findings, or ' +
+            'lintBeforeWrite=false to skip this check for this call.',
         ),
       };
     }
@@ -1085,7 +1216,7 @@ const SYNTAX_CHECKABLE_TYPES = new Set([
  *  sequence lands. Real blocking is deferred to SAPActivate, which runs after all
  *  dependencies are in place. Best-effort: network/endpoint failures return ''. */
 export async function runPreWriteSyntaxCheck(
-  client: AdtClient,
+  client: Pick<AdtClient, 'http' | 'safety'>,
   type: string,
   source: string,
   objectUrl: string,
@@ -1163,6 +1294,11 @@ export const TABL_DT_WRITE_UNAVAILABLE_HINT =
   'Use SE11 in SAPGUI, or connect ARC-1 to an SAP_BASIS ≥ 7.52 system. ' +
   'Writing the source via /sap/bc/adt/ddic/structures/ would silently flip ' +
   'DD02L-TABCLASS to INTTAB and corrupt the table.';
+
+export const ENQU_WRITE_UNAVAILABLE_HINT =
+  'Lock object (ENQU) writes are not available on this system ' +
+  '(/sap/bc/adt/ddic/lockobjects/sources is not exposed by ADT discovery). ' +
+  'Use SE11 in SAPGUI, or connect ARC-1 to a system that exposes the lock-object endpoint.';
 
 export const TTYP_WRITE_UNAVAILABLE_HINT =
   'Table type (TTYP) writes are not available on this system ' +

@@ -24,7 +24,7 @@ Authenticate MCP clients using OAuth 2.1 with an external identity provider (Mic
                                         │
                           ┌─────────────┘
                           │ JWKS keys
-                          │ (cached 1h)
+                          │ (verifier cache)
 ```
 
 ## Identity Provider Setup
@@ -67,11 +67,12 @@ Authenticate MCP clients using OAuth 2.1 with an external identity provider (Mic
    - **Why:** Power Platform requires this permission for OAuth connectors.
 
 5. **Create a Client Secret:**
+   - Use `--append` in the CLI example to preserve existing credentials ([Azure CLI reference](https://learn.microsoft.com/en-us/cli/azure/ad/app/credential#az-ad-app-credential-reset)).
    - App registration → Certificates & secrets → New client secret
    - Copy the secret value immediately (it won't be shown again)
    - Or via Azure CLI:
      ```bash
-     az ad app credential reset --id {client-id} --display-name "PowerAutomate" --years 2
+     az ad app credential reset --append --id {client-id} --display-name "PowerAutomate" --years 2
      ```
 
 6. **Note the values:**
@@ -156,7 +157,8 @@ Then let your IdP assign JWT scopes per user:
 - `read` for reviewers
 - `read write` for developers
 - `read write transports` for users allowed to create/release CTS requests
-- `read write git` for users allowed to run gCTS/abapGit mutations
+- `read write git` for users allowed to run gated abapGit mutation/egress actions (the scope reserves
+  the gCTS mutation boundary too, but current gCTS mutations are quarantined before HTTP)
 - `read write data sql` only for users who should access SAP data through ARC-1
 
 Transport and Git mutations need both `write` and the specialized `transports` / `git` scope. Granting only `transports` or only `git` is not enough because ARC-1 disables all mutations for users without `write`.
@@ -192,7 +194,7 @@ see [Auto-discovery](#auto-discovery-rfc-9728) below, including the Entra ID cav
 
 ### Microsoft Copilot Studio / Power Automate
 
-Copilot Studio uses Power Automate custom connectors to connect to MCP servers. The connector handles OAuth token acquisition automatically.
+Copilot Studio can now add an MCP server directly through its Tools page; follow [Microsoft’s current MCP setup](https://learn.microsoft.com/en-us/microsoft-copilot-studio/mcp-add-existing-server-to-agent). The Power Automate steps below apply when maintaining an existing custom connector, which handles OAuth token acquisition.
 
 #### Step 1: Create Custom Connector
 
@@ -233,13 +235,12 @@ Copilot Studio uses Power Automate custom connectors to connect to MCP servers. 
    - It looks like: `https://global.consent.azure-apim.net/redirect/crc25-5farc-2d1-20...`
 7. Go to Azure Portal → App registration → **Authentication** → Add platform → **Web**
    - Add the redirect URI from step 6
-   - Also add the base: `https://global.consent.azure-apim.net/redirect`
+   - Register the exact callback shown by your connector; do not add unrelated callbacks.
 
-   Or via Azure CLI:
+   If using the CLI, include all existing callbacks that must remain: `--web-redirect-uris` replaces the list.
    ```bash
    az ad app update --id {client-id} \
      --web-redirect-uris \
-       "https://global.consent.azure-apim.net/redirect" \
        "https://global.consent.azure-apim.net/redirect/your-connector-specific-uri"
    ```
 

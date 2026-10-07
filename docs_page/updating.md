@@ -1,5 +1,53 @@
 # Updating ARC-1
 
+## v1.5.0 — upgrade checks
+
+Start with the [1.5.0 upgrade checklist](release-notes.md#150-upgrade-checklist).
+No new server setting is required; refresh your MCP client's tool list after upgrading.
+
+### v1.5.0 — XML text and cached summaries
+
+ARC-1 now decodes SAP XML entities once. If your extension decodes values already parsed by ARC-1,
+remove that extra decoding; raw XML handled by your own code is unaffected. Text previously saved
+in SAP as a literal `&amp;` is not repaired automatically—update it once with the intended text.
+
+With `ARC1_CACHE=sqlite`, an existing SRVB summary may retain encoded text until its ETag changes.
+For an immediate refresh, stop every ARC-1 process sharing the cache, remove the cache file, then
+restart. Use `ARC1_CACHE_FILE`, or `.arc1-cache.db` in the process working directory by default.
+This clears the local cache, not SAP source; it is unnecessary if you do not see stale summaries.
+
+<a id="xsuaa-callback-hardening"></a>
+
+## v1.4.0 — XSUAA callback hardening
+
+Standard MCP clients keep their URL and registration. Perform a full MTA deployment so XSUAA
+and the app both receive the restricted policies. Before upgrading, use the
+[XSUAA upgrade table](xsuaa-setup.md#upgrading-an-existing-deployment) for your setup.
+If you use the optional browser UI with its old default route,
+[pin that route first](xsuaa-setup.md#keep-an-existing-ui-url) to keep its address unchanged.
+Custom gateways and manual XSUAA services need their exact public callbacks registered;
+clients relying on an arbitrary CF/BAS callback with the shared client ID should switch to DCR.
+
+## v1.1.0 — CLI/CI hardening compatibility changes
+
+The CLI/CI hardening changes shipped in `1.1.0`. Its direct CI commands and unavailable Git mutation
+paths were not established stable, usable contracts, so these changes ship as a minor release.
+Pipelines that already trialed them should still review these compatibility changes:
+
+| Area | Change | Migration |
+|---|---|---|
+| SAPGit | The unimplemented `commit` action is no longer advertised or accepted. All gCTS mutation names remain quarantined before HTTP. Accepted-but-unverifiable abapGit mutations return error/incomplete instead of optimistic success. | Use `push` for abapGit commits. Inspect repository/remote state before retrying any incomplete mutation. Do not depend on gCTS writes until the staged import/deploy design ships. |
+| SAPGit `description` | The gCTS-only `description` parameter was removed with the unavailable `commit` action; strict input validation now rejects it. | Drop `description` from SAPGit callers. Use the staging comment supported by the abapGit `push` flow when applicable. |
+| Recursive CTS release | `release_recursive` requires `SAP_ALLOWED_TRANSPORTS` to be the legacy unrestricted empty value or explicit `*`; exact/prefix lists cannot safely authorize a subtree that may gain a concurrent task. Success now waits for terminal CTS evidence; released tasks may be folded out of SAP's organizer tree and are confirmed by their accepted release or the terminal parent. | Use single `release` with exact transport grants, or explicitly authorize every current/concurrent child with `*` for recursive release. Set `timeoutSeconds` when the five-minute default is unsuitable. |
+| Git egress | `SAPGit.external_info` now requires `git` scope plus `SAP_ALLOW_WRITES=true` and `SAP_ALLOW_GIT_WRITES=true`; Git URLs must be HTTPS and credential-free. | Move credentials out of URLs and enable the egress/write gates only on the instance intended to contact remote Git hosts. |
+| Revision and diagnostic links | Caller-provided ADT links are restricted to canonical endpoint-specific paths. | Pass the exact revision/gateway/AUnit URI returned by ARC-1 or SAP; arbitrary `/sap/bc/adt/**` paths, traversal, and ambiguous encodings are rejected. |
+| Dedicated CI checks | Non-evaluable AUnit/ATC/diff/lint evidence exits `3`; tool/SAP failures exit `1`; usage/config validation exits `2`. | Preserve the process exit code alongside JSON, JUnit, or Checkstyle reports and handle exit `3` as incomplete rather than success. |
+| Dedicated lint preset | `arc1 lint` now uses ARC-1's CLI-safe abaplint preset instead of inheriting a repository-specific default config. Existing files may change from red to green when they only violated rules outside that preset. | Pass `SAP_ABAPLINT_CONFIG` when the CI job must enforce a repository-specific rule set. |
+| CLI parsing | Unknown commands/options, missing values, and extra positional arguments are now usage errors instead of falling through to the default server command. | Fix misspelled commands and pass every boolean flag with an explicit value, such as `--allow-writes=true`. |
+
+The generic `arc1 call` command keeps MCP `ToolResult` semantics. The stricter domain exit codes apply
+to the dedicated `unittest`, `atc`, `diff`, and `lint` commands.
+
 ## v1.0 — upgrading from 0.9.x
 
 From `1.0` ARC-1 follows [semantic versioning](https://semver.org/): a breaking change to the MCP tool
@@ -15,7 +63,7 @@ Four things to check. Per-change context for the whole release is in the
 | **Retired settings abort startup** | anyone who configured cache warmup or the unreleased multi-destination prototype | Remove `ARC1_CACHE_WARMUP`, `ARC1_CACHE_WARMUP_PACKAGES`, `--cache-warmup`, `--cache-warmup-packages` and `SAP_BTP_DESTINATIONS` — details in [Cache warmup removal](#v10-cache-warmup-removal) and [multi-target migration](#v10-experimental-destination-discovered-multi-target-migration) below. Setting them to `false` is not enough; the value is not read, the presence is |
 | **Unknown tool parameters are rejected** | MCP clients and agent frameworks that send extra keys | A parameter outside a tool's schema now returns a validation error instead of being silently stripped. If a custom client injects its own keys into tool arguments, stop doing that before upgrading — previously the call succeeded while quietly ignoring them |
 | **`SAPTransport(action="list")` returns headers only** | anything that reads the object list out of `list` | Pass `summary=false` to restore the previous full response |
-| **The XSUAA descriptor gained a jwt-bearer grant** | BTP Cloud Foundry, and only if you want app-to-app propagation | `cf update-service arc1-mcp-xsuaa -c xs-security.json` (or an MTA redeploy). Existing bindings inherit it without rebinding, and every existing login path keeps working untouched |
+| **The XSUAA descriptor gained a jwt-bearer grant** | BTP Cloud Foundry, and only if you want app-to-app propagation | a full MTA redeploy (manual services: apply the route-specific `xs-security.landscape.json`). Existing bindings inherit it without rebinding, and every existing login path keeps working untouched |
 
 Nothing else in 1.0 needs an action: the tool surface grew (procedural unit surgery, FUNC processing types,
 new server-driven types, `atc_variants`), and the rest is fixes.
@@ -112,13 +160,17 @@ Added two new scopes: `transports`, `git`. `admin` now **implies all other scope
 
 #### xs-security.json (BTP)
 
-`MCPDeveloper` role template now bundles `[read, write, transports, git]`. Re-deploy `xs-security.json` to your XSUAA service:
+`MCPDeveloper` role template now bundles `[read, write, transports, git]`. Redeploy the MTA,
+or update a manually owned service with its route-specific file:
 
 ```bash
-cf update-service arc1-xsuaa -c xs-security.json
+cf update-service arc1-xsuaa -c xs-security.landscape.json
 ```
 
-Users assigned to `ARC-1 Developer` role collection automatically gain transport and git write capability. If you want "developer without CTS/Git", create your own role template referencing just `[read, write]`.
+Users assigned to `ARC-1 Developer` role collection automatically gain transport scope and the gated
+abapGit mutation/egress scope when the matching server flags are enabled. gCTS mutations remain
+quarantined before HTTP, and unverifiable accepted abapGit actions return error/incomplete. If you
+want "developer without CTS/Git", create your own role template referencing just `[read, write]`.
 
 ### Migration steps
 
@@ -134,7 +186,7 @@ Users assigned to `ARC-1 Developer` role collection automatically gain transport
 #### BTP Cloud Foundry
 
 1. Update `xs-security.json` in your repo (already done in the ARC-1 v0.7 release).
-2. Redeploy the XSUAA service: `cf update-service arc1-xsuaa -c xs-security.json`. This updates scopes and role templates, but does not create role collections from `mta.yaml`.
+2. For an MTA-owned service, continue with the full MTA deployment below. For a manually owned service, update with its route-specific `xs-security.landscape.json`; a service update alone does not create role collections from `mta.yaml`.
 3. Run the full MTA deployment: `npm run btp:build-deploy-ext` (or `mbt build && cf deploy mta_archives/arc1-mcp_*.mtar -e mta-overrides.mtaext`). If you don't have a `mta-overrides.mtaext` yet, copy it from the tracked `mta-overrides.mtaext.example` first. The base `mta.yaml` is deliberately target-free; the extension preserves the existing single-target names or enables multi-target mode explicitly.
 4. In BTP Cockpit, verify that all seven `ARC-1 … (<space>)` role collections exist and contain roles. Existing assignments survive, but collections added after an older deployment are not created by `cf update-service` alone and must be assigned explicitly.
 5. Test with a developer user: `SAPTransport(action=check)` should succeed with a read-scoped user now; `SAPTransport(action=create)` should succeed for users in `ARC-1 Developer`.
@@ -152,7 +204,7 @@ See the full [Authorization & Roles](authorization.md) doc for the complete mode
 ## Before you update
 
 1. **Check what changed** — start with the annotated [Release Notes](release-notes.md): every release with its impact and the action it needs (usually none). The raw [CHANGELOG.md](https://github.com/arc-mcp/arc-1/blob/main/CHANGELOG.md) and the [Releases page](https://github.com/arc-mcp/arc-1/releases) list every merged PR.
-2. **Pin to a version** — in production, use exact version tags (for example `:1.0.2`), never `:latest`. Prevents surprise upgrades. <!-- x-release-please-version -->
+2. **Pin to a version** — in production, use exact version tags (for example `:1.5.1`), never `:latest`. Prevents surprise upgrades. <!-- x-release-please-version -->
 3. **Test first** — update a dev/staging instance before production. Verify MCP clients still connect and tools work as expected.
 4. **Read the startup auth line after upgrade** — a drift-free instance will log the same `auth: MCP=[...] SAP=[...]` summary before and after. If it's different, the upgrade changed something you didn't expect.
 
@@ -160,7 +212,7 @@ See the full [Authorization & Roles](authorization.md) doc for the complete mode
 
 ## npx / npm
 
-`npx` always pulls the latest version. To pin:
+Use `@latest` to follow npm’s current latest tag. An unqualified `npx arc-1` can use an existing local installation. To pin:
 
 <!-- x-release-please-start-version -->
 ```bash
@@ -168,24 +220,24 @@ See the full [Authorization & Roles](authorization.md) doc for the complete mode
 npx arc-1@latest
 
 # Pinned
-npx arc-1@1.0.2
+npx arc-1@1.5.1
 
 # Global install
-npm install -g arc-1@1.0.2
+npm install -g arc-1@1.5.1
 ```
 <!-- x-release-please-end -->
 
 Verify:
 
 ```bash
-npx arc-1 --version
+arc1 --version  # global installation; for npx, use the same exact version specifier you launch
 ```
 
 If you pin in MCP client config, update the `args`:
 
 <!-- x-release-please-start-version -->
 ```json
-{ "command": "npx", "args": ["-y", "arc-1@1.0.2"] }
+{ "command": "npx", "args": ["-y", "arc-1@1.5.1"] }
 ```
 <!-- x-release-please-end -->
 
@@ -196,7 +248,7 @@ If you pin in MCP client config, update the `args`:
 <!-- x-release-please-start-version -->
 ```bash
 # 1. Pull the new image
-docker pull ghcr.io/arc-mcp/arc-1:1.0.2
+docker pull ghcr.io/arc-mcp/arc-1:1.5.1
 
 # 2. Stop & remove the running container
 docker stop arc1 && docker rm arc1
@@ -204,24 +256,26 @@ docker stop arc1 && docker rm arc1
 # 3. Start with the new image (same env vars / config)
 docker run -d --name arc1 -p 8080:8080 \
   --env-file .env \
-  ghcr.io/arc-mcp/arc-1:1.0.2
+  ghcr.io/arc-mcp/arc-1:1.5.1
 
 # 4. Verify
 docker logs arc1 | head -20
-curl -s http://localhost:8080/mcp
+curl -s http://localhost:8080/health  # process health; also verify a safe SAP read from your client
 ```
 <!-- x-release-please-end -->
 
-**Downtime:** brief interruption between stop and start. For zero-downtime, run two containers behind a reverse proxy (nginx / Traefik) and switch traffic after health check.
+**Downtime:** brief interruption between stop and start. For single-target or PP deployments, two containers behind a reverse proxy (nginx / Traefik) can reduce downtime; switch traffic after health and safe-read checks. Shared-Basic multi-target mode requires exactly one instance and cannot use this approach.
 
-**Rollback:** start the previous image.
+**Rollback:** start the previous reviewed image with compatible configuration; replace the placeholder below. Keep HTTP authentication in `.env`.
 
 ```bash
 docker stop arc1 && docker rm arc1
-docker run -d --name arc1 -p 8080:8080 --env-file .env ghcr.io/arc-mcp/arc-1:0.6.8
+docker run -d --name arc1 -p 8080:8080 --env-file .env "ghcr.io/arc-mcp/arc-1:<previous-reviewed-version>"
 ```
 
 ---
+
+<a id="updating-on-btp"></a>
 
 ## BTP Cloud Foundry
 
@@ -235,6 +289,23 @@ identity mode; it determines whether process overlap is safe.
 | Multi-target, PP only | Rolling may be used when old/new versions are compatible |
 | Multi-target with any shared Basic destination | **Non-rolling stop/deploy/start; exactly one process** |
 | Mixed multi-target PP + Basic | Basic restriction governs the entire application |
+
+Before retrying a deploy that failed or was interrupted, check `cf mta-ops`. A previous active or
+`ERROR` operation can make a non-interactive deploy appear to hang while it waits for confirmation.
+Abort only the operation ID for this MTA, then retry the reviewed deployment:
+
+```bash
+cf mta-ops --mta <mta-id>
+cf deploy -i <operation-id> -a abort
+```
+
+Do not use `-f` to bypass this check: first inspect the operation and confirm that aborting it is
+safe for the target space. On Windows a stalled `cf.exe` can leave its `multiapps.exe`
+child running. Stop only the identified stalled invocation and its child before retrying;
+ending a local process does not itself abort the server-side operation.
+The default version rule, `SAME_HIGHER`, already permits a same-version redeploy.
+An approved rollback to an older version needs `--version-rule ALL`; check
+`cf deploy --help` for your installed plugin.
 
 ### Single-target or PP-only multi-target
 
@@ -281,11 +352,17 @@ For every mode:
 2. inspect all expected XSUAA role collections/roles after a security-descriptor change;
 3. obtain a fresh token when roles changed;
 4. for multi-target, inspect Admin `SAPTargets` and registry revision; and
-5. perform one Viewer `SAPRead SYSTEM` and verify the intended SAP identity.
+5. perform one Viewer `SAPRead SYSTEM`, then confirm the SAP user from SAP-side evidence
+   ([Verify the backend identity](principal-propagation-setup.md#verify-the-backend-identity)).
 
 Keep the previous reviewed MTAR, `.mtaext`, and DCR signing secret available. Roll back through the
-same strategy as the update. Shared Basic rollback is also stop/deploy/start and must finish at one
-process. See [BTP Administration](btp-administration.md#deployment-and-scaling-by-identity-mode).
+same strategy as the update, explicitly permitting the older archive:
+
+```bash
+cf deploy <previous-reviewed.mtar> -e <previous-reviewed.mtaext> --version-rule ALL
+```
+
+Shared Basic rollback is also stop/deploy/start and must finish at one process. See [BTP Administration](btp-administration.md#deployment-and-scaling-by-identity-mode).
 
 ### Keeping MCP clients signed in across updates
 

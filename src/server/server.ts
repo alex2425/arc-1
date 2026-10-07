@@ -1,12 +1,11 @@
 /**
- * MCP Server for ARC-1.
- *
  * Creates and starts the MCP server with 12 intent-based tools.
  * Supports two transports:
  * - stdio (default): for local MCP clients (Claude Desktop, Claude Code, Cursor)
  * - http-streamable: for remote/containerized deployments
  */
 
+import type { Server as HttpServer } from 'node:http';
 import { type ApiKeyEntry, createApiKeyVerifier, type Verifier } from '@arc-mcp/xsuaa-auth';
 import type { BTPConfig, BTPProxyConfig, Destination, PerUserAuthTokens } from '@arc-mcp/xsuaa-auth/btp';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
@@ -32,6 +31,7 @@ import {
 } from '../handlers/feature-cache.js';
 import type { ToolResult } from '../handlers/shared.js';
 import { getToolDefinitions, type ToolDefinition, type ToolDefinitionOptions } from '../handlers/tools.js';
+import { VERSION } from '../version.js';
 import { logAuthSummary } from './auth-summary.js';
 import { API_KEY_PROFILES } from './config.js';
 import { generateRequestId } from './context.js';
@@ -68,14 +68,16 @@ import {
 import { MultiTargetSharedAuthState } from './multi-target-shared-auth-state.js';
 import { injectTargetSchema, multiTargetToolDefinitions, sapTargetsDefinition } from './multi-target-tools.js';
 import { loadPlugins } from './plugin-loader.js';
+import { createDataResultSemaphore, runtimeMemoryEnvelope } from './runtime-memory.js';
+import { buildServerInstructions } from './server-instructions.js';
+import { closeHttpServer, registerShutdownHandlers } from './shutdown.js';
 import { FileSink } from './sinks/file.js';
 import { filterToolsByAuthScope } from './tool-auth.js';
 import type { ServerConfig } from './types.js';
 import { startLocalUiServer, type UiServerDeps } from './ui.js';
 import { UiLogBufferSink } from './ui-log-buffer.js';
 
-/** ARC-1 version */
-export const VERSION = '1.0.2'; // x-release-please-version
+export { VERSION } from '../version.js';
 
 // Soft warning for an unusually large served tools/list. It is re-sent on every conversation (a
 // recurring token + latency cost), and some MCP clients cap tool-list size. CI's
@@ -145,7 +147,10 @@ export function getConfiguredToolDefinitions(
   resolvedFeatures?: Parameters<typeof getToolDefinitions>[2],
   client?: Implementation,
 ): ToolDefinition[] {
-  return getToolDefinitions(config, textSearchAvailable, resolvedFeatures, getToolDefinitionOptions(config, client));
+  return getToolDefinitions(config, textSearchAvailable, resolvedFeatures, {
+    ...getToolDefinitionOptions(config, client),
+    discoveryMap: getCachedDiscovery(config.targetId ?? config.destinationName),
+  });
 }
 
 export { logAuthSummary } from './auth-summary.js';
@@ -208,23 +213,30 @@ export function buildAdtConfig(
   bearerTokenProvider?: () => Promise<string>,
   opts?: { perUser?: boolean },
   adtSemaphore?: Semaphore,
+  dataResultSemaphore?: Semaphore,
 ): Partial<AdtClientConfig> {
   const adtConfig: Partial<AdtClientConfig> = {
     baseUrl: config.url,
     client: config.client,
     language: config.language,
+    userAgent: config.userAgent,
     insecure: config.insecure,
+    gzipDataPreviewBody: config.gzipDataPreviewBody,
     disableSaml: config.disableSaml2,
     btpProxy,
     bearerTokenProvider,
     maxConcurrent: config.maxConcurrent,
     adtSemaphore,
+    maxDataPreviewResponseBytes: config.maxDataPreviewResponseBytes,
+    maxConcurrentDataResults: config.maxConcurrentDataResults,
+    dataResultSemaphore,
     safety: {
       allowWrites: config.allowWrites,
       allowDataPreview: config.allowDataPreview,
       allowFreeSQL: config.allowFreeSQL,
       allowTransportWrites: config.allowTransportWrites,
       allowGitWrites: config.allowGitWrites,
+      blockedDataSources: [...config.blockedDataSources],
       allowedPackages: config.allowedPackages,
       allowedTransports: config.allowedTransports,
       denyActions: config.denyActions,
@@ -296,6 +308,7 @@ async function createPerUserClient(
   btpProxy: BTPProxyConfig | undefined,
   userJwt: string,
   adtSemaphore?: Semaphore,
+  dataResultSemaphore?: Semaphore,
   multiTarget?: { target: TargetDescriptor; instanceConfig: ServerConfig },
 ): Promise<AdtClient> {
   const { createConnectivityProxy, lookupDestinationWithUserToken } = await import('@arc-mcp/xsuaa-auth/btp');
@@ -328,7 +341,14 @@ async function createPerUserClient(
     ? (createConnectivityProxy(btpConfig, destination.CloudConnectorLocationId, authLibLogger) ?? undefined)
     : selectPerUserProxy(destination, btpProxy);
 
-  const adtConfig = buildAdtConfig(config, effectiveProxy, undefined, { perUser: true }, adtSemaphore);
+  const adtConfig = buildAdtConfig(
+    config,
+    effectiveProxy,
+    undefined,
+    { perUser: true },
+    adtSemaphore,
+    dataResultSemaphore,
+  );
   // Override URL from destination (in case it differs from startup-resolved URL)
   adtConfig.baseUrl = resolvedUrl;
   // Set per-user auth for principal propagation.
@@ -403,6 +423,7 @@ export function applyPerUserAuthTokens(
   }
   adtConfig.username = displayUsername;
   adtConfig.password = undefined;
+  adtConfig.http = undefined; // An existing transport can carry another identity's login cookies.
   return adtConfig;
 }
 
@@ -415,7 +436,7 @@ export function applyPerUserAuthTokens(
  * exception: every caller uses the same reviewed SAP identity, so authorization-limited
  * evidence is definitive for that credential generation and may be cached.
  */
-async function probeClientFeatures(
+export async function probeClientFeatures(
   config: ServerConfig,
   client: AdtClient,
   btpConfig?: BTPConfig,
@@ -480,7 +501,10 @@ async function probeClientFeatures(
         'installed and you can ignore this. See docs/sap-trial-setup.md (423 troubleshooting).',
     );
   }
-  setCachedDiscovery(features.discoveryMap ?? new Map(), featureKey);
+  const discoveryMap = features.discoveryMap ?? new Map();
+  setCachedDiscovery(discoveryMap, featureKey);
+  // Direct calls immediately reuse the probed client, so install its evidence too.
+  client.http.setDiscoveryMap(discoveryMap);
 }
 
 export function runStartupProbe(
@@ -512,6 +536,23 @@ export interface StartupAuthPreflightResult {
 }
 
 const STARTUP_AUTH_ENDPOINT = '/sap/bc/adt/core/discovery';
+
+function skippedStartupAuthPreflight(config: ServerConfig): StartupAuthPreflightResult | undefined {
+  const reason = config.ppEnabled
+    ? 'Skipped startup auth preflight: principal propagation mode is enabled (per-user auth at runtime).'
+    : !config.url
+      ? 'Skipped startup auth preflight: SAP_URL is not configured.'
+      : undefined;
+  if (!reason) return undefined;
+  logger.info(reason);
+  return {
+    status: 'skipped',
+    blocking: false,
+    endpoint: STARTUP_AUTH_ENDPOINT,
+    checkedAt: new Date().toISOString(),
+    reason,
+  };
+}
 
 function buildStartupAuthFailureReason(statusCode: number, config: ServerConfig): string {
   if (statusCode === 401) {
@@ -546,46 +587,36 @@ function buildStartupAuthFailureReason(statusCode: number, config: ServerConfig)
   return `Startup auth preflight failed with HTTP ${statusCode}.`;
 }
 
-/**
- * Run a startup auth preflight for shared-credential mode.
- *
- * Goal: detect invalid technical/shared credentials once at startup and avoid
- * repeated failed SAP requests from the first LLM tool call onward.
- *
- * Behavior:
- * - Never throws (server must stay up)
- * - PP mode and no-URL mode are skipped (non-blocking)
- * - 401/403 are blocking failures
- * - Network/other failures are inconclusive (non-blocking)
- */
+/** Shared-auth preflight: 401/403 block; PP/no-URL skip; other failures are non-blocking. */
 export async function runStartupAuthPreflight(
   config: ServerConfig,
   btpProxy?: BTPProxyConfig,
   bearerTokenProvider?: () => Promise<string>,
   adtSemaphore?: Semaphore,
 ): Promise<StartupAuthPreflightResult> {
+  const skipped = skippedStartupAuthPreflight(config);
+  if (skipped) return skipped;
+  const client = new AdtClient(buildAdtConfig(config, btpProxy, bearerTokenProvider, undefined, adtSemaphore));
+  return runStartupAuthPreflightWithClient(config, client);
+}
+
+/** Existing-client form retains authentication state for direct calls. */
+export async function runStartupAuthPreflightWithClient(
+  config: ServerConfig,
+  client: AdtClient,
+): Promise<StartupAuthPreflightResult> {
+  const skipped = skippedStartupAuthPreflight(config);
+  if (skipped) return skipped;
   const checkedAt = new Date().toISOString();
-  const endpoint = STARTUP_AUTH_ENDPOINT;
-
-  if (config.ppEnabled) {
-    const reason = 'Skipped startup auth preflight: principal propagation mode is enabled (per-user auth at runtime).';
-    logger.info(reason);
-    return { status: 'skipped', blocking: false, endpoint, checkedAt, reason };
-  }
-
-  if (!config.url) {
-    const reason = 'Skipped startup auth preflight: SAP_URL is not configured.';
-    logger.info(reason);
-    return { status: 'skipped', blocking: false, endpoint, checkedAt, reason };
-  }
+  let endpoint = STARTUP_AUTH_ENDPOINT;
 
   try {
-    const client = new AdtClient(buildAdtConfig(config, btpProxy, bearerTokenProvider, undefined, adtSemaphore));
-    await client.http.get(endpoint);
-    const reason = 'Startup auth preflight succeeded for shared SAP credentials.';
+    endpoint = await client.http.fetchCsrfToken();
+    const reason = 'Startup authentication/CSRF bootstrap succeeded; each tool still checks authorization.';
     logger.info(reason, { endpoint });
     return { status: 'ok', blocking: false, endpoint, checkedAt, reason };
   } catch (err) {
+    if (err instanceof AdtApiError) endpoint = err.path;
     if (err instanceof AdtApiError && (err.statusCode === 401 || err.statusCode === 403)) {
       const reason = buildStartupAuthFailureReason(err.statusCode, config);
       // Non-blocking downgrade only applies to cookieFile mode — that's the path
@@ -609,7 +640,7 @@ export async function runStartupAuthPreflight(
 
     const detail = err instanceof Error ? err.message : String(err);
     const reason =
-      'Startup auth preflight was inconclusive (non-auth failure). ' +
+      'Startup authentication/CSRF bootstrap was inconclusive (non-auth failure). ' +
       'Continuing and letting runtime requests handle connectivity diagnostics.';
     logger.warn(reason, { endpoint, error: detail });
     return { status: 'inconclusive', blocking: false, endpoint, checkedAt, reason };
@@ -627,28 +658,6 @@ export function formatStartupAuthPreflightToolError(preflight: StartupAuthPrefli
   );
 }
 
-/** Sent in the MCP initialize response. Clients that defer tool loading (Claude Code enables tool
- *  search by default) use this to decide whether to look for ARC-1's tools at all, so it names the
- *  domain first. Keep under 2 KB — Claude Code truncates server instructions silently. */
-const SERVER_INSTRUCTIONS = [
-  'ARC-1 gives this SAP ABAP system a read/write interface over SAP ADT: ABAP source (classes,',
-  'programs, function modules, includes), CDS/RAP artifacts (DDLS, BDEF, SRVD, SRVB), DDIC objects',
-  '(tables, domains, data elements), transports, abapGit/gCTS, ATC and ABAP Unit, SQL/table data,',
-  'and syntax/activation. Reach for it for any question about ABAP objects, CDS views, transport',
-  'requests, or dumps/traces on this system.',
-  '',
-  'Token-cheap paths, in order — a bare full read is the expensive last resort:',
-  '- Understanding an object: SAPContext(action="deps") returns compressed contracts, not source',
-  '  (measured 14-264x smaller than SAPRead on the same class).',
-  '- One method: SAPRead(type="CLAS", method="name"). Survey signatures: method="*".',
-  '- Finding a string: SAPRead(grep="pattern") instead of reading the whole object.',
-  '- Blast radius of a CDS change: SAPContext(action="impact").',
-  'Where-used, usages, impact and transport lists are paged: they report a complete "total"/summary',
-  'alongside a capped page — trust that count, not the page length. Other list actions are unpaged.',
-  '',
-  'One SAP system per instance: there is no system/destination selector, by design.',
-].join('\n');
-
 export interface CreateServerOptions {
   btpProxy?: BTPProxyConfig;
   btpConfig?: BTPConfig;
@@ -657,9 +666,17 @@ export interface CreateServerOptions {
   startupProbePromise?: Promise<void>;
   startupAuthPreflightPromise?: Promise<StartupAuthPreflightResult>;
   adtSemaphore?: Semaphore;
+  dataResultSemaphore?: Semaphore;
   mcpRateLimiter?: McpRateLimiter;
   multiTarget?: MultiTargetServerOptions;
+  /** Shared SAP transport (cookies, CSRF token); each request still gets its own AdtClient and caches. */
+  defaultHttp?: AdtClient['http'];
 }
+
+// Mark startup-401 cookies stale once per transport, preserving cookies refreshed by earlier HTTP calls.
+const staleCookieTransports = new WeakSet<AdtClient['http']>();
+/** Maximum age when selecting a shared transport for a new HTTP request; not a ticket lifetime (R21). */
+export const SHARED_TRANSPORT_MAX_AGE_MS = 10 * 60_000;
 
 export function createServer(config: ServerConfig, options: CreateServerOptions = {}): Server {
   const {
@@ -670,6 +687,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
     startupProbePromise,
     startupAuthPreflightPromise,
     adtSemaphore,
+    dataResultSemaphore,
     mcpRateLimiter,
     multiTarget,
   } = options;
@@ -677,26 +695,21 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
     { name: config.serverName, version: VERSION },
     {
       capabilities: { tools: { listChanged: true } },
-      instructions: multiTarget ? buildMultiTargetServerInstructions(multiTarget) : SERVER_INSTRUCTIONS,
+      instructions: multiTarget
+        ? buildMultiTargetServerInstructions(multiTarget)
+        : buildServerInstructions(config.systemLabel),
     },
   );
   const apiKeyProvenanceVerifier = createConfiguredApiKeyVerifier(config);
 
-  // Create default ADT client (shared, uses startup-time credentials or OAuth bearer).
-  // Passes the shared server-wide semaphore so per-user PP clients (created at request
-  // time) share the same Layer 3 concurrency cap.
+  // Default ADT client (startup-time credentials or OAuth bearer); per-user PP clients share its semaphore.
   const defaultClient = multiTarget
     ? undefined
-    : new AdtClient(buildAdtConfig(config, btpProxy, bearerTokenProvider, undefined, adtSemaphore));
+    : new AdtClient({
+        ...buildAdtConfig(config, btpProxy, bearerTokenProvider, undefined, adtSemaphore, dataResultSemaphore),
+        http: options.defaultHttp,
+      });
 
-  // Cookie-auth preflight propagation: when startup preflight returned a non-blocking
-  // 401 in SAP_COOKIE_FILE mode, the throwaway preflight client marked itself stale —
-  // but the long-lived defaultClient was constructed independently with cookies read at
-  // startup and is unaware. Without explicit propagation, the first real tool call would
-  // re-emit the same stale cookies and hit 401 again before the lazy reload triggers,
-  // wasting one round-trip per startup-stale-cookie cycle. We propagate the stale state
-  // once on first tool call — idempotent flag keeps later calls O(1).
-  let preflightStalePropagated = false;
   let schemaNullableAutoClientInfoLogged = false;
 
   // Register tool listing — filtered by user's scopes when auth is active
@@ -805,12 +818,10 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
           isError: true,
         } as Record<string, unknown>;
       }
-      // Non-blocking 401 from cookie-auth preflight → mark the runtime client's cookies
-      // stale so its first call goes straight to the lazy reload path instead of repeating
-      // the failure. Fires once per process; subsequent calls early-return.
-      if (!preflightStalePropagated && startupAuth.status === 'inconclusive' && startupAuth.statusCode === 401) {
-        defaultClient?.http.markCookiesStale();
-        preflightStalePropagated = true;
+      const staleStartupCookies = startupAuth.status === 'inconclusive' && startupAuth.statusCode === 401;
+      if (staleStartupCookies && defaultClient && !staleCookieTransports.has(defaultClient.http)) {
+        defaultClient.http.markCookiesStale();
+        staleCookieTransports.add(defaultClient.http);
       }
     }
 
@@ -872,6 +883,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
         multiTargetMcpRateLimitConsumed ? undefined : mcpRateLimiter,
         requestId,
         postDispatchResult,
+        extra.signal,
       );
       return { ...result } as Record<string, unknown>;
     };
@@ -888,7 +900,8 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
         clientId: extra.authInfo?.clientId,
         toolName,
         multiError,
-        buildClientConfig: (proxy) => buildAdtConfig(activeConfig, proxy, undefined, undefined, adtSemaphore),
+        buildClientConfig: (proxy) =>
+          buildAdtConfig(activeConfig, proxy, undefined, undefined, adtSemaphore, dataResultSemaphore),
         dispatch: (basicClient, postDispatchResult) => dispatchWithClient(basicClient, false, postDispatchResult),
       });
     }
@@ -930,6 +943,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
           btpProxy,
           token,
           adtSemaphore,
+          dataResultSemaphore,
           selectedTarget
             ? { target: selectedTarget, instanceConfig: multiTarget?.instanceConfig ?? config }
             : undefined,
@@ -1077,13 +1091,41 @@ export async function createAndStartServer(
   config: ServerConfig,
   sources?: Record<string, import('./types.js').ConfigSource>,
 ): Promise<Server> {
-  initLogger(config.logFormat, config.verbose);
+  initLogger(config.logFormat, config.logLevel);
   const startedAt = new Date().toISOString();
   const uiLogBuffer = config.uiMode !== 'off' ? new UiLogBufferSink() : undefined;
   if (uiLogBuffer) {
     logger.addSink(uiLogBuffer);
   }
   logAuthSummary(config);
+  // Load the XSUAA binding before plugins, UI listeners or SAP traffic so a failure stops startup cleanly.
+  let xsuaaCredentials: import('@arc-mcp/xsuaa-auth').XsuaaCredentials | undefined;
+  if (config.transport === 'http-streamable' && config.xsuaaAuth) {
+    try {
+      const xsenv = await import('@sap/xsenv');
+      const services = xsenv.getServices({ uaa: { tag: 'xsuaa' } });
+      const uaa = services.uaa as Record<string, string>;
+      xsuaaCredentials = {
+        url: uaa.url,
+        clientid: uaa.clientid,
+        clientsecret: uaa.clientsecret,
+        xsappname: uaa.xsappname,
+        uaadomain: uaa.uaadomain,
+      };
+      logger.info('XSUAA credentials loaded', {
+        xsappname: xsuaaCredentials.xsappname,
+        url: xsuaaCredentials.url,
+      });
+    } catch (err) {
+      // Fail closed: continuing without credentials would serve /mcp unauthenticated.
+      logger.error('Failed to load XSUAA credentials — refusing to start', {
+        error: err instanceof Error ? err.message : String(err),
+      });
+      const flag = config.multiTargetEndpoints ? 'ARC1_MULTI_TARGET_ENDPOINTS' : 'SAP_XSUAA_AUTH';
+      throw new Error(`${flag}=true requires a valid bound XSUAA service.`);
+    }
+  }
+  logger.info('Runtime memory envelope', runtimeMemoryEnvelope());
 
   // Effective-policy log + contradiction warnings (Task 8 observability).
   // Sources is optional for test callers — defaults to 'default' for all fields.
@@ -1103,17 +1145,17 @@ export async function createAndStartServer(
     logger.addSink(new FileSink(config.logFile));
     logger.info('File logging enabled', { logFile: config.logFile });
   }
-
-  // Add BTP Audit Log sink if auditlog service is bound (auto-detected from VCAP_SERVICES)
   try {
     const { BTPAuditLogSink, parseBTPAuditLogConfig } = await import('./sinks/btp-auditlog.js');
     const auditLogConfig = parseBTPAuditLogConfig();
     if (auditLogConfig) {
-      logger.addSink(new BTPAuditLogSink(auditLogConfig));
+      const reportDeliveryError = (error: string) =>
+        logger.warn('BTP Audit Log delivery failed (rate-limited)', { error });
+      logger.addSink(new BTPAuditLogSink(auditLogConfig, reportDeliveryError));
       logger.info('BTP Audit Log sink enabled', { url: auditLogConfig.url });
     }
   } catch (err) {
-    logger.warn('BTP Audit Log sink initialization failed (optional)', {
+    logger.error('BTP Audit Log sink disabled; audit events will remain on stderr and the optional file sink', {
       error: err instanceof Error ? err.message : String(err),
     });
   }
@@ -1290,12 +1332,11 @@ export async function createAndStartServer(
   const sharedAuthState = config.multiTargetEndpoints ? new MultiTargetSharedAuthState() : undefined;
 
   // ─── Layer 3: shared SAP-bound Semaphore (server-wide cap) ────────
-  // One Semaphore for the whole process. Threaded into the shared startup client AND
-  // every per-user PP client built at request time, so ARC1_MAX_CONCURRENT is a true
-  // server-wide ceiling rather than a per-client one (the latter would multiply the cap
-  // by the number of active PP users — see ADR-0004).
+  // One process-wide instance gates the startup client and every per-user PP client;
+  // a per-client guard would multiply the cap by active users (ADR-0004).
   const adtSemaphore = new Semaphore(config.maxConcurrent);
   logger.info('SAP semaphore', { maxConcurrent: config.maxConcurrent, scope: 'server-wide' });
+  const dataResultSemaphore = createDataResultSemaphore(config);
 
   // ─── Layer 2: per-user MCP tool-call rate limiter ─────────────────
   // Applied inside handleToolCall. Stdio (no authInfo) is exempt — there's no user
@@ -1314,7 +1355,7 @@ export async function createAndStartServer(
     logger.info('Object cache enabled', {
       mode: config.cacheMode,
       sources: stats.sourceCount,
-      depGraphs: stats.contractCount,
+      legacyDepGraphs: stats.contractCount,
     });
   }
 
@@ -1344,6 +1385,18 @@ export async function createAndStartServer(
       })()
     : Promise.resolve();
 
+  // Retire transport state for new HTTP requests, preserving older requests and their late responses.
+  // Configured cookies are reloaded, not revoked; see R21. Stdio builds its server only once.
+  const newDefaultHttp = () =>
+    new AdtClient(buildAdtConfig(config, btpProxy, bearerTokenProvider, undefined, adtSemaphore, dataResultSemaphore))
+      .http;
+  let shared = { http: newDefaultHttp(), since: performance.now() };
+  const defaultHttp = () => {
+    if (performance.now() - shared.since >= SHARED_TRANSPORT_MAX_AGE_MS) {
+      shared = { http: newDefaultHttp(), since: performance.now() };
+    }
+    return shared.http;
+  };
   const buildDefaultServer = () =>
     createServer(config, {
       btpProxy,
@@ -1353,7 +1406,9 @@ export async function createAndStartServer(
       startupProbePromise,
       startupAuthPreflightPromise,
       adtSemaphore,
+      dataResultSemaphore,
       mcpRateLimiter,
+      defaultHttp: defaultHttp(),
     });
   const aggregateConfig = registry ? buildAggregateToolSurfaceConfig(config, registry.targets) : undefined;
   const buildAggregateServer =
@@ -1362,6 +1417,7 @@ export async function createAndStartServer(
           createServer(aggregateConfig, {
             btpConfig,
             adtSemaphore,
+            dataResultSemaphore,
             mcpRateLimiter,
             multiTarget: { mode: 'aggregate', registry, instanceConfig: config, sharedAuthState },
           })
@@ -1382,80 +1438,21 @@ export async function createAndStartServer(
         }
       : undefined;
 
-  // Shutdown hook for SQLite cache cleanup (guard against double-close from multiple signals).
-  // IMPORTANT: registering a SIGINT/SIGTERM listener suppresses Node's default exit behavior,
-  // so we must call process.exit() explicitly after cleanup — otherwise Ctrl+C hangs the process.
-  if (cachingLayer) {
-    let cacheClosed = false;
-    const cleanup = (signal: string) => {
-      if (cacheClosed) return;
-      cacheClosed = true;
-      try {
-        cachingLayer?.cache.close();
-      } catch {
-        // Ignore close errors during shutdown
-      }
-      logger.info(`ARC-1 shutting down (${signal})`);
-      process.exit(0);
-    };
-    process.on('SIGTERM', () => cleanup('SIGTERM'));
-    process.on('SIGINT', () => cleanup('SIGINT'));
-  } else {
-    // No cache — still log clean shutdown on explicit signals so operators see it in logs.
-    process.on('SIGTERM', () => {
-      logger.info('ARC-1 shutting down (SIGTERM)');
-      process.exit(0);
-    });
-    process.on('SIGINT', () => {
-      logger.info('ARC-1 shutting down (SIGINT)');
-      process.exit(0);
-    });
+  const httpServers: HttpServer[] = [];
+  if (uiDeps && config.uiMode === 'local') {
+    httpServers.push(await startLocalUiServer(uiDeps));
   }
 
   if (config.transport === 'stdio') {
-    if (uiDeps && config.uiMode === 'local') {
-      await startLocalUiServer(uiDeps);
-    }
     const transport = new StdioServerTransport();
     await server.connect(transport);
     logger.info('ARC-1 MCP server running on stdio');
   } else {
-    if (uiDeps && config.uiMode === 'local') {
-      await startLocalUiServer(uiDeps);
-    }
     // HTTP Streamable transport — for containerized/BTP deployments
     // Pass the factory function so HTTP server can create fresh server+transport
     // per request. This is required because MCP SDK's Server can only connect
     // to one transport at a time, and clients like Copilot Studio send
     // concurrent requests.
-    // Load XSUAA credentials if XSUAA auth is enabled
-    let xsuaaCredentials: import('@arc-mcp/xsuaa-auth').XsuaaCredentials | undefined;
-    if (config.xsuaaAuth) {
-      try {
-        const xsenv = await import('@sap/xsenv');
-        const services = xsenv.getServices({ uaa: { tag: 'xsuaa' } });
-        const uaa = services.uaa as Record<string, string>;
-        xsuaaCredentials = {
-          url: uaa.url,
-          clientid: uaa.clientid,
-          clientsecret: uaa.clientsecret,
-          xsappname: uaa.xsappname,
-          uaadomain: uaa.uaadomain,
-        };
-        logger.info('XSUAA credentials loaded', {
-          xsappname: xsuaaCredentials.xsappname,
-          url: xsuaaCredentials.url,
-        });
-      } catch (err) {
-        logger.error('Failed to load XSUAA credentials — XSUAA auth will not work', {
-          error: err instanceof Error ? err.message : String(err),
-        });
-        if (config.multiTargetEndpoints) {
-          throw new Error('ARC1_MULTI_TARGET_ENDPOINTS=true requires a valid bound XSUAA service.');
-        }
-      }
-    }
-
     const { startHttpServer } = await import('./http.js');
     const multiTargets =
       registry && btpConfig && buildAggregateServer
@@ -1467,20 +1464,30 @@ export async function createAndStartServer(
               return createServer(targetConfig, {
                 btpConfig,
                 adtSemaphore,
+                dataResultSemaphore,
                 mcpRateLimiter,
                 multiTarget: { mode: 'pinned', registry, instanceConfig: config, target, sharedAuthState },
               });
             },
           }
         : undefined;
-    await startHttpServer(
-      serveSingleTargetEndpoint ? buildDefaultServer : undefined,
-      config,
-      xsuaaCredentials,
-      config.uiMode === 'web' ? uiDeps : undefined,
-      multiTargets,
+    httpServers.push(
+      await startHttpServer(
+        serveSingleTargetEndpoint ? buildDefaultServer : undefined,
+        config,
+        xsuaaCredentials,
+        config.uiMode === 'web' ? uiDeps : undefined,
+        multiTargets,
+      ),
     );
   }
 
+  registerShutdownHandlers(
+    async () => {
+      await Promise.all(httpServers.map(closeHttpServer));
+      await server.close();
+    },
+    () => cachingLayer?.cache.close(),
+  );
   return server;
 }

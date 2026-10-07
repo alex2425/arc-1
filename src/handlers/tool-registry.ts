@@ -27,6 +27,7 @@
  * same literal set, in table order.
  */
 
+import { ATC_BATCH_TYPES } from '../adt/atc-batch.js';
 import { SDO_TYPES } from '../adt/server-driven.js';
 import type { ResolvedFeatures } from '../adt/types.js';
 import type { ServerConfig } from '../server/types.js';
@@ -79,6 +80,8 @@ const SAPREAD_TYPE_TABLE = [
   { type: 'DTEL', btp: true },
   { type: 'TRAN', btp: false },
   { type: 'TTYP', btp: false },
+  // DDIC lock objects: one XML metadata document, returned as JSON. Live-verified on-prem 8.16 + BTP trial.
+  { type: 'ENQU', btp: true },
   { type: 'TABLE_CONTENTS', btp: true },
   { type: 'TABLE_QUERY', btp: true },
   { type: 'DEVC', btp: true },
@@ -96,6 +99,7 @@ const SAPREAD_TYPE_TABLE = [
   { type: 'BSP_DEPLOY', btp: true },
   { type: 'API_STATE', btp: true },
   { type: 'INACTIVE_OBJECTS', btp: true },
+  { type: 'SYNTAX', btp: true },
   { type: 'AUTH', btp: false },
   // FTG2 is an ARC-1-private invented identifier (see docs/research/abap-types/types/ftg2.md).
   // FEATURE_TOGGLE is the new canonical name; FTG2 stays as deprecated alias for one minor.
@@ -117,6 +121,12 @@ const sapReadTypes = deriveTypeArrays(SAPREAD_TYPE_TABLE);
 export const SAPREAD_TYPES_ONPREM = sapReadTypes.onprem;
 /** SAPRead types available on BTP ABAP Environment (the `btp: true` rows). */
 export const SAPREAD_TYPES_BTP = sapReadTypes.btp;
+
+// ATC selects repository objects from the same BTP availability matrix as reads.
+// Derive the subset instead of maintaining a second PROG/INCL exclusion list.
+export const ATC_BATCH_TYPES_BTP = ATC_BATCH_TYPES.filter((type) =>
+  SAPREAD_TYPES_BTP.some((candidate) => candidate === type),
+);
 
 // ─── SAPWrite ───────────────────────────────────────────────────────
 
@@ -144,6 +154,7 @@ const SAPWRITE_TYPE_TABLE = [
   { type: 'DTEL', btp: true },
   { type: 'MSAG', btp: true },
   { type: 'TTYP', btp: false },
+  { type: 'ENQU', btp: true },
   // Server-driven objects (8.16+) — write via the generic blue:blueSource + AFF JSON engine.
   // Rows derive from SDO_TYPES exactly like the SAPRead table above.
   ...SDO_TYPES.map((t) => ({ type: t, btp: true }) as const),

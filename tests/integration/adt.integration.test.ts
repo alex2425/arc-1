@@ -11,7 +11,12 @@ import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { classifyCdsImpact } from '../../src/adt/cds-impact.js';
 import type { AdtClient } from '../../src/adt/client.js';
 import { findWhereUsed } from '../../src/adt/codeintel.js';
-import { getCdsTestCases, runAtcCheck, supportsCdsTestCases } from '../../src/adt/devtools.js';
+import {
+  getAtcSystemDefaultVariant,
+  getCdsTestCases,
+  runAtcCheck,
+  supportsCdsTestCases,
+} from '../../src/adt/devtools.js';
 import {
   getDump,
   getGatewayErrorDetail,
@@ -117,6 +122,25 @@ describe('ADT Integration Tests', () => {
         // description may be empty for some components
         expect(typeof comp.description).toBe('string');
       }
+    });
+  });
+
+  describe('BSP filestore', () => {
+    it('classifies a BSP root from SAP response media type', async (ctx) => {
+      let apps: Awaited<ReturnType<AdtClient['listBspApps']>> | undefined;
+      try {
+        apps = await client.listBspApps(undefined, 1);
+      } catch (error) {
+        if (error instanceof AdtApiError && (error.statusCode === 403 || error.statusCode === 404)) {
+          requireOrSkip(ctx, undefined, `${SkipReason.BACKEND_UNSUPPORTED}: BSP filestore unavailable`);
+        }
+        throw error;
+      }
+      const app = apps?.[0];
+      requireOrSkip(ctx, app, `${SkipReason.NO_FIXTURE}: no BSP application available`);
+      const content = await client.getBspPathContent(app.name);
+      expect(content.kind).toBe('folder');
+      if (content.kind === 'folder') expect(Array.isArray(content.nodes)).toBe(true);
     });
   });
 
@@ -1993,6 +2017,16 @@ describe('ADT Integration Tests', () => {
   //   one terminal activateBatch — SAP resolves the cross-reference internally.
 
   describe('SAPWrite batch_create activateAtEnd', () => {
+    // Parent and child reference each other: per-object DELETEs 400 on both sides and leak the pair.
+    const deletePair = async (...names: string[]) => {
+      const { deleteObjectSet } = await import('./crud-harness.js');
+      return deleteObjectSet(
+        client.http,
+        client.safety,
+        names.map((name) => ({ name, objectUrl: `/sap/bc/adt/ddic/ddl/sources/${name.toLowerCase()}` })),
+      );
+    };
+
     it('default (activateAtEnd=false) fails on composition-linked DDLS — documents the failure mode', async (ctx) => {
       requireOrSkip(ctx, process.env.TEST_SAP_URL, SkipReason.NO_CREDENTIALS);
       const { generateUniqueName } = await import('./crud-harness.js');
@@ -2005,6 +2039,7 @@ describe('ADT Integration Tests', () => {
         toolMode: 'standard',
       } as unknown as Parameters<typeof handleToolCall>[1];
 
+      let cleanupFailures: Awaited<ReturnType<typeof deletePair>> = [];
       try {
         const result = await handleToolCall(client, config, 'SAPWrite', {
           action: 'batch_create',
@@ -2041,18 +2076,9 @@ describe('ADT Integration Tests', () => {
         // refused the composition outright. Both confirm the failure mode this PR fixes.
         expect(text).toMatch(/does not exist or is not active|activation failed|Composition target/i);
       } finally {
-        for (const name of [parentName, childName]) {
-          try {
-            await handleToolCall(client, config, 'SAPWrite', {
-              action: 'delete',
-              type: 'DDLS',
-              name,
-            });
-          } catch {
-            // best-effort-cleanup
-          }
-        }
+        cleanupFailures = await deletePair(parentName, childName);
       }
+      expect(cleanupFailures).toEqual([]);
     });
 
     it('activateAtEnd=true activates a composition-linked DDLS pair in a single terminal batch', async (ctx) => {
@@ -2067,6 +2093,7 @@ describe('ADT Integration Tests', () => {
         toolMode: 'standard',
       } as unknown as Parameters<typeof handleToolCall>[1];
 
+      let cleanupFailures: Awaited<ReturnType<typeof deletePair>> = [];
       try {
         const result = await handleToolCall(client, config, 'SAPWrite', {
           action: 'batch_create',
@@ -2112,18 +2139,9 @@ describe('ADT Integration Tests', () => {
           expect(read.isError).toBeUndefined();
         }
       } finally {
-        for (const name of [parentName, childName]) {
-          try {
-            await handleToolCall(client, config, 'SAPWrite', {
-              action: 'delete',
-              type: 'DDLS',
-              name,
-            });
-          } catch {
-            // best-effort-cleanup
-          }
-        }
+        cleanupFailures = await deletePair(parentName, childName);
       }
+      expect(cleanupFailures).toEqual([]);
     });
   });
 
@@ -2241,18 +2259,39 @@ describe('ADT Integration Tests', () => {
 
   // ─── ATC worklist + check-variant flow (runAtcCheck) ─────────────────
   describe('runAtcCheck (worklist + variant flow)', () => {
-    // Regression guard for the three-step ATC flow. The previous implementation POSTed
-    // straight to /atc/runs?worklistId=1 and never bound a check variant, so ATC executed
-    // no checks and always returned zero findings. These tests assert the worklist→run→get
-    // flow completes and returns a well-formed findings array against a live system.
-    // Finding COUNT is system-dependent (ATC content + check variants vary, and ATC skips
-    // $TMP objects), so exact-format parsing is locked down by the unit fixture test
-    // (tests/unit/adt/devtools.test.ts → "parses the real SAP worklist response format").
+    // A variant may exclude this class, but that must remain incomplete rather than appear clean.
     const KERNEL_CLASS_URL = '/sap/bc/adt/oo/classes/cl_abap_typedescr';
-
+    // Assert the invariants that always hold, not "the run completed" — an incomplete run is a
+    // legitimate outcome (for example, a variant excluding the class), and it must be *reported*
+    // as incomplete rather than appear clean. Asserting
+    // completeness here made the test depend on live ATC timing and it flaked at the deadline.
+    const expectSoundResult = (result: Awaited<ReturnType<typeof runAtcCheck>>) => {
+      if (result.complete) {
+        expect(result.processedObjectCount).toBeGreaterThan(0);
+        expect(['asyncRunCompleted', 'legacyWorklistSettled']).toContain(result.completionEvidence);
+        expect(result.incompleteReasons).toEqual([]);
+      } else {
+        expect(result.incompleteReasons.length).toBeGreaterThan(0);
+      }
+      if (result.completionEvidence === 'asyncRunCompleted') expect(result.runStatus).toBe('Completed');
+      if (result.findingStatistics) {
+        expect(result.expectedFindingCount).toBe(result.findingStatistics.total);
+        expect(result.findingStatistics.total).toBe(
+          result.findingStatistics.errors + result.findingStatistics.warnings + result.findingStatistics.infos,
+        );
+      } else {
+        expect(result.expectedFindingCount).toBeNull();
+      }
+      expect(result.truncated).toBe(false);
+      expect(Array.isArray(result.runInfos)).toBe(true);
+      // Nothing processed can never read as clean.
+      if (result.processedObjectCount === 0) expect(result.complete).toBe(false);
+    };
     it('completes the flow with an explicit check variant', async () => {
-      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, 'PERFORMANCE_DB');
-      expect(Array.isArray(result.findings)).toBe(true);
+      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, 'PERFORMANCE_DB', {
+        timeoutMs: 30_000,
+      });
+      expectSoundResult(result);
       for (const f of result.findings) {
         expect(typeof f.priority).toBe('number');
         expect(typeof f.line).toBe('number');
@@ -2264,9 +2303,50 @@ describe('ADT Integration Tests', () => {
       }
     }, 90000);
 
-    it('completes the flow with the system default variant (no variant passed)', async () => {
-      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL);
-      expect(Array.isArray(result.findings)).toBe(true);
+    // SAP maps an EMPTY checkVariant to the CI variant literally named DEFAULT, NOT to
+    // systemCheckVariant — so runAtcCheck resolves the system default itself and sends it.
+    // Evidence: docs/research/2026-08-19-atc-default-check-variant.md
+    it('binds the system default check variant when none is passed', async () => {
+      const systemDefault = await getAtcSystemDefaultVariant(client.http, unrestrictedSafetyConfig());
+
+      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, undefined, {
+        timeoutMs: 30_000,
+      });
+
+      expectSoundResult(result);
+      if (systemDefault) {
+        expect(result.variantSource).toBe('systemDefault');
+        expect(result.variant).toBe(systemDefault);
+      } else {
+        // No /atc/customizing (or no systemCheckVariant) on this system — documented degradation.
+        expect(result.variantSource).toBe('sapFallback');
+        expect(result.variant).toBeNull();
+      }
+    }, 90000);
+
+    // A4H may return an incomplete zero-object result for this default-variant fixture. The 758
+    // async status must still terminate far inside the request budget without the legacy quiet wait.
+    // Evidence: docs/research/issues/728-atc-finding-stats-completeness.md
+    it('returns a terminal run far inside its budget', async () => {
+      const started = Date.now();
+      const result = await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, undefined, {
+        timeoutMs: 60_000,
+      });
+      const elapsed = Date.now() - started;
+
+      expectSoundResult(result);
+      expect(elapsed).toBeLessThan(45_000);
+    }, 90000);
+
+    it('rejects an unknown check variant instead of letting SAP silently run DEFAULT', async () => {
+      try {
+        await runAtcCheck(client.http, unrestrictedSafetyConfig(), KERNEL_CLASS_URL, 'ZZZ_ARC1_NO_SUCH_VARIANT', {
+          timeoutMs: 30_000,
+        });
+        throw new Error('Expected runAtcCheck to reject an unknown check variant');
+      } catch (err) {
+        expectSapFailureClass(err, [400], [/does not exist on this system/i]);
+      }
     }, 90000);
   });
 
@@ -2367,6 +2447,19 @@ describe('ADT Integration Tests', () => {
       // The fields that make a LADI the exposure-v2 unit: app type + catalog + intent.
       expect(src.generalInformation).toBeDefined();
       expect(src.navigation).toBeDefined();
+    });
+
+    it('reads a DRTY (CDS Type) as DDL text', async (ctx) => {
+      await gateOrSkip(ctx, 'DRTY');
+      // Demo package names differ between 758 and 816. Search the type directly.
+      const objects = await client.searchObject('*', 10, 'DRTY/STY');
+      const drty = objects.find((o) => o.objectType === 'DRTY/STY');
+      requireOrSkip(ctx, drty, `${SkipReason.NO_FIXTURE}: no visible DRTY instance`);
+      const r = await getServerDrivenObject(client.http, unrestrictedSafetyConfig(), 'DRTY', drty.objectName);
+      expect(r.type).toBe('DRTY/STY');
+      expect(typeof r.package).toBe('string');
+      expect(r.source).toBeTypeOf('string');
+      expect(r.source as string).toMatch(/define\s+type/i);
     });
 
     it('reads an EVTB (RAP Event Binding) with a populated events array', async (ctx) => {
@@ -2605,7 +2698,7 @@ describe('BDEF behavior extension create (#10)', () => {
       toolMode: 'standard',
     } as unknown as Parameters<typeof handleToolCall>[1];
     const client = getTestClient();
-    const tab = generateUniqueName('ZARC1_BX');
+    const tab = generateUniqueName('ZARC1B'); // At most 16 characters with a four-letter run ID.
     const root = `ZR_${tab}`;
     const ext = `${root}_X`;
     const W = async (args: Record<string, unknown>) => {

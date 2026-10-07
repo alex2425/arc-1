@@ -6,10 +6,12 @@ This page is the published index for those files. The canonical copies stay in `
 
 See the full source catalog in [`skills/README.md`](https://github.com/arc-mcp/arc-1/blob/main/skills/README.md).
 
-!!! tip "Fastest path for Claude Code"
-    Install the [Claude Code plugin](install-in-claude.md#claude-code-plugin-server-skills) — it
-    bundles the ARC-1 MCP server **and** every skill below in one step (`/plugin install
-    arc-1@arc-1`). The per-assistant copy instructions below are for other tools and manual setups.
+!!! tip "Install the server and skills together"
+    Install the portable [Agent Plugin](agent-plugin.md) for Copilot, VS Code, Cursor, Codex, and
+    other compatible clients. Claude Code users can install its
+    [native plugin](install-in-claude.md#claude-code-plugin-server-skills), which adds a secure
+    configuration prompt. The per-assistant copy instructions below remain useful when ARC-1 is
+    already connected separately.
 
 ## What Skills Are
 
@@ -53,11 +55,12 @@ The CLI knows Copilot-compatible paths such as `.agents/skills/<name>/` and `~/.
 
 Choose the integration style that matches your assistant:
 
+- **Agent Plugins 1.0 clients**: install the [ARC-1 Agent Plugin](agent-plugin.md) for the server and all skills in one package
 - **Claude Code**: install the [plugin](install-in-claude.md#claude-code-plugin-server-skills) (recommended — server + skills), run `npx skills add arc-mcp/arc-1`, or copy a skill folder into `.claude/skills/<name>/`
 - **GitHub Copilot in VS Code / CLI / cloud agent**: install into `.agents/skills/<name>/`, `.github/skills/<name>/`, or `~/.copilot/skills/<name>/`
 - **GitHub Copilot in Eclipse**: install into `.agents/skills/<name>/`, `.github/skills/<name>/`, or `~/.copilot/skills/<name>/` in a normal local Eclipse project; use **Enable Skills** and the `/skill:<name>` slash menu
 - **Cursor**: install into `.agents/skills/<name>/` or `~/.cursor/skills/<name>/`
-- **OpenAI Codex**: install into `.agents/skills/<name>/` or `~/.codex/skills/<name>/`
+- **OpenAI Codex**: install into `.agents/skills/<name>/` or `~/.agents/skills/<name>/` — see [Codex skill locations](https://learn.chatgpt.com/docs/build-skills)
 - **Generic tools**: paste the markdown into project instructions, system prompt, or reusable templates
 
 These skills assume:
@@ -298,7 +301,7 @@ Workspace `.vscode/mcp.json` for a centrally hosted ARC-1 server:
 }
 ```
 
-Local ARC-1 development is still useful with SAP ADT for VS Code:
+Local ARC-1 development is still useful with SAP ADT for VS Code. Generate a key with `openssl rand -hex 32` and use the same value in the server command and client header:
 
 ```bash
 npx arc-1@latest \
@@ -306,7 +309,8 @@ npx arc-1@latest \
   --http-addr 127.0.0.1:3000 \
   --url https://your-sap-host:44300 \
   --user YOUR_USER \
-  --password YOUR_PASS
+  --password YOUR_PASS \
+  --api-keys "YOUR_GENERATED_API_KEY:admin"
 ```
 
 Then configure:
@@ -316,7 +320,8 @@ Then configure:
   "servers": {
     "arc1-local": {
       "type": "http",
-      "url": "http://127.0.0.1:3000/mcp"
+      "url": "http://127.0.0.1:3000/mcp",
+      "headers": { "Authorization": "Bearer YOUR_GENERATED_API_KEY" }
     }
   }
 }
@@ -395,6 +400,8 @@ References: [ABAP Development Tools for VS Code marketplace page](https://market
 | [migrate-custom-code](https://github.com/arc-mcp/arc-1/blob/main/skills/migrate-custom-code/SKILL.md) | Runs migration-oriented checks and groups findings by priority | S/4HANA migration and ABAP Cloud readiness |
 | [sap-migration-dossier](https://github.com/arc-mcp/arc-1/blob/main/skills/sap-migration-dossier/SKILL.md) | Builds a scoped ECC to S/4HANA migration dossier with inventory, usage, ATC, Clean Core, dependency, and SAP Docs evidence | Package- or namespace-level migration planning |
 | [sap-object-documenter](https://github.com/arc-mcp/arc-1/blob/main/skills/sap-object-documenter/SKILL.md) | Batch-documents custom objects as Markdown | Package onboarding and handoffs |
+| [sap-transport-overview](https://github.com/arc-mcp/arc-1/blob/main/skills/sap-transport-overview/SKILL.md) | Lists open transports, owners, and contents | Planning releases and finding work in progress |
+| [sap-transport-review](https://github.com/arc-mcp/arc-1/blob/main/skills/sap-transport-review/SKILL.md) | Reviews transport changes or inactive drafts against earlier source | Reviewing a change before activation or release |
 
 ### Clean Core And Custom Code Retirement
 

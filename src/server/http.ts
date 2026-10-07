@@ -42,6 +42,7 @@ import {
   PINNED_RESOURCE_METADATA_PATH_PATTERN,
   targetFromPinnedMcpPath,
 } from './multi-target-identity.js';
+import { ARC1_MANUAL_CLIENT_REDIRECT_URI_PATTERNS } from './oauth-redirect-policy.js';
 import {
   buildXsuaaSessionRefreshUrl,
   createOAuthLoggedOutHandler,
@@ -292,7 +293,11 @@ export async function startHttpServer(
   xsuaaCredentials?: XsuaaCredentials,
   uiDeps?: UiServerDeps,
   multiTargets?: MultiTargetRouting,
-): Promise<void> {
+): Promise<import('node:http').Server> {
+  // Defense in depth: without credentials the XSUAA branch below is skipped and /mcp would be open.
+  if (config.xsuaaAuth && !xsuaaCredentials) {
+    throw new Error('SAP_XSUAA_AUTH=true requires XSUAA credentials; refusing to start an unauthenticated /mcp.');
+  }
   const [host, portStr] = config.httpAddr.split(':');
   const port = Number.parseInt(portStr || '8080', 10);
   const bindHost = host || '0.0.0.0';
@@ -422,6 +427,7 @@ export async function startHttpServer(
       dcrTtlSeconds: config.oauthDcrTtlSeconds,
       dcrSigningSecret: config.dcrSigningSecret,
       callbackUrl: oauthCallbackUrl,
+      redirectUriPatterns: ARC1_MANUAL_CLIENT_REDIRECT_URI_PATTERNS,
       logger: authLibLogger,
     });
     // Inject ARC-1's scope-expansion policy + logger so the verifier emits the
@@ -577,11 +583,11 @@ export async function startHttpServer(
       }
 
       // Auto-register redirect_uri for the pre-registered XSUAA client.
-      // The MCP SDK requires exact redirect_uri matching, but XSUAA itself
-      // validates redirect URIs against xs-security.json wildcard patterns.
-      // For clients like Copilot Studio that use Manual OAuth config with the
-      // XSUAA client_id, we dynamically add their redirect_uri to pass the
-      // SDK's exact-match check — XSUAA remains the authoritative validator.
+      // The MCP SDK requires exact redirect_uri matching. Because the callback
+      // proxy sends XSUAA ARC-1's own /oauth/callback, XSUAA never sees the
+      // client's URI; ARC1_MANUAL_CLIENT_REDIRECT_URI_PATTERNS is the
+      // authoritative gate for clients (such as Copilot Studio) that use the
+      // shared XSUAA client_id. DCR clients are exact-bound in their signed id.
       const params = req.method === 'POST' ? req.body : req.query;
       const redirectUri = params?.redirect_uri;
       const clientId = params?.client_id;
@@ -804,6 +810,7 @@ export async function startHttpServer(
     }
     process.exit(1);
   });
+  return httpServer;
 }
 
 // ─── OIDC Verifier (package-backed) ─────────────────────────────────

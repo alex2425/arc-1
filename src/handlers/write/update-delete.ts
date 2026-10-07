@@ -3,16 +3,15 @@
  */
 
 import {
-  deleteObject,
-  lockObject,
-  safeUpdateClassInclude,
-  safeUpdateObject,
-  safeUpdateSource,
-  unlockObject,
-} from '../../adt/crud.js';
-import { rewriteKtdText } from '../../adt/ddic-xml.js';
+  isTextElementObjectType,
+  TEXT_ELEMENT_OBJECT_TYPES,
+  TEXT_ELEMENT_PARTS,
+  type TextElementPart,
+} from '../../adt/client.js';
+import { deleteObject, lockObject, safeUpdateClassInclude, safeUpdateSource, unlockObject } from '../../adt/crud.js';
 import { AdtApiError } from '../../adt/errors.js';
 import { type FmParameter, spliceFmSignature } from '../../adt/fm-signature.js';
+import type { AdtHttpClient } from '../../adt/http.js';
 import {
   buildCdsDeleteDependencyHint,
   buildCdsUpdateCrudHint,
@@ -23,20 +22,15 @@ import { getCachedFeatures } from '../feature-cache.js';
 import { CLASS_WRITE_INCLUDES, canonicalTablType, classIncludeUrl } from '../object-types.js';
 import { errorResult, type ToolResult, textResult } from '../shared.js';
 import {
-  buildCreateXml,
-  getMetadataWriteProperties,
   isMetadataWriteType,
-  mergeMetadataWriteProperties,
   mergePreWriteWarnings,
-  resolveWriteSystemType,
   runPreWriteLint,
   runPreWriteSyntaxCheck,
   runRapPreflightValidation,
-  SKTD_V2_CONTENT_TYPE,
   stripFmParamCommentBlock,
-  vendorContentTypeForType,
 } from '../write-helpers.js';
 import type { SapWriteContext } from './context.js';
+import { writeMetadataUpdate } from './metadata-update.js';
 
 function isDeleteDependencyError(err: AdtApiError): boolean {
   const clean = AdtApiError.extractCleanMessage(err.responseBody ?? err.message).toLowerCase();
@@ -99,6 +93,7 @@ export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResul
       source,
       transport,
       getCachedFeatures()?.abapRelease,
+      args.expectedSourceHash as string | undefined,
     );
     invalidateWrittenObject(type, name);
     const initNote = initialized ? ` (initialised the ${include} include first)` : '';
@@ -107,60 +102,8 @@ export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResul
     );
   }
 
-  if (type === 'SKTD') {
-    // KTD update requires the full <sktd:docu> XML envelope with the Markdown
-    // body base64-encoded inside <sktd:text>, PUT with
-    // `application/vnd.sap.adt.sktdv2+xml`. PUTting raw text/plain silently
-    // no-ops (or 415s on strict systems). Fetch the current envelope,
-    // replace only the <sktd:text> body, and PUT it back — preserves
-    // responsible/masterLanguage/packageRef/refObject metadata.
-    const { source: currentEnvelope } = await client.getKtd(name);
-    const body = rewriteKtdText(currentEnvelope, source);
-    await safeUpdateObject(
-      client.http,
-      client.safety,
-      objectUrl,
-      body,
-      SKTD_V2_CONTENT_TYPE,
-      transport,
-      getCachedFeatures()?.abapRelease,
-    );
-    invalidateWrittenObject(type, name);
-    return textResult(`Successfully updated ${type} ${name}.`);
-  }
-
-  if (isMetadataWriteType(type)) {
-    // Metadata updates are full-XML-replace — we must fetch existing metadata
-    // and merge with provided fields so omitted fields keep their current values.
-    // Without this, updating just labels would reset dataType/typeKind to defaults.
-    const metadataProps = getMetadataWriteProperties(args);
-    const mergedProps = await mergeMetadataWriteProperties(client, type, name, metadataProps);
-    const description = String(args.description ?? mergedProps._description ?? name);
-    const pkg = String(args.package ?? existingPackage ?? mergedProps._package ?? '$TMP');
-    // Keep the full-XML-replace body cloud-correct on BTP (G-3); resolve the user from the JWT (G-5).
-    const systemType = resolveWriteSystemType(config, client);
-    const responsible = config.username || (await client.getEffectiveUser());
-    const body = buildCreateXml(
-      type,
-      name,
-      pkg,
-      description,
-      mergedProps,
-      config.language,
-      responsible,
-      systemType === 'btp',
-    );
-    await safeUpdateObject(
-      client.http,
-      client.safety,
-      objectUrl,
-      body,
-      vendorContentTypeForType(type),
-      transport,
-      getCachedFeatures()?.abapRelease,
-    );
-    invalidateWrittenObject(type, name);
-    return textResult(`Successfully updated ${type} ${name}.`);
+  if (type === 'SKTD' || isMetadataWriteType(type)) {
+    return writeMetadataUpdate(ctx, existingPackage);
   }
 
   // RAP deterministic preflight validation
@@ -186,43 +129,28 @@ export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResul
   //
   // Issue #252: when `parameters` is supplied as a structured array, splice
   // it into the FM source as ABAP-source-based signature syntax. If `source`
-  // is omitted entirely, fetch the existing source first to preserve the
+  // is omitted entirely, read the existing source under the lock to preserve the
   // body. The structured clause replaces any existing signature region.
   let effectiveSource = source;
   let fmParamStripWarning: string | undefined;
-  let fmParamMergeWarning: string | undefined;
-  if (type === 'FUNC') {
-    const parameters = args.parameters as FmParameter[] | undefined;
-    if (parameters !== undefined) {
-      // If caller passed parameters but no source, fetch the current source so
-      // the body is preserved (the parameters array re-emits only the signature).
-      let baseSource = source;
-      if (!baseSource || baseSource.trim() === '') {
-        const groupName = String(args.group ?? '');
-        const fetched = await client.getFunction(groupName, name).catch(() => null);
-        baseSource = fetched?.source ?? `FUNCTION ${name}.\nENDFUNCTION.\n`;
-      } else if (!/^\s*FUNCTION\s+/i.test(baseSource)) {
-        // Body-only source: wrap in FUNCTION/ENDFUNCTION so the splicer has
-        // something to work with. Common shape from LLMs: just the body.
-        baseSource = `FUNCTION ${name}.\n${baseSource}\nENDFUNCTION.\n`;
-      }
-      try {
-        effectiveSource = spliceFmSignature(baseSource, name, parameters);
-      } catch {
-        // No FUNCTION token in the supplied source — fall back to user's source.
-        effectiveSource = baseSource;
-        fmParamMergeWarning =
-          'Could not splice structured parameters: source did not start with FUNCTION keyword. Used the supplied source verbatim.';
-      }
-    }
-    // Defense-in-depth: strip *" comment blocks even after splicing — the
-    // user's body may contain them (e.g. pasted from SAPGUI).
-    const stripped = stripFmParamCommentBlock(effectiveSource);
-    effectiveSource = stripped.source;
+  const parameters = args.parameters as FmParameter[] | undefined;
+  const needsCurrentFunctionSource = type === 'FUNC' && parameters !== undefined && !source.trim();
+  const prepareFunctionSource = (baseSource: string): string => {
+    if (parameters !== undefined) baseSource = spliceFmSignature(baseSource, name, parameters);
+    const stripped = stripFmParamCommentBlock(baseSource);
     if (stripped.wasStripped) {
       fmParamStripWarning =
         'Stripped *"…IMPORTING/EXPORTING…*" parameter comment blocks (SAP rejects them on PUT — pass `parameters` as a structured array instead).';
     }
+    return stripped.source;
+  };
+  if (type === 'FUNC' && !needsCurrentFunctionSource) {
+    // Only caller-supplied body text may be wrapped. A fetched source must contain the real FUNCTION envelope.
+    const bodyOnly = parameters !== undefined && !/^\s*FUNCTION\s+/i.test(source);
+    effectiveSource = prepareFunctionSource(bodyOnly ? `FUNCTION ${name}.\n${source}\nENDFUNCTION.\n` : source);
+  }
+  if (!needsCurrentFunctionSource && !effectiveSource.trim()) {
+    return errorResult(`"source" is required for action="update" on ${type} ${name}; no write was made.`);
   }
 
   // Pre-write lint validation (uses sanitized source for FUNC)
@@ -230,7 +158,23 @@ export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResul
   if (lintWarnings.blocked) return lintWarnings.result!;
 
   // Pre-write server-side syntax check (opt-in; never blocks — warnings only).
-  const checkNotes = await runPreWriteSyntaxCheck(client, type, effectiveSource, objectUrl, config, checkOverride);
+  let checkNotes = '';
+  const checkSource = async (candidate: string, http = client.http): Promise<string> => {
+    checkNotes = await runPreWriteSyntaxCheck(
+      { http, safety: client.safety },
+      type,
+      candidate,
+      objectUrl,
+      config,
+      checkOverride,
+    );
+    return candidate;
+  };
+  // A signature-only FUNC edit derives its replacement from fresh bytes under the lock.
+  // A failed read aborts; there is no empty-body fallback or unlocked source read.
+  const replacement = needsCurrentFunctionSource
+    ? (current: string, session: AdtHttpClient) => checkSource(prepareFunctionSource(current), session)
+    : await checkSource(effectiveSource);
 
   // If safeUpdateSource throws (lock conflict, network error, etc.), checkNotes
   // is intentionally discarded — pre-check warnings only matter when the write succeeded.
@@ -239,9 +183,10 @@ export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResul
     client.safety,
     objectUrl,
     srcUrl,
-    effectiveSource,
+    replacement,
     transport,
     getCachedFeatures()?.abapRelease,
+    args.expectedSourceHash as string | undefined,
   );
   invalidateWrittenObject(type, name);
   const msg = `Successfully updated ${type} ${name}.`;
@@ -252,7 +197,6 @@ export async function writeActionUpdate(ctx: SapWriteContext): Promise<ToolResul
     checkNotes,
     cdsUpdateHint,
     fmParamStripWarning,
-    fmParamMergeWarning,
   );
   return warnings ? textResult(`${msg}\n\n${warnings}`) : textResult(msg);
 }
@@ -318,25 +262,50 @@ export async function writeActionDelete(ctx: SapWriteContext): Promise<ToolResul
   return textResult(`Deleted ${type} ${name}.`);
 }
 
-/** Write a global class's text symbols via the ADT textelements service. type=CLAS only. The body is
- *  the properties-style pool (`@MaxLength:NN` per symbol, then `NNN=text`). Immediately active — no
- *  SAPActivate. The client method locks the textelements object, PUTs, and unlocks; the package gate
- *  here checks the class's real package (ctx.objectUrl is the /oo/classes/{n} URL). Not an
- *  ABAP-source write → no lint. (Selection texts are a program selection-screen concept — a class has
- *  none — so only text symbols are supported here.) */
+/** Write one subobject of an object's textpool via the ADT textelements service (CLAS, PROG, FUGR).
+ *  `textPart` selects it: symbols (`@MaxLength:NN` then `NNN=text`), selections (a report's
+ *  selection texts, `P_PARAM=Label` per line), headings (`listHeader=`, `columnHeader_N=`).
+ *  ARC-1 supports only symbols for classes. Immediately active, no SAPActivate.
+ *  The client method locks the textelements object, PUTs, and unlocks; the package gate here checks
+ *  the owning object's real package (ctx.objectUrl). Not an ABAP-source write → no lint. */
 export async function writeActionEditTextSymbols(ctx: SapWriteContext): Promise<ToolResult> {
-  const { client, type, name, source, hasSource, transport, enforcePackageForExistingObject, invalidateWrittenObject } =
-    ctx;
-  if (type !== 'CLAS') {
-    return errorResult('action edit_text_symbols requires type=CLAS (global class text symbols).');
-  }
-  if (!hasSource) {
+  const {
+    args,
+    client,
+    type,
+    name,
+    source,
+    hasSource,
+    transport,
+    enforcePackageForExistingObject,
+    invalidateWrittenObject,
+  } = ctx;
+  if (!isTextElementObjectType(type)) {
     return errorResult(
-      'source is required for edit_text_symbols — the text-symbol body, e.g. "@MaxLength:20\\n001=Label\\n" (one @MaxLength per symbol, blank-line separated).',
+      `action edit_text_symbols requires type=${TEXT_ELEMENT_OBJECT_TYPES.join('/')} — got "${type}".`,
     );
   }
+  const requestedPart = (args.textPart as string | undefined) ?? 'symbols';
+  if (!TEXT_ELEMENT_PARTS.includes(requestedPart as TextElementPart)) {
+    return errorResult(`Invalid textPart "${requestedPart}" — valid values: ${TEXT_ELEMENT_PARTS.join(', ')}.`);
+  }
+  const part = requestedPart as TextElementPart;
+  if (type === 'CLAS' && part !== 'symbols') {
+    return errorResult(`Only symbols can be written for CLAS; ${part} is read-only in ARC-1.`);
+  }
+  if (!hasSource) {
+    return errorResult(`source is required for edit_text_symbols — the ${part} body, e.g. ${TEXT_PART_EXAMPLE[part]}.`);
+  }
   await enforcePackageForExistingObject();
-  await client.writeClassTextSymbols(name, source, transport);
+  await client.writeTextElementPart(type, name, part, source, transport);
   invalidateWrittenObject();
-  return textResult(`Updated text symbols for class ${name}.`);
+  return textResult(`Updated ${part} of ${type} ${name}.`);
 }
+
+/** One-line body example per subobject, used in the missing-source error so the caller can retry
+ *  without opening the docs. */
+const TEXT_PART_EXAMPLE: Record<TextElementPart, string> = {
+  symbols: '"@MaxLength:20\\n001=Label\\n" (one @MaxLength per symbol, blank-line separated)',
+  selections: '"P_LGNUM=Warehouse\\nP_WRKST=Work center" (one PARAMETER/SELECT-OPTION per line)',
+  headings: '"listHeader=My report\\ncolumnHeader_1=First column"',
+};

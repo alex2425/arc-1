@@ -14,8 +14,10 @@
  *    ABAP itself base64-encoded in `<enh:source>`.
  */
 
-import { AdtApiError } from './errors.js';
+import type { AdtClient } from './client.js';
+import { AdtApiError, AdtError } from './errors.js';
 import type { AdtHttpClient } from './http.js';
+import { checkOperation, OperationType } from './safety.js';
 import type {
   EnhancementImplementationInfo,
   EnhancementObjectRef,
@@ -24,20 +26,8 @@ import type {
   ObjectEnhancementImplementation,
   ObjectEnhancementsResult,
 } from './types.js';
-import { decodeXmlEntities, findDeepNodes, parseXml, toRecordArray } from './xml-parser.js';
-
-/**
- * Collections that serve enhancement IMPLEMENTATIONS, BAdI-specific representation first.
- * `accept` is the fallback used when ADT discovery is not loaded.
- */
-export const ENHO_COLLECTIONS: ReadonlyArray<{ collection: string; accept?: string }> = [
-  { collection: '/sap/bc/adt/enhancements/enhoxhb', accept: 'application/vnd.sap.adt.enh.enhoxhb.v4+xml' },
-  // Hook implementations get their own collection from 7.58 on. No hard-coded accept: the systems
-  // that have it also advertise its media type, and we have not seen that type on the wire.
-  // Recorded discovery: S/4HANA 2023 + ABAP Platform 2025 list it, both 7.50 systems do not.
-  { collection: '/sap/bc/adt/enhancements/enhoxhh' },
-  { collection: '/sap/bc/adt/enhancements/enhoxh', accept: 'application/vnd.sap.adt.enh.enho.v1+xml' },
-];
+import { decodeXmlEntities } from './xml-entities.js';
+import { findDeepNodes, getNestedArray, parseXml, toRecordArray } from './xml-parser.js';
 
 /** Workbench-wrapper object type for enhancement implementations (`/vit/wb/object_type/…`). */
 const ENHO_WORKBENCH_TYPE = 'enhoxh';
@@ -188,8 +178,8 @@ export function parseEnhancementImplementation(xml: string): EnhancementImplemen
         implementingClass: String(implementingClass['@_name'] ?? ''),
         badiDefinition: String(badiDefinition['@_name'] ?? ''),
         enhancementSpot: String(enhancementSpot['@_name'] ?? ''),
-        active: String(node['@_active'] ?? '') === 'true',
-        default: String(node['@_default'] ?? '') === 'true',
+        active: String(node['@_active'] ?? node['@_isActive'] ?? '') === 'true',
+        default: String(node['@_default'] ?? node['@_isDefault'] ?? '') === 'true',
       };
     }),
   };
@@ -605,29 +595,151 @@ export async function resolveAnchorFeedTargets(
  * last resort. Kept here rather than in the client facade so the whole release-quirk story for
  * enhancements lives in one file.
  */
-export async function readEnhancementImplementation(
-  http: AdtHttpClient,
-  name: string,
-): Promise<EnhancementImplementationInfo> {
-  try {
-    const { body, uri } = await fetchEnhancementObject(http, name, ENHO_COLLECTIONS);
-    return { ...parseEnhancementImplementation(body), uri };
-  } catch (err) {
-    // NW 7.50 dumps on the object representation (ADT could not edit enhancements before 7.53).
-    // The workbench wrapper still answers, so a 500 downgrades to reduced metadata instead of no
-    // answer at all. Any other failure — auth, network — stays a failure.
-    if (!(err instanceof AdtApiError) || err.statusCode !== 500) throw err;
-    try {
-      const { body, uri } = await fetchEnhancementMetadataViaWorkbench(http, name, ENHO_WORKBENCH_TYPE);
-      return { ...parseWorkbenchEnhancementMetadata(body), uri };
-    } catch {
-      // The wrapper is a consolation prize, not the request the caller made. If it fails too,
-      // report the original dump — a 404 on a URL nobody asked for would only mislead.
-      throw err;
-    }
+/**
+ * ADT route per ENHO subtype. `enhoxhh` is the HOOK representation: where a release serves it, its
+ * `hookImplementation` entries carry the `overwrite` flag per method — the only ADT source for
+ * "replaces the SAP implementation" versus "runs around it".
+ */
+const SUBTYPE_ROUTES = {
+  'ENHO/XHB': ['enhoxhb', 'application/vnd.sap.adt.enh.enhoxhb.v4+xml'],
+  'ENHO/XHH': ['enhoxhh', 'application/vnd.sap.adt.enh.enhoxhh.v3+xml'],
+  'ENHO/XH': ['enhoxh', 'application/vnd.sap.adt.enh.enho.v1+xml'],
+} as const;
+type EnhancementSubtype = keyof typeof SUBTYPE_ROUTES;
+
+/**
+ * Statuses that mean "wrong subtype or wrong representation" and may be re-routed. Reading the
+ * wrong collection is not always a clean 404: SAP also answers 400 with a transformation error and
+ * 500 when the representation handler is missing. Auth and network failures must never reroute.
+ */
+const REROUTE_STATUS = [400, 404, 406, 415, 500];
+
+const subtypePath = (subtype: EnhancementSubtype, name: string) =>
+  `/sap/bc/adt/enhancements/${SUBTYPE_ROUTES[subtype][0]}/${encodeURIComponent(name)}`;
+
+/**
+ * Parse an ENHO representation, whichever root its subtype serves.
+ *
+ * BAdI implementations arrive as `<enho:objectData>`. The hook representation uses an
+ * `<enh:enhancement>` root whose `contentSpecific > hookTechnology > hookImplementation` entries
+ * name the enhanced object, the hook location and the per-method `overwrite` flag.
+ */
+export function parseEnhancementMetadata(xml: string): EnhancementImplementationInfo {
+  const parsed = parseXml(xml);
+  if (parsed.objectData && typeof parsed.objectData === 'object') return parseEnhancementImplementation(xml);
+  const root = parsed.enhancement as Record<string, unknown> | undefined;
+  if (!root || typeof root !== 'object' || Array.isArray(root)) {
+    throw new AdtError('Invalid ENHO metadata: expected objectData or enhancement.');
   }
+  const pkg = (root.packageRef ?? {}) as Record<string, unknown>;
+  const common = (root.contentCommon ?? {}) as Record<string, unknown>;
+  const specific = (root.contentSpecific ?? {}) as Record<string, unknown>;
+  const hook = (specific.hookTechnology ?? {}) as Record<string, unknown>;
+  const enhanced = toEnhancementObjectRef(hook.enhancedObject);
+  return {
+    name: String(root['@_name'] ?? ''),
+    description: decodeXmlEntities(String(root['@_description'] ?? '')),
+    package: String(pkg['@_name'] ?? ''),
+    technology: String(common['@_toolType'] ?? ''),
+    switchSupported: String(common['@_switchSupported'] ?? '') === 'true',
+    badiImplementations: [],
+    ...(enhanced ? { enhancedObject: enhanced } : {}),
+    hookImplementations: getNestedArray(specific, 'hookTechnology', 'hookImplementation').map((item) => ({
+      id: String(item['@_id'] ?? ''),
+      spotName: String(item['@_spotname'] ?? ''),
+      programName: String(item['@_programname'] ?? ''),
+      method: String(item['@_method'] ?? ''),
+      overwrite: ['true', 'X'].includes(String(item['@_overwrite'] ?? '')),
+      fullName: String(item['@_full_name'] ?? ''),
+      description: decodeXmlEntities(String(item['@_full_description'] ?? '')),
+      uri: String(
+        getNestedArray({ item }, 'item', 'link').find((link) => link['@_rel'] === 'enclosure')?.['@_href'] ?? '',
+      ),
+    })),
+  };
 }
 
+/**
+ * Ask the object directory which subtype this enhancement actually is — more reliable than
+ * guessing, because SAP's error status does not identify the right collection.
+ */
+async function resolveEnhancementSubtype(
+  client: Pick<AdtClient, 'searchObject'>,
+  name: string,
+): Promise<EnhancementSubtype | undefined> {
+  const matches = await client.searchObject(name, 100, 'ENHO');
+  const subtypes = new Set(
+    matches
+      .filter(
+        (m) =>
+          m.objectName.toUpperCase() === name.toUpperCase() ||
+          // 7.50 decorates names with a display label; the relative object URI still identifies it.
+          (Object.hasOwn(SUBTYPE_ROUTES, m.objectType) &&
+            m.uri.toUpperCase() === subtypePath(m.objectType as EnhancementSubtype, name).toUpperCase()),
+      )
+      .map((m) => m.objectType),
+  );
+  const subtype = subtypes.size === 1 ? [...subtypes][0] : undefined;
+  return subtype && Object.hasOwn(SUBTYPE_ROUTES, subtype) ? (subtype as EnhancementSubtype) : undefined;
+}
+
+/**
+ * Read an enhancement implementation through the route its subtype actually serves.
+ *
+ * The BAdI route first (the common case); on a wrong-subtype answer the object directory is asked
+ * which subtype this is, because SAP's status does not identify the right collection. A search
+ * failure propagates deliberately — it tells the caller that read permission alone is not enough.
+ *
+ * ARC-1 adds one fallback on top: NW 7.50 answers 500 for EVERY representation (ADT had no
+ * enhancement editor before 7.53), and there the VIT workbench wrapper still returns reduced
+ * metadata, which beats no answer at all. The original error is preserved if that fails too.
+ */
+export async function readEnhancementImplementation(
+  client: Pick<AdtClient, 'http' | 'safety' | 'searchObject'>,
+  name: string,
+): Promise<EnhancementImplementationInfo> {
+  checkOperation(client.safety, OperationType.Read, 'GetEnhancementImplementation');
+  const attempted: string[] = [];
+  const read = async (subtype: EnhancementSubtype): Promise<EnhancementImplementationInfo> => {
+    const [collection, accept] = SUBTYPE_ROUTES[subtype];
+    attempted.push(collection);
+    // Construct only known endpoints. Repository/source links are data, never request URLs.
+    const path = subtypePath(subtype, name);
+    const result: EnhancementImplementationInfo = {
+      ...parseEnhancementMetadata((await client.http.get(path, { Accept: accept })).body),
+      uri: path,
+    };
+    if (subtype === 'ENHO/XHH')
+      result.source = (await client.http.get(`${path}/source/main`, { Accept: 'text/plain' })).body;
+    return result;
+  };
+
+  try {
+    try {
+      return await read('ENHO/XHB');
+    } catch (initial) {
+      // These statuses include SAP's wrong-subtype transformation errors. Do not reroute auth or network failures.
+      if (!(initial instanceof AdtApiError) || !REROUTE_STATUS.includes(initial.statusCode)) throw initial;
+      const subtype = await resolveEnhancementSubtype(client, name);
+      if (!subtype || subtype === 'ENHO/XHB') throw initial;
+      return await read(subtype);
+    }
+  } catch (error) {
+    // 7.50 dumps on the representation itself; the workbench wrapper answers with reduced metadata.
+    if (error instanceof AdtApiError && error.statusCode === 500) {
+      try {
+        const { body, uri } = await fetchEnhancementMetadataViaWorkbench(client.http, name, ENHO_WORKBENCH_TYPE);
+        return { ...parseWorkbenchEnhancementMetadata(body), uri };
+      } catch {
+        // The wrapper is a consolation prize, not the request the caller made — report the real error.
+      }
+    }
+    if (error instanceof AdtApiError && REROUTE_STATUS.includes(error.statusCode)) {
+      error.extraHint = `ENHO read attempted ${attempted.join(', ')}. If this enhancement cannot be exposed by ADT, inspect it in SAP GUI (SE80/SE19) or Eclipse's SAP GUI integration.`;
+    }
+    throw error;
+  }
+}
 /** Read an enhancement spot through the first collection that serves it. */
 export async function readEnhancementSpot(http: AdtHttpClient, name: string): Promise<EnhancementSpotInfo> {
   const { body, uri } = await fetchEnhancementObject(http, name, ENHS_COLLECTIONS);
