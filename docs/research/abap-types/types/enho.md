@@ -86,10 +86,14 @@ Qualification and limitations: [per-type research](../../2026-09-10-live-relatio
 
 Closes the "working class-enhancement metadata" gap above for one release:
 
-- Every representation dumps: `enhoxh/{name}` answers 500 for HOOK_IMPL and CLASENH alike, while
-  the same URL answers 406 for `text/plain` — the resource exists, the handler does not.
+- The editor's own tool types dump: `enhoxh/{name}` answers 500 for HOOK_IMPL and CLASENH alike,
+  while the same URL answers 406 for `text/plain` — the resource exists, the handler does not.
   ARC-1 then falls back to `/vit/wb/object_type/enhoxh/object_name/{NAME}`, which returns the
   common workbench envelope (package, author, master language, timestamps).
+  BADI_IMPL is NOT affected: `enhoxh/%2FATL%2FARCHIVE_WRITE_DELETE` returns the full
+  representation on the same system, parsed into `badiImplementations[]`. So the 500 is per tool
+  type, not per release — keep the fallback keyed on the status, and do not read an earlier
+  "every representation dumps" phrasing as a release-wide rule.
 - `enhoxhb` and `enhoxhh` are absent on 7.50; discovery lists only `enhoxh`/`enhsxs` (same on a
   second 7.50 system, ECC EhP8 SP31, per the recorded probe fixtures).
 - Hook coding is still reachable: it is served by the ENHANCED object, not by the ENHO resource,

@@ -690,9 +690,12 @@ async function resolveEnhancementSubtype(
  * which subtype this is, because SAP's status does not identify the right collection. A search
  * failure propagates deliberately — it tells the caller that read permission alone is not enough.
  *
- * ARC-1 adds one fallback on top: NW 7.50 answers 500 for EVERY representation (ADT had no
- * enhancement editor before 7.53), and there the VIT workbench wrapper still returns reduced
- * metadata, which beats no answer at all. The original error is preserved if that fails too.
+ * ARC-1 adds one fallback on top: NW 7.50 had no enhancement editor before 7.53, and its only
+ * collection answers 500 for the tool types that editor owned — HOOK_IMPL and CLASENH. BADI_IMPL
+ * is served normally there (live-verified), so the fallback is not a blanket release rule and
+ * must stay keyed on the status, never on the release. Where it does trigger, the VIT workbench
+ * wrapper still returns reduced metadata, which beats no answer at all. The original error is
+ * preserved if that fails too.
  */
 export async function readEnhancementImplementation(
   client: Pick<AdtClient, 'http' | 'safety' | 'searchObject'>,
