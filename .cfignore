@@ -4,20 +4,24 @@
 .codex-tmp/
 .git/
 
-# Source and tests — only dist/ is needed at runtime
-src/
-tests/
-docs/
-docs_page/
-scripts/
-skills/
-compare/
-artifacts/
-site/
-public/
-coverage/
-test-results/
-mta_archives/
+# Source and tests — only dist/ is needed at runtime.
+# Leading slash is REQUIRED: .cfignore follows .gitignore matching, so a bare
+# `public/` also excludes the compiled `dist/public/`, and the app then dies at
+# startup with ERR_MODULE_NOT_FOUND (dist/public/read-only-client.js is a value
+# import of the startup graph via server/safe-http-client.js).
+/src/
+/tests/
+/docs/
+/docs_page/
+/scripts/
+/skills/
+/compare/
+/artifacts/
+/site/
+/public/
+/coverage/
+/test-results/
+/mta_archives/
 *.mtaext*
 
 # Dev config
