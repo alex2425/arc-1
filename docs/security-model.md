@@ -104,6 +104,13 @@ Where: [`src/authz/policy.ts`](../src/authz/policy.ts) (`ACTION_POLICY`),
 Fails when: a new write path skips the package gate (see R4), or gates a user-supplied package
 instead of the resolved one, or package resolution fails *open*.
 
+For the scoped pinned multi-target path, require ADR-0010's additional conjunction before resolving
+PP: existing pinned route, global and destination write opt-ins, verified raw write scope, read
+access grant and exact write-target grant. Global and destination package/CTS rules are independent
+constraints, never replacement lists. Aggregate/Copilot and Basic routes cannot mutate. Carry an
+explicit enabled/disabled context into the ADT boundary; a missing context must not select legacy
+single-target writes. See [the implementation contract](plans/2026-10-22-multi-target-pinned-writes.md).
+
 ### I2 — Per-user isolation of anything cached or keyed
 Wherever SAP authorization differs per user, a cache or in-memory map must **either** key on a
 *verified, unique* user identity **or** still force a per-user SAP round-trip on every hit. Never
@@ -138,6 +145,15 @@ Where: [`src/server/logger.ts`](../src/server/logger.ts) (`redactSensitive`),
 [`src/server/audit.ts`](../src/server/audit.ts).
 Fails when: redaction lives in one sink but not others (R5), or is shallow and a secret is logged
 nested under a non-sensitive key.
+
+Source and business content in tool arguments (`source`, `content`, `oldContent`, `newContent`,
+`proposalUserContent`, `fixedValues`, `messages`, `shortTexts`, `parameters`, at any depth) is never
+written to a sink: the same central redactor replaces it with its length and a 12-hex SHA-256 prefix.
+The prefix correlates events; it is not secrecy for short or guessable values. Other free-text
+arguments (descriptions, labels, commit messages, SQL text and filters) are still logged truncated.
+Multi-target routes audit authenticated `403` refusals before dispatch as `mcp_route_denied`, without
+target, path or token. Admin-scope `403`s on the optional UI routes come from the MCP SDK middleware
+and are not audited.
 
 abapGit error diagnostics are inspected before extraction or truncation. Responses with credential
 terminology, sensitive URLs, ambiguous duplicate properties, unresolved encodings, or more than
@@ -199,15 +215,15 @@ with a least-privileged technical SAP identity and its own safety ceiling. This 
 mandatory: mixed mode is supported with explicit `SAP_PP_STRICT=false`, but one endpoint then has both
 per-user and shared SAP audit identities.
 
-> **ARC-1 never proxies the caller's token to a SAP API.** Principal propagation exchanges the user
-> JWT for a scoped, user-context credential — `OAuth2UserTokenExchange` / `OAuth2JWTBearer`
-> (RFC 8693) or a SAML bearer assertion, minted by the BTP Destination Service. One path looks like
-> an exception and is not: `SAP-Connectivity-Authentication: Bearer <userJwt>`
-> ([`multi-target-destination-runtime.ts`](../src/server/multi-target-destination-runtime.ts))
-> hands the user JWT to the **Cloud Connector**, which validates it and mints a short-lived X.509
-> user certificate for the on-premise call. The recipient is the connectivity proxy performing the
-> exchange, not a downstream business API — the SAP-prescribed CC principal-propagation flow. The
-> credential that actually reaches SAP is never the caller's MCP token.
+> **Principal propagation uses destination-specific credentials.** The configured flow can return
+> an exchanged user-context bearer token, a SAML assertion, or connectivity-proxy credentials that
+> lead to a short-lived X.509 user certificate for on-premise SAP. `OAuth2UserTokenExchange`,
+> `OAuth2JWTBearer` and `OAuth2TokenExchange` are distinct authentication types; do not describe
+> every exchange as RFC 8693. `SAP-Connectivity-Authentication: Bearer <userJwt>` in the
+> [multi-target runtime](../src/server/multi-target-destination-runtime.ts) is sent to the connectivity
+> intermediary for principal propagation, not used as the downstream SAP application's bearer token.
+> These flows preserve user context but do not establish registered agent identity or per-tool
+> narrowing of the downstream credential. See the [current architecture assessment](../docs_page/sap-api-policy-and-architecture.md).
 
 ---
 
@@ -250,6 +266,8 @@ Added by the 2026-06-09 deep review (Track A/B). All verified in code; R8 verifi
 | R19 | **Plugin raw writes (`ctx.http.post`/`put`/`delete`) bypass `SAP_ALLOWED_PACKAGES` for non-ADT paths (FEAT-61).** Behind the default-off `SAP_ALLOW_PLUGIN_RAW_WRITES` opt-in (+ `allowWrites` + `write` scope), a plugin may POST/PUT/DELETE to OData/ICF paths. These carry no ABAP package, so the package allowlist genuinely can't constrain them — gated instead by the opt-in + `allowWrites` + scope + `denyActions` + the service's SAP-side auth (+ CC resource allowlist on BTP). Writes to `/sap/bc/adt/…` object paths are **always refused** (normalization-proof), so I1's package gate is never skipped for ADT objects. | Low–Med (opt-in, non-ADT only) | any with plugins + opt-in | [`safe-http-client.ts`](../src/server/safe-http-client.ts) (`gateWrite`/`isAdtPath`) | by design / documented |
 | R20 | **Shared-platform redirect wildcards → OAuth auth-code interception between co-tenants.** Both callback allowlists trusted whole SAP platform domains (`https://*.hana.ondemand.com/**`, `https://*.applicationstudio.cloud.sap/**`). Any co-tenant app or BAS workspace on those domains was therefore a valid redirect target for the shared manual client id, and a previously issued signed state could still steer `/oauth/callback` at one. Narrowing only `xs-security.json` does not close it — XSUAA never sees the client's URI (the proxy sends ARC-1's own `/oauth/callback`), so the runtime list is the one that decides. | **High** (Crit if code is exchangeable) | XSUAA OAuth, shared manual client id | [`oauth-redirect-policy.ts`](../src/server/oauth-redirect-policy.ts), [`http.ts`](../src/server/http.ts), [`xs-security.json`](../xs-security.json), [`mta.yaml`](../mta.yaml) | ✅ [#678](https://github.com/arc-mcp/arc-1/pull/678) — fixed client hosts and native callbacks only; XSUAA restricted to deployment-owned routes; DCR stays exact-bound |
 | R22 | **XSUAA binding failure → unauthenticated `/mcp`.** With `SAP_XSUAA_AUTH=true`, an unreadable or missing `VCAP_SERVICES` XSUAA binding was only logged; the bare flag had already satisfied the HTTP-auth startup check, so without API keys/OIDC `/mcp` was mounted on the open no-auth route (startup log `auth: NONE (open)`). The safety ceiling still applied, but there was no authentication and no scopes. | **High** | XSUAA HTTP (BTP CF) | [`server.ts`](../src/server/server.ts), [`http.ts`](../src/server/http.ts), [`xsuaa-startup.test.ts`](../tests/unit/server/xsuaa-startup.test.ts) | ✅ [#916](https://github.com/arc-mcp/arc-1/pull/916) — startup refused whenever the binding cannot be loaded, also with API keys/OIDC or `ARC1_ALLOW_HTTP_NO_AUTH`; `startHttpServer` refuses XSUAA without credentials |
+| R24 | **Local SAML signing-key compromise.** The experimental issuer can assert any SAP user whose identity maps in its trusted SAML bearer provider. The signing key is effectively a root credential for that trust relationship, even though ARC-1's normal safety and scope gates still constrain calls through ARC-1. Store it in a private secret mount outside the repository, restrict file access to the ARC-1 process, and rotate by replacing the trusted certificate in SAML2 and the mounted key together. The configured NameID claim must be one end users cannot edit. Entra's `email` claim is unsuitable for this mapping; select a stable administrator-controlled claim. A verified email bit alone does not prove immutability. | **High** | opt-in local SAML issuer | [`saml-bearer.ts`](../src/adt/saml-bearer.ts), [`saml-bearer-client.ts`](../src/server/saml-bearer-client.ts), [guide](../docs_page/local-sso-experimental.md) | residual operator trust/secret risk; [ADR-0011](adr/0011-local-saml-bearer-issuer.md) |
+| R25 | **Recipient was not enforced by the tested SAP release.** A4H 7.58/001 accepted a valid signed SAML bearer assertion whose `SubjectConfirmationData/@Recipient` was an unrelated URL, although it rejected a wrong audience and untrusted certificate. Do not use Recipient as the isolation boundary between SAP targets. One signing key/certificate per SAP target and a SAML2 local provider name unique across systems trusting any ARC-1 certificate are required, including after system copies. | Medium | opt-in local SAML issuer | [guide](../docs_page/local-sso-experimental.md), [`saml-bearer.ts`](../src/adt/saml-bearer.ts) | accepted residual SAP validation behavior; SEC-23 tracks wider validation |
 
 ---
 
@@ -259,21 +277,104 @@ Added by the 2026-06-09 deep review (Track A/B). All verified in code; R8 verifi
 and already-created requests.** Single-target HTTP requests share a SAP transport, which is
 replaced for new requests once it is ten minutes old (monotonic elapsed time). Older requests
 keep their transport, including lock/save/unlock and late responses. Stdio's lifetime is unchanged.
-Per-user PP and multi-target transports remain request-local; both credential sanitizers discard
-injected transports. Factory tests cover these identity boundaries and rollover isolation.
+Per-user PP and multi-target transports never receive the shared transport; both credential
+sanitizers discard injected transports. Single-target PP through the Cloud Connector keeps a
+separate transport per exact `SAP-Connectivity-Authentication` JWT and route (OPS-06), capped at
+500 entries. New calls replace it at ten minutes or credential expiry, whichever comes first;
+reuse never extends that deadline. Each call invokes destination resolution, which can use the
+SAP SDK's per-user cache; this is not a fresh BTP authorization check. A changed
+credential or route gets a separate login (I2). Missing/opaque/expired credentials, the reserved
+proxy-token flow, OAuth2UserTokenExchange, SAMLAssertion and multi-target remain request-local.
+Factory and loopback-proxy tests cover isolation, expiry, failure and in-flight rollover.
 
 A replacement drops runtime cookies but reloads configured cookie credentials and retains the
 configured bearer provider. An unchanged SSO ticket or configured session cookie can authenticate
 without a new Basic password check. Existing requests may also outlive the transport-age limit.
 This is a reuse boundary, **not a ten-minute revocation guarantee**. SAP's idle timeout does not
 bound continuous use. Repeated fresh logons with stale configured credentials can also lock the
-technical account under SAP's policy; the concurrency limit is not a logon-rate limit.
+technical account under SAP's policy; the concurrency limit is not a logon-rate limit. For PP, a
+user locked or unmapped in SAP can keep an existing session for the rest of its transport age
+while presenting the same still-valid token; before this reuse, every call re-authenticated.
 
 **Status: partial mitigation; operator revocation procedure still required.** Follow the
 [rotation/revocation procedure](../docs_page/security-guide.md#shared-sap-login-lifetime-and-credential-rotation).
 The live cookie-precedence evidence on 758/816 does not establish the outcome of a real password
 change or user lock. Retiring transport objects prevents late responses from refilling the new
 jar; clearing an existing jar in place would not provide that isolation.
+
+### R23 — Scoped pinned multi-target mutation risks
+
+**High, mitigated by explicit gates; residual operational and authored-code risks accepted for this scope.**
+
+ADR-0010 introduced an explicit PP-only mutation surface under `SAP_ALLOW_WRITES`, destination
+opt-in, target-filtered XSUAA access and exact verified write grants. It supports CLAS/INTF main
+source writes and whole-owner activation, with independent package and canonical-request policy
+(its adapter is superseded below). Read-only defaults, aggregate/Copilot isolation, no shared-Basic writes and per-call drift checks
+remain structural. Source hashes, owning stateful locks, positive local/CTS evidence, bounded
+cleanup, no automatic mutation replay and positive activation-execution evidence protect the
+scoped lifecycle. [Qualification evidence](research/2026-10-22-multi-target-write-qualification.md)
+distinguishes live SAP checks from fault-injection tests and untested release shapes.
+
+ADR-0011 replaces ADR-0010's CLAS/INTF adapter: pinned writes use the single-target handlers for
+every listed `SAPWrite` action (not `edit_content`) and `SAPActivate activate`. Its controls:
+
+- **Admission:** an explicit `Tool.action` list (`src/server/multi-target-write-surface.ts`). Fields
+  outside the single-target schema and `preaudit=false` are refused (also in the `SAPActivate`
+  handler). `handleToolCall` repeats the HTTP gate's decision for every tool when `config.targetId`
+  is set.
+- **HTTP barrier:** a write-enabled pinned `AdtHttpClient` turns off transient retries for
+  POST/PUT/DELETE, resends a 403 only on SAP's CSRF challenge and refuses any `corrNr` not on both
+  transport lists.
+- **Lock:** `lockObject` refuses (and unlocks) when the lock's request is off either list.
+- **Activation scope:** `confirmPreaudit` refuses objects SAP adds that were not requested. The one
+  internal `preaudit=false` call activates exactly the text pool `edit_text_symbols` just saved.
+
+Given up versus ADR-0010: read-back, under-lock revalidation, recording preflight, task-to-parent
+resolution (a task must itself be listed), positive activation-execution evidence (an explicit
+"not executed" is reported as a warning) and a mandatory source hash.
+
+Evidence: per-family mock tests cover package resolution and request placement. Three live runs on
+758 found and confirmed fixes for four defects, and package refusals held with asymmetric lists.
+Not reproduced live: SAP adding objects to an activation.
+
+Residual limits: one process shares availability; route/client identity does not isolate the
+cross-client ABAP repository; package rules do not sandbox the eventual behavior of authored ABAP;
+ABAP Unit can execute authored code under the SAP user (deny `SAPDiagnose.unittest` when unintended);
+activation includes preexisting drafts for the complete owner; an interrupted create/save may leave
+partial state. CTS allowance matches every ID ARC-1 sends or SAP returns from a lock; a task is
+allowed only if listed itself. ARC-1 does not prove locality: a save with no request at all is decided
+by SAP, which refuses transportable objects without one (maintainer decision, ADR-0011).
+Audit delivery remains asynchronous. Removed IAM assignments may survive in old tokens/refresh
+sessions, so immediate disable uses server/destination policy and restart, and admitted calls may
+still complete. New backends require new public IDs and grants. Operators must assess these limits
+before enabling the feature; separate single-target applications remain the stronger availability
+and deployment-isolation option.
+
+### R24 — Client-IP allowlist rests on the platform header
+
+**Medium if the platform ever passes a client-supplied header through; observed replaced on one landscape.**
+
+`ARC1_ALLOWED_CLIENT_IPS` trusts `x-cf-true-client-ip` alone. SAP documents that BTP Cloud Foundry
+sets this header on requests through its public router, but not that it replaces a value the client
+sent. If it did not, any client could name an allowed address and pass the filter. Authentication,
+scopes and the safety ceiling would still apply, so the loss is the allowlist only.
+
+Known limits:
+
+- `VCAP_APPLICATION`, which HTTP startup requires for a configured list, does not prove that a
+  request passed the CF router. A caller on an internal `apps.internal` route or a C2C policy can
+  forge the header, so operators must restrict direct ingress separately.
+- A fronting proxy becomes the client.
+- `/health` stays reachable from anywhere.
+- IPv4 literals match only IPv4 rules; mapped IPv6 values can also match IPv6 rules.
+
+**Observed (2026-11):** on SAP BTP Cloud Foundry `us10-001` (AWS), a client-supplied
+`x-cf-true-client-ip` was always replaced with the connecting IPv4 address, in any casing, repeated,
+or combined with the real address, and a forged `X-Forwarded-For` changed nothing. Not covered:
+IPv6, other regions and infrastructures, custom domains. Because the behavior is undocumented,
+recheck it after platform changes. The full run is recorded in PR #1244. See
+[Client IP allowlist](../docs_page/security-guide.md#client-ip-allowlist-sap-btp-cloud-foundry-opt-in).
+
 
 ## 6. Per-PR security review checklist
 
@@ -333,7 +434,7 @@ if the change is *in* one of them.
   safety; shared holders carry no per-user data. [`src/adt/client.ts`](../src/adt/client.ts).
 - **CORS** — off by default; exact `Set.has` origin match with `credentials:true`; no wildcard.
 - **Per-user credential stripping** — `buildAdtConfig(...,{perUser:true})` strips
-  username/password/cookies; per-user cookie/CSRF jars are per-instance.
+  username/password/cookies; PP cookie/CSRF jars are isolated by the exact credential and route (R21).
 - **stdout discipline** — no `console.log` on the MCP path; all logging to stderr.
 
 ---

@@ -14,6 +14,61 @@ describe('Audit Events', () => {
       expect(sanitizeArgs(args)).toEqual({ type: 'FUNC', name: 'ZHELLO', includeSignature: true });
     });
 
+    it('audits long_text mode and counts without keys, prefixes, phrases or extra business data', () => {
+      const privateData = 'private-business-data-sentinel';
+      const args = {
+        action: 'long_text',
+        name: privateData,
+        phrase: privateData,
+        longText: { mode: 'search', namePrefix: privateData, keys: [{ name: privateData }], phrase: privateData },
+      };
+      const safe = sanitizeArgs(args);
+      expect(safe).toEqual({ action: 'long_text', longText: { mode: 'search', keyCount: 1 } });
+      const rawEvent: ToolCallStartEvent = {
+        timestamp: '',
+        level: 'info',
+        event: 'tool_call_start',
+        tool: 'SAPQuery',
+        args: safe,
+      };
+      const event = redactAuditEvent(rawEvent);
+      expect(event).toMatchObject({ args: safe });
+      expect(JSON.stringify(event)).not.toContain(privateData);
+      expect(JSON.stringify(redactAuditEvent({ ...rawEvent, args }))).not.toContain(privateData);
+    });
+
+    it('protects hyperfocused nested and malformed text parameters before validation', () => {
+      const privateData = 'private-text-argument-sentinel';
+      for (const args of [
+        {
+          action: 'query',
+          name: privateData,
+          params: { action: 'long_text', name: privateData, longText: { mode: 'discover', namePrefix: privateData } },
+        },
+        {
+          action: ['QUERY'],
+          name: privateData,
+          params: { action: ['LONG_TEXT'], longText: { mode: 'read', keys: [{ name: privateData }] } },
+        },
+        {
+          action: 'query',
+          name: privateData,
+          params: { action: ['long_text'], longText: { mode: 'read', keys: [{ name: privateData }] } },
+        },
+        {
+          action: 'read',
+          type: 'LONG_TEXT',
+          params: { longText: { mode: 'search', phrase: privateData, keys: [{ name: privateData }] } },
+        },
+        { type: 'LONG_TEXT', longText: privateData },
+        { action: 'long_text', name: privateData, longText: privateData },
+        { action: ['long_text'], name: privateData, longText: { mode: 'read', keys: [{ name: privateData }] } },
+        { type: 'LONG_TEXT', longText: { mode: privateData, keys: [{ name: privateData }] } },
+        { long_text: { mode: 'read', keys: [{ name: privateData }] } },
+      ])
+        expect(JSON.stringify(sanitizeArgs(args))).not.toContain(privateData);
+    });
+
     it('redacts sensitive keys', () => {
       const args = { password: 'secret', token: 'abc123', type: 'PROG' };
       const result = sanitizeArgs(args);
@@ -22,12 +77,15 @@ describe('Audit Events', () => {
       expect(result.type).toBe('PROG');
     });
 
-    it('truncates long string values', () => {
-      const longString = 'A'.repeat(600);
-      const args = { source: longString };
-      const result = sanitizeArgs(args);
-      expect(result.source).toContain('[truncated 600 chars]');
-      expect((result.source as string).length).toBeLessThan(300);
+    it('truncates long non-content string values', () => {
+      const result = sanitizeArgs({ description: 'A'.repeat(600) });
+      expect(result.description).toContain('[truncated 600 chars]');
+      expect((result.description as string).length).toBeLessThan(300);
+    });
+
+    it('replaces source values with a length and hash summary instead of truncating them', () => {
+      const result = sanitizeArgs({ source: 'A'.repeat(600) });
+      expect(result.source).toMatch(/^\[REDACTED content 600 chars sha256:[0-9a-f]{12}\]$/);
     });
 
     it('bounds adversarial escape normalization work before redaction', () => {

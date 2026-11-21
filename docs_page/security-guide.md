@@ -2,6 +2,8 @@
 
 A consolidated security reference for ARC-1 operators. This guide covers hardening, authentication, authorization, and incident response. It references detailed setup guides where appropriate rather than duplicating their content.
 
+Reviewing ARC-1 for your organization? Start with the **[Security Review](security.md)**.
+
 ---
 
 ## 1. Security Architecture Overview
@@ -52,7 +54,7 @@ When using an external identity provider (Entra ID, Okta, Keycloak, etc.), confi
 Verification checklist:
 
 - [ ] `SAP_OIDC_ISSUER` matches the `iss` claim in your tokens exactly (trailing slashes matter).
-- [ ] `SAP_OIDC_AUDIENCE` matches the `aud` claim in your tokens (decode a token at jwt.ms to verify).
+- [ ] `SAP_OIDC_AUDIENCE` matches the `aud` claim in your tokens (inspect locally; do not paste production bearer tokens into public token decoders).
 - [ ] The OIDC provider includes ARC-1 scopes (`read`, `write`, `data`, `sql`, `transports`, `git`, `admin`) in the `scope` or `scp` claim. Tokens without scope claims default to read-only access.
 - [ ] OIDC discovery at `{issuer}/.well-known/openid-configuration` and its advertised `jwks_uri` are reachable from ARC-1.
 - [ ] The issuer and JWKS TLS certificates are trusted by Node.js. `--insecure` affects SAP connections, not OIDC; add an internal CA with `NODE_EXTRA_CA_CERTS` when needed.
@@ -100,18 +102,22 @@ All safety flags are **positive opt-ins** (default: `false` / restrictive). Enab
 
 ### SAP API Policy and data-access gates
 
-SAP's API Policy restricts large-scale extraction and ungoverned autonomous AI call patterns, which is part of why these two capabilities are gated. See **[SAP API Policy & Architecture Alignment](sap-api-policy-and-architecture.md)** for the clause-by-clause treatment and ARC-1's position; validate your productive setup against SAP documentation, your SAP agreement, and internal governance.
+SAP's API Policy FAQ Q33 places business-data reads and backend SQL outside ADT's intended
+development-tooling scope. The API Policy also conditions agent-driven API sequences and large-scale
+extraction on documented, endorsed pathways. **[SAP API Policy & Architecture Alignment](sap-api-policy-and-architecture.md)**
+explains the recommended custom-MCP architecture and the remaining ADT-channel and control gaps.
 
 Two ARC-1 capabilities can expose business data or execute ad-hoc SQL and require explicit env vars before they are reachable:
 
 | Capability | Env var | Default | Policy note |
 | ---------- | ------- | ------- | ----------- |
-| Named table content preview (`SAPRead(type=TABLE_CONTENTS)`) | `SAP_ALLOW_DATA_PREVIEW=true` | `false` (off) | Can expose application-table data; keep off unless the use case is approved. |
-| Freestyle ABAP SQL (`SAPQuery`) | `SAP_ALLOW_FREE_SQL=true` | `false` (off) | Executes ad-hoc ABAP SQL; keep off unless the use case is approved. |
+| Table previews, [saved SAPscript texts](tools.md#stored-sapscript-long-texts) and [SLG1 messages](tools.md#saved-application-logs-actionapplication_log) | `SAP_ALLOW_DATA_PREVIEW=true` | `false` (off) | Reads application data; authenticated callers also need `data` scope. |
+| Freestyle ABAP SQL (`SAPQuery(action=sql)`) | `SAP_ALLOW_FREE_SQL=true` | `false` (off) | Executes ad-hoc ABAP SQL; authenticated callers also need `sql` scope. |
 | Exact table/CDS blocklist (experimental) | `SAP_BLOCKED_DATA_SOURCES=USR02,PA0002` | empty (off) | Defense-in-depth denial with live CDS/replacement lineage; unresolved requests fail closed. Not an allowlist or SAP authorization replacement. |
 
-**Recommended security-focused profile.** Keep structured data access and remove caller-authored SQL,
-which is the largest parser and SQL-Console surface:
+**For data access whose specific use is documented or authorized by SAP:** this narrower technical
+profile removes caller-authored SQL, the largest parser and SQL-Console surface. It does not establish
+API-policy permission:
 
 ```bash
 SAP_ALLOW_DATA_PREVIEW=true
@@ -119,21 +125,24 @@ SAP_ALLOW_FREE_SQL=false
 SAP_BLOCKED_DATA_SOURCES=USR02,PA0002
 ```
 
-Blocklist + free SQL remains a supported *advanced* profile for installations that genuinely need
-`SAPQuery`; it is the less restrictive choice and subjects callers to the strict static-SQL subset.
+Blocklist + free SQL is a technically supported *advanced* profile, subject to the same SAP allowance;
+it is less restrictive and subjects callers to the strict static-SQL subset.
 Either way, apply **SAP Note 3772411** independently — this feature is default-off and remediates
 nothing, and `SAP_ALLOW_WRITES=false` does not neutralize a database-side mutation reached through a
 vulnerable SQL Console host expression.
 
-**Recommendation for productive systems:** keep both flags at their defaults unless there is an approved use case. ARC-1 still covers the core developer-tooling surface — read source/metadata, search, navigate, lint, write/activate ABAP objects, manage transports, drive Git workflows. Turning either flag on can be appropriate, but should be a deliberate operator decision against the current SAP API Policy, the customer's SAP agreement, SAP authorizations, and internal data-protection rules.
+**Recommendation, including dev/test:** keep both flags off unless the specific use has a documented
+allowance or SAP authorization under the applicable agreements. An internal approval or technical
+opt-in is insufficient. Conservative data gates reduce exposure; they do not establish permission
+for the remaining ADT development operations. Review those against FAQ Q33 as well.
 
 ### Recommended production defaults
 
 | Setting                            | Recommended | Rationale                                                                                      |
 |------------------------------------|-------------|------------------------------------------------------------------------------------------------|
 | `SAP_ALLOW_WRITES`                 | `false` unless writes are needed | Blocks every mutation — object writes, activation, transport writes, git writes. |
-| `SAP_ALLOW_FREE_SQL`               | `false` on sensitive systems | Blocks arbitrary SQL queries against the database via `SAPQuery`.                               |
-| `SAP_ALLOW_DATA_PREVIEW`           | `false` unless table preview is required | Blocks named table content preview.                                              |
+| `SAP_ALLOW_FREE_SQL`               | `false` on sensitive systems | Blocks `SAPQuery(action=sql)`. |
+| `SAP_ALLOW_DATA_PREVIEW`           | `false` unless application data is needed | Blocks table previews and `SAPQuery` actions `long_text` / `application_log`. |
 | `SAP_BLOCKED_DATA_SOURCES`         | Exact sensitive sources when data access is approved; keep data access disabled if the target lacks the required catalog metadata | Experimental, default-off emergency brake, slower by design (extra SAP metadata calls, no cache). Requires catalog access to `DD02L` and `DDLDEPENDENCY` under the caller identity; blocking either prevents table-lineage proof. Missing data-preview support returns `DATA_POLICY_UNAVAILABLE`. Fails closed on unsupported lineage but leaves every unlisted source eligible. Not an allowlist, not a DCL replacement, and not a remediation for SAP Note 3772411. |
 | `SAP_ALLOWED_PACKAGES`             | `$TMP` or `Z*,Y*,$TMP` | Restricts writes to custom-code packages. Prefix wildcards (`Z*`), exact matches, and DEVCLASS subtree rules (`ZFOO/**` — `ZFOO` plus every transitive sub-package) are all supported; subtree resolution is fail-closed on SAP errors. Reads are never package-gated. |
 | `SAP_ALLOW_TRANSPORT_WRITES`       | `false` unless CTS needed | Opt-in for transport mutations (`SAPTransport.create`/`release`/`delete`).                           |
@@ -199,7 +208,7 @@ When deploying ARC-1 behind a reverse proxy (nginx, HAProxy, Traefik, etc.) outs
 | **Proxy headers** | Forward `Host`, `X-Real-IP`, and `X-Forwarded-For` to ARC-1 for accurate logging. |
 | **Health check** | Expose `/health` without authentication for load balancer probes. |
 | **Timeouts** | Set proxy read/write timeouts to at least 120 seconds. Some ADT operations (activation, unit tests) can take 30-60 seconds. |
-| **Request size** | ARC-1 currently uses Express's **100 KiB JSON body limit**. A larger proxy limit does not raise it; oversized HTTP tool calls return 413 before dispatch. Use smaller source edits or local stdio for larger payloads. |
+| **Request size** | MCP JSON bodies default to **100 KiB**. Administrators can set `ARC1_MAX_HTTP_REQUEST_BYTES` up to 16 MiB; raising only the proxy limit has no effect. Oversized requests return 413. Compressed JSON/form bodies return 415; disable request compression in clients and gateways. Align proxy limits and timeouts, and review the [request admission and memory guidance](configuration-reference.md#http-request-bodies) before raising the limit. |
 
 Example nginx configuration is provided in the [API Key Setup](api-key-setup.md#behind-a-reverse-proxy-nginx) guide.
 
@@ -215,7 +224,7 @@ Scopes are assigned to BTP users via role templates and role collections in the 
 
 When `SAP_PP_ENABLED=true`, each MCP user's JWT identity flows through to SAP via BTP Destination Service. For on-premise systems this routes through Connectivity Service + Cloud Connector principal propagation; for BTP ABAP Environment it uses a cloud-to-cloud destination such as `OAuth2UserTokenExchange`. SAP sees the real user identity for authorization checks and audit logging. JWT PP failures always fail closed. Separate strict PP and API-key instances are recommended. With explicit `SAP_PP_STRICT=false`, one supported instance can accept both: JWT calls use PP and API-key calls use the shared technical SAP identity.
 
-Experimental multi-target v1 recommends strict Principal Propagation per destination. It also has a
+Experimental multi-target v1 enforces strict Principal Propagation for PP destinations. It also has a
 separate, default-off `BasicAuthentication` exception for mutation-free on-premise targets. That
 exception requires `ARC1_MULTI_TARGET_ALLOW_BASIC_AUTH=true`, an XSUAA-authenticated caller, one
 non-rolling CF process, a least-privileged technical SAP user, and a principal-type-None Cloud
@@ -225,12 +234,32 @@ used when per-user SAP authorization or horizontal scaling is required. See
 [ADR-0007](https://github.com/arc-mcp/arc-1/blob/main/docs/adr/0007-shared-basic-identity-for-read-only-multi-target.md)
 and [Multi-System Setup](multi-target-setup.md).
 
+For [scoped pinned PP writes](multi-target-writes.md), every call also requires the global write
+ceiling, destination opt-in and restrictions, verified raw write scope, read access grant and exact
+write-target grant. Aggregate and Basic connections stay mutation-free. `MCPTargetDeveloper`
+contains application-wide functional scopes: enable target-filtered mode before assigning it.
+Package restrictions do not constrain what authored ABAP does when activated or run by ABAP Unit;
+keep `SAPDiagnose.unittest` denied unless that execution is intended.
+
 ### Shared SAP login lifetime and credential rotation
 
 Single-target HTTP deployments reuse the shared identity's SAP login cookies and CSRF token
 across tool calls (#871). Each call still gets fresh object/package caches and its own scope
 restrictions. JWT principal-propagation clients and multi-target clients do not receive this
 shared transport.
+
+Single-target Cloud Connector principal propagation reuses each user's **own** login when
+`SAP-Connectivity-Authentication` carries a JWT with a known expiry. A different credential or
+route gets a separate login. Reuse ends at ten minutes or credential expiry, whichever comes first;
+the pool retains at most 500 entries. Other PP authentication modes and multi-target routes stay
+request-local. In stderr/file audit logs, successful `auth_pp_created` events report `transportReuse`
+as `pooled-new`, `pooled-reused`, or `request-local` without exposing credentials. This tracks the
+transport, not SAP logins: a reused transport can still need to log on again after SAP ends its session.
+
+This reduces repeated logins. SAP's unused-session limit is consistent with the symptoms in
+[#1085](https://github.com/arc-mcp/arc-1/issues/1085), but that deployment's cause still needs SAP-side
+confirmation. On a cold login, other calls wait for its first response. A session reset can interrupt
+another call's CSRF bootstrap; write contexts remain separate.
 
 **Transport renewal:** once a transport is ten minutes old, a new HTTP request gets a replacement.
 Requests already created retain the old one, so lock/save/unlock and late responses stay together.
@@ -256,7 +285,10 @@ the affected HTTP security sessions (SM05) and address outstanding SSO tickets u
 incident procedure. Restarting ARC-1 discards its in-memory cookies; it does not revoke tickets
 copied elsewhere. Replace configured cookie files/strings too if using the development SSO bridge.
 ARC-1's existing 401 recovery is not a revocation mechanism and does not guarantee automatic
-recovery of a write.
+recovery of a write. For principal propagation, lock the user in SAP and terminate their HTTP
+security sessions (SM05). Unmapping alone may leave an issued SSO ticket usable; ending sessions
+alone lets a still-authorized user log on again.
+Revoke BTP access too; already-issued tokens and admitted calls may remain valid.
 
 SAP recommends `login/create_sso2_ticket=3` to issue assertion tickets without logon tickets, but
 legacy SSO consumers may require `2`. Have the SAP owner assess that landscape-wide setting
@@ -318,12 +350,13 @@ tool call. See [setup](btp-cloud-foundry-deployment.md#optional-btp-audit-log-si
 
 | Event | Description |
 |-------|-------------|
-| `tool_call_start` | Tool name and centrally redacted arguments. |
+| `tool_call_start` | Tool name and centrally redacted arguments. Source and content arguments (`source`, `content`, `oldContent`, `newContent`, `proposalUserContent`, `fixedValues`, `messages`, `shortTexts`, `parameters`, at any depth incl. `batch_create` objects) are replaced by `[REDACTED content <n> chars sha256:<12 hex>]` for correlation, never logged. SQL text and filters are still logged, truncated. |
 | `tool_call_end` | Tool, duration, success/error status, error class, and result size/preview after central redaction. |
 | `http_request` | SAP HTTP method, ADT path, status, and duration. Optional debug bodies/headers are centrally redacted; authentication response bodies are never logged. |
 | `data_response_limited` | A successful or retry response crossed the configured data-preview byte ceiling. Includes tool, limit/observed bytes, endpoint family, queue wait, request ID, and selected target/identity when applicable; never SQL or response bodies. |
 | `http_csrf_fetch` | Debug-level CSRF probe response: method, endpoint, HTTP status, duration, session mode and context-cookie presence. `success` means this response supplied a usable token; a failed probe may recover through a fallback. Presence includes reset markers; it does not establish a valid context. No token/cookie values or bodies. |
 | `auth_scope_denied` | Tool, required scope, and caller's available scopes when authorization rejects a call. |
+| `mcp_route_denied` | A multi-target MCP route refused an authenticated caller with `403` before tool dispatch: `route` (`pinned-mcp`/`aggregate-mcp`), `reason` (`missing_scope` or `user_token_required`), user/client ID when known and request ID. Never the target, path, token or body. |
 | `auth_pp_created` | Success or failure while creating a per-user Principal Propagation ADT client. |
 | `auth_shared_created` | Successful shared technical-user authentication after the Basic canary. Includes tool and `identity: "shared"`. |
 | `target_resolution_failed` | Multi-target ID/registry resolution failed. Includes tool and safe `errorCode`. |
@@ -338,11 +371,13 @@ tool call. See [setup](btp-cloud-foundry-deployment.md#optional-btp-audit-log-si
 | `safety_blocked` | Safety ceiling blocked an operation; includes the operation and safe reason. |
 | `server_start` | Server version, transport, write ceiling, configured target URL indicator, and process ID where available. |
 | `activation_preaudit_completed` | Two-phase SAP activation preaudit result, reference count, and phase durations. |
-| `oauth_client_registered` | XSUAA only: a new DCR `client_id` was minted (`/register`). Includes id length and redirect-URI count. |
+| `oauth_client_registered` | XSUAA only: a new DCR `client_id` was minted (`/register`). Includes id length, redirect-URI count and parsed redirect hosts. |
+| `oauth_client_registration_rejected` | XSUAA only: DCR registration was refused. Includes client name, parsed callback host when available, and a reason; no submitted path, query or credentials. |
 | `oauth_client_lookup_failed` | XSUAA only: a `client_id` failed to resolve. `reason` ∈ {`unknown_prefix`, `malformed`, `bad_signature`, `invalid_payload`, `expired`}. Useful for spotting forgery / probing. |
 | `oauth_redirect_uri_registered` | XSUAA only: a redirect URI matched the manual-client policy at `/authorize` and was added to ARC-1's in-memory client metadata. The XSUAA service configuration is unchanged. |
 | `oauth_redirect_uri_rejected` | XSUAA only: an unapproved redirect URI was rejected at `/authorize`; useful for detecting interception attempts or bad client configuration. |
 | `cors_rejected` | A browser request was blocked because its `Origin` header is not in `ARC1_ALLOWED_ORIGINS`. Includes origin, method, path. Useful for spotting misconfigured browser clients or probing. |
+| `client_ip_rejected` | The [client IP allowlist](#client-ip-allowlist-sap-btp-cloud-foundry-opt-in) refused a request with `403`. Includes the `reason` ([meanings](#when-a-request-is-refused)), the address the platform reported (`clientIp`), method and path. Not sent to the BTP Audit Log, because callers without credentials can trigger it at will. |
 | `auth_rate_limited` | **Layer 1** rate-limit denial on OAuth or `/mcp` endpoint (per-IP). Includes endpoint, IP, `limitPerMinute`. See [Rate Limiting Guide](rate-limiting.md). |
 | `mcp_rate_limited` | **Layer 2** rate-limit denial on per-user MCP tool quota. Includes user, tool, `limitPerMinute`, `retryAfterMs`. The MCP client receives a tool error with `retryAfter` (not HTTP 429). |
 
@@ -351,6 +386,8 @@ Every entry has `timestamp`, `level`, and `event`. Events within one MCP tool ca
 calls also add `destination`, public `target`, and `identity` (`per-user` or `shared`). Destination
 credentials, bearer tokens, cookies, authorization headers, and other secret values are centrally
 redacted before any sink write.
+
+OAuth lifecycle events are available through stderr (subject to the log level) and the configured file sink. The BTP Audit Log sink currently does not forward these events.
 
 ### Retention
 
@@ -458,6 +495,100 @@ curl -sI -X OPTIONS \
   grep -i 'access-control'   # expect: empty
 ```
 
+### Client IP allowlist (SAP BTP Cloud Foundry, opt-in)
+
+`ARC1_ALLOWED_CLIENT_IPS` lets only the network addresses you list reach ARC-1 on SAP BTP Cloud
+Foundry. Every other caller gets `403` on every path except `/health`, before ARC-1 looks at any
+credentials. It is off by default.
+
+The allowlist is an extra layer, not a replacement for authentication. An allowed caller still has
+to sign in, and scopes and the safety ceiling still apply.
+
+- **Use it** for local clients (Claude Desktop, Claude Code, VS Code, Cursor, Eclipse) that reach
+  ARC-1 from an office network or VPN with known public addresses.
+- **Do not use it** for clients hosted by a vendor (Microsoft Copilot Studio, claude.ai connectors
+  and similar). They call from the vendor's cloud, so a list of your own addresses locks them out.
+- **Outside SAP BTP Cloud Foundry** (Docker, Kubernetes, a VM), ARC-1 refuses to start with a list,
+  because a client there could set the address itself. Filter at your reverse proxy or firewall.
+
+#### Turn it on
+
+1. Add your addresses to the properties of the `arc1-mcp-server` module in `mta-overrides.mtaext`:
+
+    ```yaml
+    ARC1_ALLOWED_CLIENT_IPS: "198.51.100.0/24,2001:db8:1234::/48"
+    ```
+
+2. Build and deploy the MTA with the extension, as for any other
+   [configuration change](btp-administration.md#change-and-restart-matrix).
+3. Send this request without credentials from an allowed network and from another one, for example
+   a phone hotspot:
+
+    ```bash
+    curl -s -o /dev/null -w '%{http_code}\n' -X POST https://<your-app-url>/mcp
+    # allowed network: 401 (passed the allowlist, now needs credentials)
+    # other network:   403
+    ```
+
+To turn the allowlist off, set the value to `""` and deploy again.
+
+#### Find the address to allow
+
+ARC-1 sees the public address your traffic leaves your network from, not the address of a laptop.
+Your network team knows it. If you cannot ask, let ARC-1 report it:
+
+1. Set the placeholder `ARC1_ALLOWED_CLIENT_IPS: "192.0.2.1"`, which matches no real client. Nobody
+   can reach ARC-1 while it is active.
+2. Send one request from the client's network.
+3. Read `clientIp` from the refusal in the log, then replace the placeholder with it:
+
+    ```bash
+    cf logs arc1-mcp-server --recent | grep client_ip_rejected
+    # ... [client_ip_rejected] {"reason":"not_allowed","clientIp":"203.0.113.9","method":"POST","path":"/mcp"}
+    ```
+
+#### When a request is refused
+
+The caller gets `403` with the body `{"error":"Forbidden"}`. The log gets one
+[`client_ip_rejected`](#what-gets-logged) event with a `reason`:
+
+| `reason` | Meaning | What to do |
+|---|---|---|
+| `not_allowed` | The address in `clientIp` is not in the list. | Add it if this caller should have access. |
+| `missing_header` | The request did not come through the platform's public router. | Expected for calls from other apps over an internal route. See [Limits](#limits-of-the-allowlist). |
+| `invalid_header` | The platform did not report exactly one address. | Not expected on SAP BTP Cloud Foundry. Check what sits between the client and ARC-1. |
+
+#### Rules for the list
+
+- Separate entries with commas. An entry is one IPv4 or IPv6 address, or a CIDR range such as
+  `198.51.100.0/24`.
+- List IPv4 and IPv6 separately: `0.0.0.0/0` covers no IPv6 address and `::/0` covers no IPv4
+  address. The exception: an IPv4 client that the platform reports in IPv6 notation
+  (`::ffff:10.1.2.3`) matches both kinds of entry.
+- A range covers its whole network: `10.0.0.5/8` means `10.0.0.0/8`.
+- A mistake stops the app from starting, and the message names the entry: a stray comma, a
+  hostname, a port or an impossible range.
+
+#### Limits of the allowlist
+
+- **`/health` stays open to everyone**, because Cloud Foundry's health check needs it. It returns
+  status and version, no SAP data.
+- **It protects the public route only.** A caller that reaches ARC-1 directly, through an internal
+  route (`apps.internal`) or a container-to-container network policy, can set the address itself.
+  Do not open ARC-1 that way to apps you do not trust.
+- **A proxy in front becomes the client.** Behind a corporate reverse proxy, SAP API Management or
+  an AppRouter (including the optional `arc1-ui-router` for `/ui`), ARC-1 sees the proxy's address,
+  not the user's. A proxy that runs on SAP BTP typically calls from an egress address that SAP lists
+  [per region](https://help.sap.com/docs/BTP/65de2977205c403bbc107264b8eccf4b/f344a57233d34199b2123b9620d0bb41.html),
+  not per app, so allowing it admits other apps in that region too. Check `clientIp` before you add
+  it.
+- **It relies on one platform header.** ARC-1 takes the address only from `x-cf-true-client-ip`,
+  which SAP BTP Cloud Foundry sets
+  ([SAP blog](https://community.sap.com/t5/technology-blog-posts-by-sap/ip-based-allow-listing-for-applications/ba-p/14140136)),
+  never from `X-Forwarded-For`, which any client can set. SAP does not document that the platform
+  overwrites a value the client sent. A live check on one landscape showed that it does
+  ([R24 in the security model](https://github.com/arc-mcp/arc-1/blob/main/docs/security-model.md#r24--client-ip-allowlist-rests-on-the-platform-header)).
+
 ### SAP Connection
 
 - Use HTTPS for the SAP connection (`SAP_URL=https://...`) whenever possible.
@@ -501,51 +632,112 @@ This is the most critical on-premise PP compromise scenario -- a compromised Clo
 
 ## 13. Dependency & Supply-Chain Security
 
-ARC-1 ships as an [npm package](https://www.npmjs.com/package/arc-1) and a [Docker image](https://github.com/arc-mcp/arc-1/pkgs/container/arc-1) consumed by enterprise customers running on regulated landscapes (banks, government, defense, pharma). Customers will run their own image scanners (Aqua, Prisma Cloud, Microsoft Defender) against the published image and reject vulnerable artifacts. ARC-1 layers its own supply-chain controls on top of GitHub-native primitives so issues are caught upstream of those scanners.
+What you can verify depends on what you deploy, so use the evidence for that artifact. A clean scan
+means the scanner found nothing it knows about at that time. It does not prove that no vulnerability
+or malicious package exists.
+
+### What each artifact comes with
+
+| Artifact | What you can check | What it does not cover |
+|---|---|---|
+| BTP build from source | Your commit and lockfiles, using the [commands below](#btp-builds-from-source) | The running app: Cloud Foundry installs the dependencies again during staging |
+| npm package | [npm provenance](https://docs.npmjs.com/generating-provenance-statements) and `arc-1-<version>-sbom.cdx.json` on the GitHub Release (best effort) | Your install: the package has no lockfile, so `npm install arc-1@<version>` can resolve other transitive versions than the SBOM lists |
+| Docker image | The image digest, which you can scan yourself | Signed provenance: BuildKit's attestation is unsigned and `gh attestation verify` finds nothing. There is no image SBOM |
+| Single-file executables | `SHA256SUMS.txt` on the GitHub Release | Publisher identity: the binaries are not code-signed, and there is no SBOM |
+| MCPB bundle | The release asset, smoke-tested at build | No signature or bundle SBOM. The build removes `better-sqlite3`, so the npm SBOM does not match it exactly |
+| Extensions | Your own code and dependencies | They run inside the ARC-1 process and are in no ARC-1 inventory. See [Extensions](extensions.md) |
+
+For a repeatable install, keep your own lockfile and use `npm ci`, or pin the Docker image by digest.
+
+### BTP builds from source
+
+`mta.yaml` runs `npm ci` and `npm run build`, but leaves `node_modules` out of the MTAR. The Node.js
+buildpack then installs the dependencies again during staging. So there are two stages to record:
+your build and the staging.
+
+Run these commands from a clean checkout of the commit you approved. They read the lockfiles and
+install nothing. `npm audit` sends package names and versions to your configured npm registry. It
+exits non-zero on a `high` or `critical` finding, and when the audit itself fails.
+
+```bash
+git status --short   # must print nothing
+git rev-parse HEAD
+npm sbom --package-lock-only --omit=dev --sbom-format=cyclonedx --sbom-type=application > arc-1.cdx.json
+npm audit --package-lock-only --audit-level=high
+
+# Only if you deploy the optional AppRouter, which has its own lockfile:
+npm sbom --package-lock-only --omit=dev --sbom-format=cyclonedx --sbom-type=application --prefix btp/approuter > approuter.cdx.json
+npm audit --package-lock-only --audit-level=high --prefix btp/approuter
+```
+
+Keep these with your build record:
+
+- The commit and any local patches
+- The SBOMs and audit results
+- Node, npm and MBT versions used for the build
+- The MTAR checksum (`sha256sum mta_archives/*.mtar`)
+- Stack, buildpack, Node and npm versions from the staging log
+
+Remove `--omit=dev` if you also want build tools in the SBOM. These commands describe the lockfiles,
+not the staged app: if you need the installed tree or OS packages, collect them with your platform
+tools. Do not put `cf env` output, service keys or other
+credentials in the record.
 
 ### What runs in CI
 
-| Control | Workflow | Severity gate |
+| Control | Where | What it does |
 |---|---|---|
-| Dependabot — root npm + BTP AppRouter npm + GitHub Actions + Docker | `.github/dependabot.yml` | weekly + same-day security advisories |
-| `npm audit` PR gates via `audit-ci` | `.github/workflows/test.yml` (root + `btp/approuter`) | fail on `high` / `critical`, subject to the expiring advisory exception below |
-| GitHub Dependency Review (PR diff) | `.github/workflows/dependency-review.yml` | fails on `high`; license allow/deny lists |
-| CodeQL SAST (JavaScript/TypeScript) | GitHub Default Setup | findings on Security tab; PR check fails on `High or higher` |
+| Dependabot — root npm + BTP AppRouter npm + GitHub Actions + Docker | `.github/dependabot.yml` | weekly version updates; security updates open separately when an advisory is published, with no guaranteed turnaround |
+| `npm audit` checks via `audit-ci` | `.github/workflows/test.yml` (root + `btp/approuter`) | fails the job on `high` / `critical` |
+| npm install hooks disabled | `.github/workflows/test.yml` + `release.yml` (`NPM_CONFIG_IGNORE_SCRIPTS`) | dependency lifecycle scripts never run in PR CI or on the publish runner; explicit build/test commands still do |
+| GitHub Dependency Review (PR diff) | `.github/workflows/dependency-review.yml` | `Dependency security` fails on newly introduced `high` / `critical` advisories in any dependency scope; `Dependency licenses` fails on denied licenses |
+| CodeQL SAST (JavaScript/TypeScript, Actions, Python) | GitHub Default Setup | findings on the Security tab and the PR |
 | Trivy container scan — dev push | `.github/workflows/docker.yml` | non-gating; SARIF uploaded to Security tab |
-| Trivy container scan — scheduled | `.github/workflows/security-scan.yml` | **gating amd64 + arm64 maintenance signal** on `HIGH` / `CRITICAL`; SARIF uploaded |
+| Trivy container scan — scheduled | `.github/workflows/security-scan.yml` | fails the scheduled run on `HIGH` / `CRITICAL` for amd64 + arm64; SARIF uploaded. It builds a fresh image, so it says nothing about an image you already deployed |
 | Trivy container scan — release | `.github/workflows/release.yml` | scan and SARIF upload are non-gating; neither can strand the Docker artifact |
-| Workflow-level `permissions: contents: read` | all workflows | minimum `GITHUB_TOKEN` scope |
-| Third-party action SHA pinning | `googleapis/release-please-action`, `docker/*`, `aquasecurity/trivy-action` | mitigates the `tj-actions/changed-files` 2024 supply-chain compromise class |
+| Explicit `GITHUB_TOKEN` permissions | all workflows, per workflow or per job | write scopes only where a job publishes or uploads |
+| Third-party action SHA pinning | `googleapis/release-please-action`, `docker/*`, `aquasecurity/trivy-action` | mitigates the `tj-actions/changed-files` 2025 supply-chain compromise class; most GitHub-owned actions stay on version tags |
 | npm provenance | `.github/workflows/release.yml` (`npm publish --provenance`) | every release tarball is Sigstore-attested |
 | npm production SBOM | `.github/workflows/release.yml` (`npm sbom --package-lock-only --omit=dev`) | best-effort, non-gating CycloneDX JSON release asset |
-| `SECURITY.md` policy | repo root | private vulnerability reporting + severity-tiered response SLAs |
+| `SECURITY.md` policy | repo root | private vulnerability reporting + best-effort response targets |
+
+!!! warning "These checks report problems. They do not block merges."
+
+    The `main` ruleset requires a pull request and blocks force pushes and branch deletion, but it
+    requires no status check or code-scanning result (checked 2026-11-01). A red check is visible
+    on the PR, and GitHub still allows the merge. Recheck with
+    `gh api repos/arc-mcp/arc-1/rules/branches/main`. See [SEC-20](roadmap.md#sec-20).
 
 Docker BuildKit does not automatically invalidate a cached `RUN apk upgrade` when Alpine's
 package repository changes. ARC-1 therefore names the final Dockerfile stage `runtime` and every
 CI image build uses `no-cache-filters: runtime` plus `pull: true`. The comparatively expensive
 native-module builder stage stays cached, while the runtime package upgrade is re-executed and can
-pick up newly published OS security fixes.
+pick up newly published OS security fixes. This does not repair an image you already deployed: move
+to the new digest.
 
-### Temporary node-forge audit exception
+### Dependency audit policy
+
+The lockfile now resolves `node-forge` to **1.4.3**, which includes the
+[upstream RSA verification and PEM Buffer fixes](https://github.com/digitalbazaar/forge/blob/v1.4.3/CHANGELOG.md).
+The temporary `GHSA-86w9-cpqp-85rv` risk exception has been removed from `audit-ci.json`.
+High/critical advisories, including a reintroduction of that advisory, and audit failures fail the CI job.
 
 `audit-ci.json` temporarily accepts only
-[`GHSA-86w9-cpqp-85rv`](https://github.com/advisories/GHSA-86w9-cpqp-85rv), the RSA
-signature-verification advisory affecting `node-forge` through 1.4.0 with no published patch as of
-7 October 2026. The exception expires automatically at **00:00 Europe/Berlin on 21 October 2026**.
-It lets unrelated dependency maintenance proceed; it does not fix the vulnerability or establish
-that ARC-1 cannot be affected. Remove the exception when the affected dependency paths are fixed,
-or reassess it before expiry in a separate reviewed change.
+[`GHSA-fc5q-39xc-vjpf`](https://github.com/advisories/GHSA-fc5q-39xc-vjpf), a ReDoS advisory that
+covers every `picomatch` release through 4.0.7 and has no patched version as of 17 November 2026.
+`picomatch` is reachable only through development tooling (`lint-staged`, `vitest`, `vite`); it is
+not in the production dependency graph or the published package, and its glob patterns come from
+this repository's own configuration. The exception expires automatically at **00:00 Europe/Berlin
+on 15 December 2026**; remove it as soon as a fixed release is available. Other advisories still fail.
 
 Run `npm run audit:ci` and `npm run audit:ci -- --directory btp/approuter` to reproduce the PR
-gates. Both retain the high/critical threshold, development dependencies, and the existing optional
-dependency omission. Other advisories, including future node-forge advisories, still fail. The
-accepted advisory remains visible in the output; after expiry it blocks again. Plain `npm audit`,
-Dependabot alerts and update PRs, GitHub Dependency Review, and container scans keep their existing
-behavior. The exception is specific to these two PR audit steps.
+checks. Both audit production and development dependencies with the existing optional dependency
+omission. The separate, version-specific BSD license selection in Dependency Review is not a
+vulnerability exception. Dependabot, GitHub Dependency Review, and container scans remain enabled.
 
 ### GitHub-native security features (verified enabled)
 
-These toggles live on the repo’s Settings → Code security page. REST-exposed scanning/update settings were rechecked **2026-10-04**; UI-only grouped-update and malware-alert settings below retain the **2026-05-08** observation and need an administrator to reconfirm.
+These toggles live on the repo’s Settings → Code security page. REST-exposed scanning/update settings were rechecked **2026-11-01**; UI-only grouped-update and malware-alert settings below retain the **2026-05-08** observation and need an administrator to reconfirm.
 
 | Feature | API verification | Status |
 |---|---|---|
@@ -568,10 +760,14 @@ User-account-level recommendation (cannot be enforced via repo settings): the pr
 ### Verifying the chain as an operator
 
 ```bash
-# 1. npm package — verify the published tarball was built from this repo
-npm install arc-1
-npm audit signatures arc-1
-# Expected: "audited <N> packages — verified <N> packages with Sigstore"
+# Run these in a new, empty directory, on a machine without SAP credentials.
+
+# 1. npm package — verify registry signatures and provenance of the installed tree.
+# --ignore-scripts skips the native better-sqlite3 build: this is for inspection, not for running.
+npm init -y
+npm install --ignore-scripts --save-exact arc-1@<version>
+npm audit signatures
+# Expected: every package has a verified registry signature; some also have verified attestations.
 
 # 2. npm package — download and inspect the production dependency SBOM
 VERSION=<version>
@@ -590,8 +786,9 @@ jq -e --arg version "$VERSION" '
 npm audit --audit-level=high
 # Nonzero exit means advisories at or above the threshold need review.
 
-# 4. Docker image — scan locally with the same scanner CI uses
-trivy image ghcr.io/arc-mcp/arc-1:<version> \
+# 4. Docker image — scan the digest you deploy with the same scanner CI uses
+trivy image ghcr.io/arc-mcp/arc-1@sha256:<digest> \
+  --platform linux/amd64 \
   --severity HIGH,CRITICAL \
   --exit-code 1
 # Nonzero exit means HIGH/CRITICAL findings need review.
@@ -600,12 +797,8 @@ trivy image ghcr.io/arc-mcp/arc-1:<version> \
 open https://github.com/arc-mcp/arc-1/security/advisories
 ```
 
-The release SBOM describes the production npm graph resolved from the root `package-lock.json`.
-It does not inventory Alpine packages in the Docker image, the assembled MCPB contents, or
-dynamically loaded extensions. Those artifacts need their own build-output SBOMs; do not use the
-npm SBOM as evidence for their full contents.
-
-SBOM publication is deliberately **non-gating**. A generation, validation, or GitHub upload error
+The release SBOM covers only the production npm graph from the root `package-lock.json`. Its
+publication is deliberately **non-gating**. A generation, validation, or GitHub upload error
 remains visible in the `publish-npm-sbom` job, but `continue-on-error: true` prevents it from failing
 or blocking the npm, Docker, MCPB, or MCP Registry release. Maintainers can regenerate and attach a
 missing asset later.
@@ -614,9 +807,7 @@ missing asset later.
 
 See [`SECURITY.md`](https://github.com/arc-mcp/arc-1/blob/main/SECURITY.md). Preferred channel is GitHub [Private Vulnerability Reporting](https://github.com/arc-mcp/arc-1/security/advisories/new); fallback is email. Do **not** open a public issue or post on the SAP Community before the maintainers acknowledge the report — that bypasses coordinated disclosure and can put deployed instances at risk.
 
-### Roadmap
+### Open items
 
-This section corresponds to roadmap entry **SEC-11 (Tier 1: Foundation)**. Future tiers extend the chain:
-
-- **Tier 2 (Attestation)** — the production npm CycloneDX release asset is complete. Image/MCPB SBOM coverage, Cosign keyless image signing, and OpenSSF Scorecard remain in [`docs/plans/2026-05-08-dependency-security-tier2-attestation.md`](https://github.com/arc-mcp/arc-1/blob/main/docs/plans/2026-05-08-dependency-security-tier2-attestation.md).
-- **Tier 3 (Active Defense)** — Socket.dev PR review, vulnerability triage runbook, formal non-adoption decisions for Renovate / Snyk / SLSA L3. Plan in [`docs/plans/2026-05-08-dependency-security-tier3-defense.md`](https://github.com/arc-mcp/arc-1/blob/main/docs/plans/2026-05-08-dependency-security-tier3-defense.md).
+Mandatory checks, Socket policy and SBOMs for other artifacts are parked on the roadmap as
+[SEC-20](roadmap.md#sec-20), [SEC-21](roadmap.md#sec-21) and [SEC-22](roadmap.md#sec-22).

@@ -1,7 +1,9 @@
 /** Real dispatcher round trips for surgical FORM/MODULE insertion (#776). */
-import { afterAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { fetchDiscoveryDocument } from '../../src/adt/discovery.js';
 import { handleToolCall } from '../../src/handlers/dispatch.js';
 import { DEFAULT_CONFIG } from '../../src/server/types.js';
+import { deleteProgramFixture } from '../helpers/program-cleanup.js';
 import { generateUniqueName } from './crud-harness.js';
 import { getTestClient } from './helpers.js';
 
@@ -13,9 +15,19 @@ describe('add_unit — live', () => {
     expect(result.isError, JSON.stringify(result)).toBeUndefined();
     return result;
   }
+  beforeAll(async () => {
+    client.http.setDiscoveryMap((await fetchDiscoveryDocument(client.http)).map);
+  });
+
   afterAll(async () => {
     for (const object of created.reverse()) {
-      await call('SAPWrite', { action: 'delete', ...object });
+      if (object.type === 'PROG') {
+        const result = await deleteProgramFixture(
+          (tool, args) => handleToolCall(client, DEFAULT_CONFIG, tool, args),
+          object.name,
+        );
+        expect(result.isError, JSON.stringify(result)).toBeUndefined();
+      } else await call('SAPWrite', { action: 'delete', ...object });
       const path = `/sap/bc/adt/programs/${object.type === 'PROG' ? 'programs' : 'includes'}/${object.name}/source/main`;
       await expect(client.http.get(path)).rejects.toMatchObject({ statusCode: 404 });
     }

@@ -8,7 +8,7 @@ import { unrestrictedSafetyConfig } from '../../../src/adt/safety.js';
 import { CachingLayer } from '../../../src/cache/caching-layer.js';
 import { MemoryCache } from '../../../src/cache/memory.js';
 import { DEFAULT_CONFIG } from '../../../src/server/types.js';
-import { mockResponse } from '../../helpers/mock-fetch.js';
+import { DISCOVERY_WITHOUT_SERVER_DRIVEN, isDiscoveryRequest, mockResponse } from '../../helpers/mock-fetch.js';
 import { AdtClient, createClient, mockFetch } from './setup-undici-mock.js';
 
 const { handleToolCall } = await import('../../../src/handlers/dispatch.js');
@@ -16,6 +16,7 @@ const { handleToolCall } = await import('../../../src/handlers/dispatch.js');
 const { buildBatchActivationStatuses, formatBatchActivationStatuses } = await import(
   '../../../src/handlers/activate.js'
 );
+const { activationDetailMatchesObject } = await import('../../../src/handlers/activation-results.js');
 const devtools = await import('../../../src/adt/devtools.js');
 const objects = ['ZFIRST', 'ZFIRST2'].map((name) => ({ type: 'INTF', name, url: `/sap/bc/adt/oo/interfaces/${name}` }));
 
@@ -44,6 +45,88 @@ describe('SAPActivate handler', () => {
         type: 'INCL',
         name: 'LZARC1TOP',
         group: 'ZARC1',
+      });
+      expect(result.isError).toBeUndefined();
+      const activationCall = mockFetch.mock.calls.find((call) => String(call[0]).includes('/activation?'));
+      expect(String(activationCall?.[1]?.body)).toContain('/sap/bc/adt/functions/groups/zarc1/includes/lzarc1top');
+    });
+
+    it('auto-resolves the function group when activating a structural INCL without group', async () => {
+      mockFetch.mockImplementation((url: string | URL) => {
+        const pathname = new URL(String(url)).pathname;
+        if (pathname === '/sap/bc/adt/repository/informationsystem/search') {
+          return Promise.resolve(
+            mockResponse(
+              200,
+              `<?xml version="1.0"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+                `<adtcore:objectReference adtcore:type="FUGR/I" adtcore:name="LZARC1TOP" adtcore:packageName="ZARC1" ` +
+                `adtcore:uri="/sap/bc/adt/functions/groups/zarc1/includes/lzarc1top"/></adtcore:objectReferences>`,
+              { 'x-csrf-token': 'mock-csrf-token' },
+            ),
+          );
+        }
+        return Promise.resolve(
+          mockResponse(200, "REPORT zhello.\nWRITE: / 'Hello'.", { 'x-csrf-token': 'mock-csrf-token' }),
+        );
+      });
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPActivate', {
+        type: 'INCL',
+        name: 'LZARC1TOP',
+      });
+      expect(result.isError).toBeUndefined();
+      const activationCall = mockFetch.mock.calls.find((call) => String(call[0]).includes('/activation?'));
+      expect(String(activationCall?.[1]?.body)).toContain('/sap/bc/adt/functions/groups/zarc1/includes/lzarc1top');
+    });
+
+    it('keeps ordinary standalone INCL activation free of owner searches', async () => {
+      mockFetch.mockImplementation((url: string | URL) => {
+        const pathname = new URL(String(url)).pathname;
+        if (pathname === '/sap/bc/adt/repository/informationsystem/search') {
+          return Promise.resolve(
+            mockResponse(
+              200,
+              '<?xml version="1.0"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core"/>',
+              { 'x-csrf-token': 'mock-csrf-token' },
+            ),
+          );
+        }
+        return Promise.resolve(
+          mockResponse(200, "REPORT zhello.\nWRITE: / 'Hello'.", { 'x-csrf-token': 'mock-csrf-token' }),
+        );
+      });
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPActivate', {
+        type: 'INCL',
+        name: 'ZSTANDALONE_INCL',
+      });
+      expect(result.isError).toBeUndefined();
+      const activationCall = mockFetch.mock.calls.find((call) => String(call[0]).includes('/activation?'));
+      expect(String(activationCall?.[1]?.body)).toContain('/sap/bc/adt/programs/includes/ZSTANDALONE_INCL');
+      expect(mockFetch.mock.calls.some(([url]) => String(url).includes('/informationsystem/search'))).toBe(false);
+    });
+
+    it('auto-resolves the function group for INCL entries in batch activation without group', async () => {
+      mockFetch.mockImplementation((url: string | URL) => {
+        const pathname = new URL(String(url)).pathname;
+        if (pathname === '/sap/bc/adt/repository/informationsystem/search') {
+          return Promise.resolve(
+            mockResponse(
+              200,
+              `<?xml version="1.0"?><adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">` +
+                `<adtcore:objectReference adtcore:type="FUGR/I" adtcore:name="LZARC1TOP" adtcore:packageName="ZARC1" ` +
+                `adtcore:uri="/sap/bc/adt/functions/groups/zarc1/includes/lzarc1top"/></adtcore:objectReferences>`,
+              { 'x-csrf-token': 'mock-csrf-token' },
+            ),
+          );
+        }
+        return Promise.resolve(
+          mockResponse(200, "REPORT zhello.\nWRITE: / 'Hello'.", { 'x-csrf-token': 'mock-csrf-token' }),
+        );
+      });
+
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPActivate', {
+        objects: [{ type: 'INCL', name: 'LZARC1TOP' }],
       });
       expect(result.isError).toBeUndefined();
       const activationCall = mockFetch.mock.calls.find((call) => String(call[0]).includes('/activation?'));
@@ -862,6 +945,11 @@ describe('SAPActivate handler', () => {
       (client.http as unknown as { hasDiscoveryData(): boolean }).hasDiscoveryData = () => true;
       (client.http as unknown as { discoveryAcceptFor(p: string): string | undefined }).discoveryAcceptFor = () =>
         undefined;
+      mockFetch.mockImplementation(async (url: unknown) =>
+        isDiscoveryRequest(url)
+          ? mockResponse(200, DISCOVERY_WITHOUT_SERVER_DRIVEN)
+          : mockResponse(200, '', { 'x-csrf-token': 'T' }),
+      );
       const result = await handleToolCall(client, DEFAULT_CONFIG, 'SAPActivate', {
         action: 'activate',
         type: 'DESD',
@@ -890,6 +978,11 @@ describe('SAPActivate handler', () => {
       (client.http as unknown as { hasDiscoveryData(): boolean }).hasDiscoveryData = () => true;
       (client.http as unknown as { discoveryAcceptFor(p: string): string | undefined }).discoveryAcceptFor = () =>
         undefined;
+      mockFetch.mockImplementation(async (url: unknown) =>
+        isDiscoveryRequest(url)
+          ? mockResponse(200, DISCOVERY_WITHOUT_SERVER_DRIVEN)
+          : mockResponse(200, '', { 'x-csrf-token': 'T' }),
+      );
       const result = await handleToolCall(client, DEFAULT_CONFIG, 'SAPActivate', {
         action: 'activate',
         objects: [{ type: 'DESD', name: 'ZARC1_SDO' }],
@@ -1065,4 +1158,11 @@ describe('post-activation source promotion', () => {
       expect(sourceGets('active')).toHaveLength(1);
     },
   );
+});
+
+it('matches encoded activation identities without matching another index or malformed URI', () => {
+  const object = '/sap/bc/adt/ddic/db/indexes/ztable~001';
+  expect(activationDetailMatchesObject('/sap/bc/adt/ddic/db/indexes/ZTABLE%7E001#start=1,1', object)).toBe(true);
+  expect(activationDetailMatchesObject('/sap/bc/adt/ddic/db/indexes/ztable%7e0010', object)).toBe(false);
+  expect(activationDetailMatchesObject('/sap/bc/adt/ddic/db/indexes/ztable%xx001', object)).toBe(false);
 });

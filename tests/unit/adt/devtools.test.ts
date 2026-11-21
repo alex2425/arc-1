@@ -174,6 +174,7 @@ describe('DevTools', () => {
         expect.stringContaining('checkObjectList'),
         'application/vnd.sap.adt.checkobjects+xml',
         expect.objectContaining({ Accept: 'application/vnd.sap.adt.checkmessages+xml' }),
+        undefined,
       );
     });
 
@@ -485,6 +486,7 @@ describe('DevTools', () => {
         expect.stringContaining('objectReference'),
         'application/*',
         expect.objectContaining({ Accept: 'application/xml' }),
+        expect.objectContaining({ fetchTimeoutMs: 300_000, retryTransientErrors: false }),
       );
     });
 
@@ -496,17 +498,7 @@ describe('DevTools', () => {
         expect.stringContaining('objectReference'),
         'application/*',
         expect.objectContaining({ Accept: 'application/xml' }),
-      );
-    });
-
-    it('defaults preauditRequested=true when preaudit option is omitted', async () => {
-      const http = mockHttp('<activation/>');
-      await activate(http, unrestrictedSafetyConfig(), '/sap/bc/adt/programs/programs/ZTEST');
-      expect(http.post).toHaveBeenCalledWith(
-        expect.stringContaining('preauditRequested=true'),
-        expect.any(String),
-        expect.any(String),
-        expect.any(Object),
+        expect.objectContaining({ fetchTimeoutMs: 300_000, retryTransientErrors: false }),
       );
     });
 
@@ -615,6 +607,7 @@ describe('DevTools', () => {
         expect.any(String),
         'application/*',
         expect.objectContaining({ Accept: 'application/xml' }),
+        expect.objectContaining({ fetchTimeoutMs: 300_000, retryTransientErrors: false }),
       );
     });
 
@@ -631,6 +624,7 @@ describe('DevTools', () => {
         expect.any(String),
         'application/*',
         expect.objectContaining({ Accept: 'application/xml' }),
+        expect.objectContaining({ fetchTimeoutMs: 300_000, retryTransientErrors: false }),
       );
     });
 
@@ -1580,6 +1574,29 @@ describe('DevTools', () => {
   // ─── getFixProposals / applyFixProposal ───────────────────────────
 
   describe('quickfix APIs', () => {
+    it('preserves whitespace in opaque state, affected source, and replacement deltas (#993)', async () => {
+      const http = mockHttpSequence(
+        `<qf:evaluationResults xmlns:qf="http://www.sap.com/adt/quickfixes" xmlns:adtcore="http://www.sap.com/adt/core"><evaluationResult>
+          <adtcore:objectReference adtcore:uri="/sap/bc/adt/quickfixes/1"/>
+          <affectedObjects><unit><content>\n  WRITE 'a &amp; b'.\n</content><adtcore:objectReference adtcore:uri="/source"/></unit></affectedObjects>
+          <userContent> state\n </userContent>
+        </evaluationResult></qf:evaluationResults>`,
+        `<qf:proposalResult xmlns:qf="http://www.sap.com/adt/quickfixes" xmlns:adtcore="http://www.sap.com/adt/core"><deltas>
+          <unit><content>\n    DATA lv TYPE i.\n  </content><adtcore:objectReference adtcore:uri="/source#start=8,13"/></unit>
+          <unit><content> </content><adtcore:objectReference adtcore:uri="/source#start=9,1;end=9,2"/></unit>
+        </deltas></qf:proposalResult>`,
+      );
+      const [proposal] = await getFixProposals(http, unrestrictedSafetyConfig(), '/source', 'source', 9, 1);
+      expect(proposal?.userContent).toBe(' state\n ');
+      expect(proposal?.affectedObjects?.[0]?.content).toBe("\n  WRITE 'a & b'.\n");
+      const deltas = await applyFixProposal(http, unrestrictedSafetyConfig(), proposal!, '/source', 'source', 9, 1);
+      expect(deltas[0]?.content).toBe('\n    DATA lv TYPE i.\n  ');
+      expect(deltas[1]?.content).toBe(' ');
+      expect((http.post as ReturnType<typeof vi.fn>).mock.calls[1]?.[1]).toContain(
+        '<userContent> state\n </userContent>',
+      );
+    });
+
     it('getFixProposals parses quickfix proposals', async () => {
       const xml = `<?xml version="1.0" encoding="utf-8"?>
 <qf:evaluationResults xmlns:qf="http://www.sap.com/adt/quickfixes" xmlns:adtcore="http://www.sap.com/adt/core">

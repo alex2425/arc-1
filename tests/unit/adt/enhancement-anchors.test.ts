@@ -6,7 +6,7 @@
 import { describe, expect, it, vi } from 'vitest';
 import {
   anchorFeedTargets,
-  enhancementIncludeName,
+  enhancementPartIncludeName,
   feedTargetFromSourceUri,
   parseEnhancementAnchors,
   parseEnhancementMethodExits,
@@ -296,14 +296,14 @@ describe('resolveAnchorFeedTargets', () => {
   });
 });
 
-describe('enhancementIncludeName', () => {
+describe('enhancementPartIncludeName', () => {
   it('pads the enhancement name to 30 characters, then E / EIMP', () => {
     // The 30-character padding is confirmed against REPOSRC, which lists exactly these names.
     // ADT's include reader answers 500 for the correct name AND for a mis-padded one, so the
     // status cannot be used to check the name — only REPOSRC can.
-    expect(enhancementIncludeName('ZENH_CLASS_DEMO')).toBe('ZENH_CLASS_DEMO===============E');
-    expect(enhancementIncludeName('ZENH_CLASS_DEMO', 1)).toBe('ZENH_CLASS_DEMO===============EIMP');
-    expect(enhancementIncludeName('zenh_class_demo')).toHaveLength(31);
+    expect(enhancementPartIncludeName('ZENH_CLASS_DEMO')).toBe('ZENH_CLASS_DEMO===============E');
+    expect(enhancementPartIncludeName('ZENH_CLASS_DEMO', 1)).toBe('ZENH_CLASS_DEMO===============EIMP');
+    expect(enhancementPartIncludeName('zenh_class_demo')).toHaveLength(31);
   });
 });
 

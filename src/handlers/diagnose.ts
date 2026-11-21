@@ -39,7 +39,6 @@ import {
   deleteTraceRequest,
   getAuthorizationTrace,
   getCdsCreateStatements,
-  getDump,
   getGatewayErrorDetail,
   getObjectState,
   getSqlTraceDirectory,
@@ -55,12 +54,17 @@ import {
   probeODataPerformance,
   setSqlTraceState,
 } from '../adt/diagnostics.js';
+import { getDumpWithFeedFallback } from '../adt/dump-feed-detail.js';
+import { dayLimitedDumpListNote, feedUpdatedAt } from '../adt/dump-list-window.js';
 import { AdtApiError, AdtNetworkError } from '../adt/errors.js';
+import { detectAbapRelease } from '../adt/features.js';
+import { type FeedFilter, readDumpFeedSchema } from '../adt/feed-schema.js';
 import { internalOperationDenial } from '../adt/internal-data-operations.js';
 import { isServerDrivenObjectType } from '../adt/server-driven.js';
 import type {
   DumpDetail,
   FixAffectedObject,
+  SystemType,
   TracedObjectType,
   TracedProcessType,
   TraceRequestCreateOptions,
@@ -68,7 +72,7 @@ import type {
 } from '../adt/types.js';
 import { getCurrentContext } from '../server/context.js';
 import { handleCiQuality } from './diagnose-ci.js';
-import { isBtpSystem } from './feature-cache.js';
+import { cacheFeatureEvidence, getCachedFeatures, isBtpSystem } from './feature-cache.js';
 import { classIncludeUrl, normalizeObjectType, objectUrlForType, sourceUrlForType } from './object-types.js';
 import { errorResult, type ToolResult, textResult, toolJson } from './shared.js';
 import { handleSyntaxCheck } from './syntax.js';
@@ -641,13 +645,20 @@ export async function handleSAPDiagnose(
   client: AdtClient,
   args: Record<string, unknown>,
   minimalErrors: boolean,
-  options: { deadline?: number; signal?: AbortSignal } = {},
+  options: {
+    deadline?: number;
+    signal?: AbortSignal;
+    configuredAbapRelease?: string;
+    configuredSystemType?: SystemType;
+  } = {},
 ): Promise<ToolResult> {
   const action = String(args.action ?? '');
   const name = String(args.name ?? '');
   const type = normalizeObjectType(String(args.type ?? ''));
 
   switch (action) {
+    case 'feed_schema':
+      return textResult(toolJson(await readDumpFeedSchema(client.http, client.safety)));
     case 'syntax':
       return handleSyntaxCheck(client, args);
     case 'unittest': {
@@ -851,7 +862,12 @@ export async function handleSAPDiagnose(
     }
     case 'unittest_ci':
     case 'atc_ci':
-      return handleCiQuality(client, args, (c, a, o) => handleSAPDiagnose(c, a, minimalErrors, o));
+      return handleCiQuality(
+        client,
+        args,
+        (c, a, o) => handleSAPDiagnose(c, a, minimalErrors, o),
+        options.configuredSystemType,
+      );
     case 'atc': {
       if (args.objects !== undefined) {
         const objects = (args.objects as { type: AtcBatchObject['type']; name: string }[]).map((object) => ({
@@ -866,6 +882,13 @@ export async function handleSAPDiagnose(
           ? errorResult(toolJson(result))
           : textResult(toolJson(result));
       }
+      // Without type+name the URL degrades to a bare collection path (e.g. /programs/programs/) that SAP
+      // only rejects AFTER a worklist and run were already created, leaving an orphan worklist.
+      if (!type || !name)
+        return errorResult(
+          '"type" and "name" are required for "atc" (e.g. type="CLAS", name="ZCL_FOO"), or pass "objects" for a batch. ' +
+            'For packages use action="atc", type="DEVC", name=<package>; BTP also supports action="atc_ci".',
+        );
       const objectUrl = objectUrlForType(type, name);
       const variant = args.variant as string | undefined;
       const result = await runAtcCheck(client.http, client.safety, objectUrl, variant, {
@@ -1022,7 +1045,7 @@ export async function handleSAPDiagnose(
     case 'dumps': {
       const id = args.id as string | undefined;
       if (id) {
-        const detail = await getDump(client.http, client.safety, id);
+        const detail = await getDumpWithFeedFallback(client.http, client.safety, id);
         const includeFullText = args.includeFullText === true || String(args.includeFullText ?? '') === 'true';
         const selectedSections = selectDumpSections(detail, args.sections);
 
@@ -1042,6 +1065,7 @@ export async function handleSAPDiagnose(
             title: chapter.title,
             line: chapter.line,
           })),
+          ...(detail.origin ? { origin: detail.origin, note: detail.note } : {}),
         };
         if (includeFullText) {
           payload.formattedText = detail.formattedText;
@@ -1053,8 +1077,26 @@ export async function handleSAPDiagnose(
       const maxResults = args.maxResults ? Number(args.maxResults) : undefined;
       const from = args.from as string | undefined;
       const to = args.to as string | undefined;
-      const dumps = await listDumps(client.http, client.safety, { user, maxResults, from, to });
-      return textResult(toolJson(dumps));
+      let feedClock: Date | undefined;
+      const dumps = await listDumps(client.http, client.safety, {
+        user,
+        maxResults,
+        from,
+        to,
+        filters: args.filters as FeedFilter[] | undefined,
+        onFirstPage: (body) => {
+          feedClock = feedUpdatedAt(body);
+        },
+      });
+      const result = textResult(toolJson(dumps));
+      // The list stays a plain array; the window note is a separate text block after it.
+      const abapRelease = await dumpListRelease(client, options.configuredAbapRelease, {
+        deadline: options.deadline,
+        signal: options.signal ?? getCurrentContext()?.signal,
+      });
+      const note = dayLimitedDumpListNote({ abapRelease, from, to, feedClock, empty: dumps.length === 0 });
+      if (note) result.content.push({ type: 'text', text: note });
+      return result;
     }
     case 'traces': {
       const id = args.id as string | undefined;
@@ -1225,13 +1267,32 @@ export async function handleSAPDiagnose(
   }
 }
 
+/**
+ * SAP_BASIS for the dump window note: the probed release, else SAP_ABAP_RELEASE, else one read as this
+ * caller. A startup probe under a restricted technical user can miss it; a read release is shared like
+ * other lazily learned facts, so later lists skip the read.
+ */
+async function dumpListRelease(
+  client: AdtClient,
+  configured: string | undefined,
+  request: { deadline?: number; signal?: AbortSignal },
+): Promise<string | undefined> {
+  const known = getCachedFeatures()?.abapRelease ?? configured;
+  if (known) return known;
+  const detected = await detectAbapRelease(client.http, request);
+  if (detected) cacheFeatureEvidence({ abapRelease: detected }, true);
+  return detected;
+}
+
 function selectDumpSections(detail: DumpDetail, requestedSections: unknown): Record<string, string> {
   const availableSections = detail.sections ?? {};
   const availableIds = Object.keys(availableSections);
   if (availableIds.length === 0) return {};
 
   const requestedIds = resolveRequestedDumpSectionIds(detail, requestedSections);
-  const selectedIds = requestedIds.length > 0 ? requestedIds : pickDefaultDumpSectionIds(detail);
+  // A feed summary is already the focused part of a dump, so it is returned whole by default.
+  const defaultIds = detail.origin === 'feed-summary' ? availableIds : pickDefaultDumpSectionIds(detail);
+  const selectedIds = requestedIds.length > 0 ? requestedIds : defaultIds;
   const finalIds = selectedIds.length > 0 ? selectedIds : availableIds.slice(0, 5);
 
   return Object.fromEntries(finalIds.map((id) => [id, availableSections[id] ?? '']));

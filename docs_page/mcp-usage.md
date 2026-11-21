@@ -10,7 +10,7 @@
 
 ### SQL Query Limitations (SAPQuery)
 
-SAPQuery uses the ADT freestyle endpoint (`/sap/bc/adt/datapreview/freestyle`) with **ABAP SQL syntax**, not standard SQL.
+The SQL action of SAPQuery uses the ADT freestyle endpoint (`/sap/bc/adt/datapreview/freestyle`) with **ABAP SQL syntax**, not standard SQL.
 ABAP SQL as a language supports JOINs and subqueries, but the freestyle endpoint parser can still reject valid-looking SQL on some backend versions.
 
 | Feature | Status | Syntax |
@@ -57,13 +57,17 @@ SELECT carrid, COUNT(*) as cnt FROM sflight GROUP BY carrid ORDER BY cnt DESC
 | KTD / SKTD | **Y** | Knowledge Transfer Documents; `KTD` is the friendly alias for canonical `SKTD` |
 | TABL (Table Definition) | **Y** | Table structure |
 | VIEW (DDIC View) | **Y** | Dictionary views |
-| TABLE_CONTENTS | **Y** | Legacy preview; filter and exact cap vary by backend. Prefer `TABLE_QUERY` for structured filtering |
+| TABLE_CONTENTS | **Y** | Legacy preview; ARC-1 caps returned rows. Prefer `TABLE_QUERY` for structured filtering |
 | DEVC (Package) | **Y** | Package contents |
 | SYSTEM | **Y** | ADT discovery collections and configured/token-derived user; not SID, release, or SAP identity proof |
 | COMPONENTS | **Y** | Installed software components |
 | MSAG | **Y** | Message class texts (canonical TADIR R3TR type; deprecated alias: `MESSAGES`) |
 | TEXT_ELEMENTS | **Y** | Program, class, or function-group text elements (`objectType`) |
-| VARIANTS | **Y** | Program variants |
+| VARIANTS | Limited | No tested release serves the resource; SAP_BASIS 750, 758 and 816 return an error |
+
+For saved SO10 and business-document SAPscript texts, use `SAPQuery(action="long_text")`.
+It requires `SAP_ALLOW_DATA_PREVIEW=true` and `data` scope. See the
+[long-text examples and limits](tools.md#stored-sapscript-long-texts).
 
 ---
 
@@ -81,6 +85,7 @@ flowchart TD
     RTYPE -->|Table data| TD{Need SQL?}
     TD -->|Simple| SR2[SAPRead type=TABLE_CONTENTS]
     TD -->|Complex| SQ[SAPQuery]
+    RTYPE -->|Saved SAPscript long text| SLT[SAPQuery action=long_text]
     RTYPE -->|Find objects| SS[SAPSearch]
     RTYPE -->|System info| SR3[SAPRead type=SYSTEM]
 
@@ -113,6 +118,7 @@ flowchart TD
 | Read message class | `SAPRead` | `type=MSAG, name=ZMSG` (deprecated alias: `type=MESSAGES`) |
 | Read table structure | `SAPRead` | `type=TABL, name=MARA` |
 | Read table data | `SAPRead` | `type=TABLE_QUERY, name=MARA, columns=["MATNR"], maxRows=10` |
+| Read/discover/search a saved SAPscript text | `SAPQuery` | `action=long_text, longText={mode, ...}` |
 | **Read user's draft** | `SAPRead` | `type=CLAS, name=ZCL_TEST, version=inactive` |
 | **Show developer's view** (draft if exists, else active) | `SAPRead` | `type=CLAS, name=ZCL_TEST, version=auto` |
 | **Bypass cache for one read** | `SAPRead` | `type=PROG, name=ZTEST, force_refresh=true` |
@@ -120,7 +126,7 @@ flowchart TD
 | System info | `SAPRead` | `type=SYSTEM` |
 | Installed components | `SAPRead` | `type=COMPONENTS` |
 
-**Cache & freshness:** SAPRead source results are normally cached and revalidated against SAP via `If-None-Match`. A response prefixed with `[cached:revalidated]` means SAP confirmed the cached body is still current; no prefix alone does not prove a fresh fetch. On instances without principal propagation, an activation can make its captured draft available for up to 120 seconds without a GET; use `force_refresh=true` to bypass this window. With `SAP_PP_ENABLED=true`, including mixed PP/API-key instances, activations invalidate instead; see [cache security](caching.md#security). When the active source has an unactivated draft (created by the same user in Eclipse/SE80), the response prepends a one-line note so you know to consider `version='inactive'` if the draft is what you want. See [Caching System](caching.md) for the full mechanics.
+**Cache & freshness:** SAPRead source results are normally cached and revalidated against SAP via `If-None-Match`. A response prefixed with `[cached:revalidated]` (SRVB JSON: a `"cached": "revalidated"` field) means SAP confirmed the cached body is still current; no prefix alone does not prove a fresh fetch. On instances without principal propagation, an activation can make its captured draft available for up to 120 seconds without a GET; use `force_refresh=true` to bypass this window. With `SAP_PP_ENABLED=true`, including mixed PP/API-key instances, activations invalidate instead; see [cache security](caching.md#security). When the active source has an unactivated draft (created by the same user in Eclipse/SE80), the response prepends a one-line note (SRVB JSON: a `warning` field) so you know to consider `version='inactive'` if the draft is what you want. See [Caching System](caching.md) for the full mechanics.
 
 ### Searching
 
@@ -147,6 +153,7 @@ flowchart TD
 | Simple query | `SAPQuery` | `sql="SELECT * FROM t000"` |
 | Filtered query | `SAPQuery` | `sql="SELECT * FROM sflight WHERE carrid = 'LH'"` |
 | Aggregation | `SAPQuery` | `sql="SELECT carrid, COUNT(*) as cnt FROM sflight GROUP BY carrid ORDER BY cnt DESCENDING"` |
+| Saved SAPscript text | `SAPQuery` | `action="long_text", longText={mode:"read", keys:[...]}`; [examples](tools.md#stored-sapscript-long-texts) |
 
 ---
 

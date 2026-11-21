@@ -675,20 +675,24 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
       }
     });
 
-    it('404 error includes SAPSearch hint', async () => {
-      mockFetch.mockReset();
-      // Make the mock reject with a 404 AdtApiError
-      mockFetch.mockRejectedValueOnce(
-        new AdtApiError('Not found', 404, '/sap/bc/adt/programs/programs/ZNONEXIST/source/main'),
-      );
-      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
-        type: 'PROG',
-        name: 'ZNONEXIST',
-      });
-      expect(result.isError).toBe(true);
-      expect(result.content[0]?.text).toContain('SAPSearch');
-      expect(result.content[0]?.text).toContain('ZNONEXIST');
-    });
+    it.each(['Not found', 'ZNONEXIST does not have any inactive version'])(
+      'program 404 retains the SAPSearch hint: %s',
+      async (message) => {
+        mockFetch.mockReset();
+        // Make the mock reject with a 404 AdtApiError
+        mockFetch.mockRejectedValueOnce(
+          new AdtApiError(message, 404, '/sap/bc/adt/programs/programs/ZNONEXIST/source/main', message),
+        );
+        const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPRead', {
+          type: 'PROG',
+          name: 'ZNONEXIST',
+        });
+        expect(result.isError).toBe(true);
+        expect(result.content[0]?.text).toContain('SAPSearch');
+        expect(result.content[0]?.text).toContain('ZNONEXIST');
+        expect(result.content[0]?.text).not.toContain('testclasses');
+      },
+    );
 
     it('401 error includes client hint', async () => {
       mockFetch.mockReset();
@@ -1126,7 +1130,7 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
     /** Create minimal BTP-detected features for testing */
     function setBtpMode(): void {
       setCachedFeatures({
-        ...features({ abapGit: false, gcts: false, amdp: false, ui5: false, ui5repo: false, flp: false }),
+        ...features({ abapGit: false, gcts: false, ui5: false, ui5repo: false, flp: false }),
         abapRelease: '758',
         systemType: 'btp',
       });
@@ -1277,6 +1281,19 @@ describe('tool dispatch & cross-cutting handler behavior', () => {
       });
       expect(result.isError).toBe(true);
       expect(result.content[0]?.text).toContain('Unknown action');
+    });
+
+    it('refuses SAP(read) TABLE_QUERY with a sqlFilter before any request is sent', async () => {
+      mockFetch.mockReset();
+      const result = await handleToolCall(createClient(), { ...DEFAULT_CONFIG, toolMode: 'hyperfocused' }, 'SAP', {
+        action: 'read',
+        type: 'TABLE_QUERY',
+        name: 'T000',
+        params: { sqlFilter: "MANDT = '000'", maxRows: 5 },
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0]?.text).toContain('TABLE_QUERY does not accept sqlFilter');
+      expect(mockFetch).not.toHaveBeenCalled();
     });
 
     it('routes SAP(search) with params', async () => {
@@ -1903,6 +1920,26 @@ ENDCLASS.`;
       const text = result.content[0]?.text ?? '';
       expect(text).toContain('Check SAP_CLIENT');
       expect(text).not.toContain('SAP cookies have expired');
+    });
+
+    it('explains SAML bearer mapping failures without suggesting shared credentials', async () => {
+      mockFetch.mockReset();
+      mockFetch.mockResolvedValue(mockResponse(401, 'Logon failed'));
+      const result = await handleToolCall(
+        createClient(),
+        { ...DEFAULT_CONFIG, ppEnabled: true, samlIdpKeyFile: '/tmp/idp.key' },
+        'SAPRead',
+        { type: 'PROG', name: 'ZTEST' },
+        undefined,
+        undefined,
+        undefined,
+        true,
+      );
+      expect(result.isError).toBe(true);
+      const text = result.content[0]?.text ?? '';
+      expect(text).toContain('unique SAP NameID mapping');
+      expect(text).not.toContain('Check SAP_CLIENT');
+      expect(text).not.toContain('SAP_PASSWORD');
     });
   });
 });

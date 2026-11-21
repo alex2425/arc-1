@@ -8,6 +8,7 @@ import { createClient, mockFetch } from './setup-undici-mock.js';
 const { handleToolCall } = await import('../../../src/handlers/dispatch.js');
 const { resetCachedFeatures } = await import('../../../src/handlers/feature-cache.js');
 const { SAPWriteSchema, SAPWriteSchemaBtp } = await import('../../../src/handlers/schemas.js');
+const { handleSAPWrite } = await import('../../../src/handlers/write.js');
 const transportModule = await import('../../../src/adt/transport.js');
 const writeHelpers = await import('../../../src/handlers/write-helpers.js');
 const config = { ...DEFAULT_CONFIG, lintBeforeWrite: false };
@@ -53,7 +54,6 @@ describe('batch preflight and persisted outcomes', () => {
   it.each([
     ['mixed-case name', { type: 'PROG', name: 'Zbad' }],
     ['function-group structural include', { type: 'INCL', name: 'LZGROUPTOP' }],
-    ['unsupported SDO', { type: 'UIAD', name: 'ZBAD' }],
     ['invalid AFF header', { type: 'PROG', name: 'ZBAD', description: 'x'.repeat(100) }],
     ['duplicate entry', program('ZFIRST')],
   ])('rejects a later %s before creating the first object', async (_label, invalid) => {
@@ -159,8 +159,15 @@ describe('batch preflight and persisted outcomes', () => {
     expect(creates()).toHaveLength(0);
   });
 
-  it('reports all predictable bad entries together', async () => {
-    const result = await run([program('ZFIRST'), { type: 'PROG', name: 'Zbad' }, { type: 'UIAD', name: 'ZUIAD' }]);
+  it('reports all preflight failures for callers that enter the handler directly', async () => {
+    const objects = [program('ZFIRST'), { type: 'PROG', name: 'Zbad' }, { type: 'UIAD', name: 'ZUIAD' }];
+    const result = await handleSAPWrite(
+      createClient(),
+      { action: 'batch_create', package: '$TMP', objects },
+      config,
+      undefined,
+      { isPerUserClient: false },
+    );
     expect(result.content[0].text).toContain('Zbad');
     expect(result.content[0].text).toContain('ZUIAD');
     expect(creates()).toHaveLength(0);
@@ -216,6 +223,37 @@ describe('batch preflight and persisted outcomes', () => {
     const result = await run([program('ZFIRST'), program('ZSECOND')], {}, undefined, { minimalErrors });
     expect(result.content[0].text).toContain('Invalid metadata shape');
     expect(creates()).toHaveLength(0);
+  });
+
+  // SAP truncates a longer MSAG name to 20 characters and creates an empty class under that name.
+  it.each(['create', 'batch_create'])(
+    '%s refuses an MSAG name over 20 characters before any SAP call',
+    async (action) => {
+      const msag = { type: 'MSAG', name: `Z${'M'.repeat(20)}` };
+      const result = await handleToolCall(createClient(), config, 'SAPWrite', {
+        action,
+        package: '$TMP',
+        ...(action === 'create' ? msag : { objects: [msag] }),
+      });
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain('MSAG names must be at most 20 characters. Nothing was created.');
+      expect(mockFetch).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each(['create', 'batch_create'])('%s still creates an MSAG with a 20-character name', async (action) => {
+    const msag = { type: 'MSAG', name: `Z${'M'.repeat(19)}` };
+    const result = await handleToolCall(createClient(), config, 'SAPWrite', {
+      action,
+      package: '$TMP',
+      ...(action === 'create' ? msag : { objects: [msag] }),
+    });
+    expect(result.isError).toBeFalsy();
+    expect(
+      mockFetch.mock.calls.some(
+        ([url, options]) => options?.method === 'POST' && new URL(String(url)).pathname === '/sap/bc/adt/messageclass',
+      ),
+    ).toBe(true);
   });
 
   it('rejects a later MSAG transport lookup failure before creating the first object', async () => {

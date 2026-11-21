@@ -45,17 +45,29 @@ describe('enhancement parsers', () => {
       expect(enho.badiImplementations[1]?.active).toBe(false);
     });
 
-    it('extracts the enhanced object and its main program from contentCommon usages', () => {
+    it('does not report the enhancement spot of a BAdI implementation as its enhanced object', () => {
       const xml = loadFixture('enhancement-implementation.xml');
       const enho = parseEnhancementImplementation(xml);
-      // The BAdI fixture points at its enhancement spot; a source plug-in points at the
+      // The BAdI fixture's usage is its enhancement spot; only a source plug-in names an
       // enhanced include, with mainObjectReference naming the main program.
+      expect(enho.enhancedObject).toBeUndefined();
+      expect(enho.mainObject).toBeUndefined();
+    });
+
+    it('extracts the enhanced include and its main program from a source plug-in usage', () => {
+      const xml =
+        '<enho:objectData xmlns:enho="http://www.sap.com/adt/enhancements/enho" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="ZENH_PLUGIN">' +
+        '<enho:contentCommon enho:toolType="HOOK_IMPL"><enho:usages><enho:referencedObject>' +
+        '<enho:objectReference adtcore:uri="/sap/bc/adt/programs/includes/rptmoz00" adtcore:type="PROG/I" adtcore:name="RPTMOZ00"/>' +
+        '<enho:mainObjectReference adtcore:uri="/sap/bc/adt/programs/programs/sapfp51t" adtcore:type="PROG/P" adtcore:name="SAPFP51T"/>' +
+        '</enho:referencedObject></enho:usages></enho:contentCommon></enho:objectData>';
+      const enho = parseEnhancementImplementation(xml);
       expect(enho.enhancedObject).toEqual({
-        name: 'BCF_REMOTE_TCD',
-        type: 'ENHS/XSB',
-        uri: '/sap/bc/adt/enhancements/enhsxsb/bcf_remote_tcd',
+        name: 'RPTMOZ00',
+        type: 'PROG/I',
+        uri: '/sap/bc/adt/programs/includes/rptmoz00',
       });
-      expect(enho.mainObject?.name).toBe('BCF_REMOTE_TCD');
+      expect(enho.mainObject?.name).toBe('SAPFP51T');
     });
 
     it('returns the raw XML when the payload is not an objectData envelope', () => {
@@ -136,7 +148,7 @@ describe('enhancement parsers', () => {
 
   describe('parseEnhancementSpot', () => {
     it('structures the BAdI definitions of a real spot payload', () => {
-      const spot = parseEnhancementSpot(loadFixture('enhancement-spot.xml'));
+      const spot = parseEnhancementSpot(loadFixture('enhancement-spot-enhsxs.xml'));
       expect(spot).toMatchObject({
         name: 'ZENH_SPOT_DEMO',
         package: 'ZENH_DEMO',

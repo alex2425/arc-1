@@ -1,6 +1,6 @@
 _schema-version: "3.1"
 ID: arc1-mcp
-version: 1.5.1 # x-release-please-version
+version: 1.10.1 # x-release-please-version
 description: ARC-1 — MCP Server for SAP ABAP Systems
 
 # ──────────────────────────────────────────────────────────────────────
@@ -217,6 +217,8 @@ modules:
       # Copilot Studio) don't need this. Comma-separated, exact match, no
       # wildcards.
       ARC1_ALLOWED_ORIGINS: ""
+      # Client IP allowlist — empty (default) is off. See security-guide.md.
+      ARC1_ALLOWED_CLIENT_IPS: ""
     provides:
       - name: arc1-mcp-api
         properties:
@@ -338,6 +340,12 @@ resources:
             description: "Full ARC-1 administrative access (admin implies all scopes)"
             role-template-references:
               - "$XSAPPNAME.MCPAdmin"
+          # Unassigned by default. IAM explicitly grants current AND future targets.
+          # Do not add this template to existing, potentially assigned collections.
+          - name: "ARC-1 All Targets (${space})"
+            description: "Read-only ARC-1 access to all current and future configured SAP targets"
+            role-template-references:
+              - "$XSAPPNAME.MCPAllTargetReadAccess"
     requires:
       - name: arc1-mcp-api
 

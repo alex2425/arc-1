@@ -12,7 +12,7 @@
 
 import { describe, expect, it, vi } from 'vitest';
 import { unrestrictedSafetyConfig } from '../../../src/adt/safety.js';
-import { isServerDrivenObjectType } from '../../../src/adt/server-driven.js';
+import { isServerDrivenObjectType, SDO_TYPES } from '../../../src/adt/server-driven.js';
 import { canonicalTablType, KNOWN_BASE_TYPES, normalizeObjectType } from '../../../src/handlers/object-types.js';
 import { getToolSchema } from '../../../src/handlers/schemas.js';
 import {
@@ -45,7 +45,7 @@ const { resetCachedFeatures } = await import('../../../src/handlers/feature-cach
 
 // allowWrites registers SAPWrite (the BTP/onprem type matrix this file checks); the other gate
 // flags don't affect the type enums, so they're left at their defaults.
-const onpremFull: ServerConfig = onprem({ allowWrites: true });
+const onpremFull: ServerConfig = onprem({ allowWrites: true, allowDataPreview: true });
 const btpFull: ServerConfig = btp({ allowWrites: true });
 
 function typeEnum(config: ServerConfig, toolName: string): string[] {
@@ -104,6 +104,19 @@ describe('registry sync — JSON-Schema enums equal the registry', () => {
     expect(typeEnum(onpremFull, 'SAPWrite')).toEqual([...SAPWRITE_TYPES_ONPREM]);
     expect(typeEnum(btpFull, 'SAPWrite')).toEqual([...SAPWRITE_TYPES_BTP]);
   });
+  it.each([onpremFull, btpFull])('SAPWrite batch items on $systemType', (config) => {
+    const write = getToolDefinitions(config, true).find((tool) => tool.name === 'SAPWrite')!;
+    const props = (write.inputSchema as any).properties;
+    const excluded = new Set<string>(['TABL/DTT', 'SOD1', 'SOD2', ...SDO_TYPES]);
+    const expected = typeEnum(config, 'SAPWrite').filter((type) => !excluded.has(type));
+    expect(props.objects.items.properties.type.enum).toEqual(expected);
+
+    const schema = getToolSchema('SAPWrite', config.systemType === 'btp')!;
+    for (const type of [...expected, ...excluded]) {
+      const input = { action: 'batch_create', objects: [{ type, name: 'ZARC1_X' }] };
+      expect(schema.safeParse(input).success, type).toBe(!excluded.has(type));
+    }
+  });
   it('SAPContext', () => {
     expect(typeEnum(onpremFull, 'SAPContext')).toEqual([...SAPCONTEXT_TYPES_ONPREM]);
     expect(typeEnum(btpFull, 'SAPContext')).toEqual([...SAPCONTEXT_TYPES_BTP]);
@@ -122,7 +135,13 @@ describe('registry sync — Zod enums accept every registry type and reject bogu
   });
 
   it('SAPWrite onprem + btp', () => {
-    const wargs = (type: string) => ({ action: 'create', type, name: 'ZARC1_X', source: 'x', package: '$TMP' });
+    const wargs = (type: string) => ({
+      action: type === 'TABL/DTT' ? 'update' : 'create',
+      type,
+      name: 'ZARC1_X',
+      source: 'x',
+      package: '$TMP',
+    });
     for (const t of SAPWRITE_TYPES_ONPREM) {
       expect(getToolSchema('SAPWrite', false)!.safeParse(wargs(t)).success, `onprem accepts ${t}`).toBe(true);
     }

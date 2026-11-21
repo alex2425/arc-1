@@ -28,7 +28,7 @@ const BUDGETS = {
   // write.ts is now a thin SAPWrite orchestrator (prologue + ctx + action dispatch) after the
   // Stage D split into src/handlers/write/{create,update-delete,class-surgery,rap}.ts. The action
   // submodules ride the default src budget; keep this tight so the dispatcher can't reabsorb them.
-  'src/handlers/write.ts': 300,
+  'src/handlers/write.ts': 305, // Includes dispatch to the SOD1/SOD2 catalog writer.
   // tools.ts holds every tool's JSON schema. The #520 description trim (write-mode tools/list
   // 87→66 KB to clear the Copilot-for-Eclipse gateway limit) shrank it; lowered to match. The
   // CLIENT-SAFETY size guard is scripts/ci/check-tool-schema-budget.ts — trim there before raising this.
@@ -41,7 +41,10 @@ const BUDGETS = {
   // +30 for SAPDiagnose ATC objects[]; keep its small item schema with the tool (no new module).
   // Combined #769/#772: 1791 lines, retaining 4 lines of headroom.
   // +4: parent function group for SAPTransport check/history.
-  'src/handlers/tools.ts': 1774,
+  // SAPQuery action-dependent schemas now live in query-tool.ts; lower the ratchet after extraction.
+  // +references packages/detail: keep two small parameter definitions beside SAPNavigate.
+  'src/handlers/tools.ts': 1798, // MSAG message deletion (#1248) and CTS request categories (#1047).
+  'src/handlers/schemas.ts': 1624, // MSAG deletion (#1248), CTS request categories (#1047), SRVB include allowlist.
   // +shared parseNamedItems relocated here from transport.ts (now used by ATC variants too) +
   // parseAtcSystemCheckVariant (FEAT-68 ATC variant listing) + parseFunctionModuleProperties and
   // the pre-7.52 projectexplorer function-group parser.
@@ -51,14 +54,14 @@ const BUDGETS = {
   // "reference" as a transport id, and a malformed escape threw away the whole feed
   // (docs/plans/2026-08-03-transport-diff.md).
   // -25: parseXml decodes entities itself, so the per-parser decodes went away.
-  // -43: the ENHO payload parser moved to the enhancement domain module (src/adt/enhancements.ts).
-  'src/adt/xml-parser.ts': 1726,
+  'src/adt/xml-parser.ts': 1537, // Revision feed split; includes 12 lines from upstream #1007 name normalization.
   // diagnostics.ts gained the ABAP trace-request engine (#508) + the OData perf probe + CDS Show-SQL (#509)
   // + ST05 SQL-trace control (#510) + clientWait split. Split out a perf/trace module if it grows much further.
   // +88 for dump paging: SAP caps the dumps feed at 100 entries and ignores $skip, so listDumps walks
   // the inclusive `to` bound, refuses to guess when a second holds a full page, and rejects bounds
   // SAP would silently discard or roll over to another day.
-  'src/adt/diagnostics.ts': 1933,
+  // +5: bounded typed dump query hook; schema/compiler/budget setup live in feed-schema.ts.
+  'src/adt/diagnostics.ts': 1938,
   // The ADT client facade aggregates every read/write op; set_api_state (#506) + runQueryWithMetrics
   // (SAPQuery metrics) + getEffectiveUser (BTP JWT-derived user, G-5) + getSourceAtObjectUrl
   // (post-activation cache promotion) + get/writeClassTextElements (class text pool) pushed it past
@@ -73,24 +76,32 @@ const BUDGETS = {
   // -5 after removing the forwarding-only guard factory and its extra import/configuration lines.
   // TABL write-route cache removed (never cache subtype routes for mutations); +9 for refusing TABL
   // mutations whose subtype cannot be verified on 7.50/7.51 (the resolver's error text).
-  // +30: three enhancement read ops on the facade — spot metadata (ENHS), the enhanced object's
-  // enhancement feed, and the repository object structure that locates a FORM's include.
-  'src/adt/client.ts': 1727,
+  // +1: forward the internal pinned-write no-replay policy (#1080). +29: three enhancement read ops
+  // on the facade — spot metadata (ENHS), the enhanced object's enhancement feed, and the
+  // repository object structure that locates a FORM's include.
+  'src/adt/client.ts': 1729,
   // The single live ADT integration suite covers every read/write surface against a real system;
   // it passed the 3000-line default test budget with the ATC check-variant binding cases
   // (docs/research/2026-08-19-atc-default-check-variant.md). Split by domain before raising again.
-  'tests/integration/adt.integration.test.ts': 3100,
+  'tests/integration/adt.integration.test.ts': 2944, // API-release and package-content lifecycles moved to focused live suites.
   // The two largest unit suites each gained the enhancement-framework cases (subtype routing,
   // workbench fallback, anchors, exit types). Split by domain before raising either again.
-  'tests/unit/adt/client.test.ts': 3110,
+  'tests/unit/adt/client.test.ts': 2986,
   'tests/unit/handlers/read.test.ts': 3101,
   // Typed attempt accounting, scoped response ownership, and stateful-context teardown must stay at
   // the transport choke point. Relation parsing/traversal and feature algorithms live elsewhere.
-  'src/adt/http.ts': 1561, // +12: #907 bounded legacy negotiation; selector lives in its own module.
+  // +3: classify caller cancellation before generic network wrapping (#1045).
+  // +50: bounded same-cookie local-SAML security-session logoff stays beside the owning cookie jar
+  // and stateful clone lifecycle; no separate transport or cross-user session pool is introduced.
+  // +28: ADR-0011 pinned write barrier (no transient retry, CSRF-only 403 resend, dual request ceiling on corrNr).
+  'src/adt/http.ts': 1644,
+  'tests/unit/adt/http.test.ts': 3008, // Same-cookie logoff must omit SAML Authorization.
   // #817: reject absent CTS documents at the existing list/get parser boundary.
-  'src/adt/transport.ts': 1507, // Keep the safe CTS explanation in minimal-error mode.
-  // +3 for passing existing exact discovery evidence into the pure opt-in schema projection.
-  'src/server/server.ts': 1493, // Shared HTTP transport + monotonic renewal for new requests (R21).
+  'src/adt/transport.ts': 1489, // Includes best-effort ABAP task-owner resolution for newrequest.
+  // Target-authorization helpers are extracted; retain shared transport renewal and fail-closed
+  // XSUAA startup from main.
+  // PP pool wiring and secret-free reuse audit status; logic lives in per-user-transport.ts (#1085).
+  'src/server/server.ts': 1497,
 };
 
 const DEFAULT_SRC = 1500;
@@ -112,7 +123,7 @@ function countLines(path) {
 // core.quotePath would wrap "tests/.../zäh.ts" in quotes, and a naive .endsWith('.ts') would
 // then silently skip it — voiding the ratchet for that file).
 // Include the maintained relation-validation entry points, not unrelated research scripts.
-const files = execSync('git ls-files -z src tests bin scripts/smoke-live-relations.ts scripts/bench-context-parsing.ts', {
+const files = execSync('git ls-files -z src tests bin scripts/smoke-live-relations.ts scripts/bench-context-parsing.ts scripts/spikes/pr677-target-authorization scripts/ci/check-target-authorization-mta.mjs', {
   encoding: 'utf8',
 })
   .split('\0')

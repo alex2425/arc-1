@@ -15,6 +15,7 @@
  * are imported from their respective modules by handlers.
  */
 import { getCurrentContext } from '../server/context.js';
+import { type ApiReleaseVisibility, parseApiReleaseState, setApiReleaseState } from './api-release.js';
 import { BSP_OBJECTS_PATH, bspContentPath, resolveBspNameAndPath } from './bsp-path.js';
 import type { AdtClientConfig } from './config.js';
 import { defaultAdtClientConfig } from './config.js';
@@ -23,10 +24,13 @@ import { canonicalDataSourceName } from './data-source-name.js';
 import { CDS_DEPENDENCY_GRAPH_PATH, DataSourceBlocklistGuard, parseTableReplacement } from './data-source-policy.js';
 import { parseTableType, type TableTypeInfo } from './ddic-xml.js';
 import { readEnhancementImplementation, readEnhancementSpot, readObjectEnhancements } from './enhancements.js';
-import { AdtApiError, AdtSafetyError, isNotFoundError } from './errors.js';
+import { AdtApiError, AdtError, AdtSafetyError, isNotFoundError } from './errors.js';
 import { AdtHttpClient, type AdtHttpConfig, type AdtResponse } from './http.js';
 import type { AdtRequestOptions } from './http-deadline.js';
-import { AdtPackageHierarchyResolver, type PackageHierarchyResolver } from './package-hierarchy.js';
+import { filterIncludeHits, requiresUnfilteredIncludeSearch } from './include-search.js';
+import { getDirectPackageContents } from './package-browser.js';
+import { requirePackageFilteredSearch } from './package-contents.js';
+import { AdtPackageHierarchyResolver, fetchSuperPackage, type PackageHierarchyResolver } from './package-hierarchy.js';
 import { canonicalRevisionSourcePath } from './path-safety.js';
 import { clampUrlLimit } from './result-limits.js';
 import { checkOperation, OperationType, type SafetyConfig } from './safety.js';
@@ -42,6 +46,7 @@ import {
   readTextElements,
   type TextElementObjectType,
   type TextElementPart,
+  type TextElementWriteResult,
   writeTextElementPart,
 } from './text-elements.js';
 import { clampSearchResults, searchSource as executeSourceSearch, toTextSearchObjectType } from './text-search.js';
@@ -70,10 +75,7 @@ import type {
   TransactionInfo,
 } from './types.js';
 import {
-  assertApiReleaseStateConfirmed,
-  buildApiReleasePutBody,
   type DataPreviewMeta,
-  parseApiReleaseState,
   parseAuthorizationField,
   parseBspAppList,
   parseBspFolderListing,
@@ -91,6 +93,7 @@ import {
   parseMessageClass,
   parseRevisionFeed,
   parseSearchResults,
+  parseServerDrivenMetadata,
   parseServiceBinding,
   parseSubpackageNodestructure,
   parseSystemInfo,
@@ -302,6 +305,7 @@ export class AdtClient {
       samlAuthorization: config.samlAuthorization,
       disableSaml: config.disableSaml,
       retryUnauthorized: config.retryUnauthorized,
+      pinnedWrite: config.safety?.multiTargetWrite,
       onUnauthorized: config.onUnauthorized,
       // Prefer the shared server-wide semaphore when provided so all per-user PP clients
       // share one cap. Fall back to a private semaphore for stdio/tests when only maxConcurrent
@@ -335,11 +339,10 @@ export class AdtClient {
    * per-safety-scope. Cache invalidation is exposed via `invalidatePackageHierarchy()`.
    */
   getPackageHierarchyResolver(): PackageHierarchyResolver {
-    if (!this.packageHierarchyResolverHolder.resolver) {
-      this.packageHierarchyResolverHolder.resolver = new AdtPackageHierarchyResolver((root) =>
-        this.getSubpackages(root),
-      );
-    }
+    this.packageHierarchyResolverHolder.resolver ??= new AdtPackageHierarchyResolver(
+      (pkg) => fetchSuperPackage(this.http, this.safety, pkg),
+      { fetchSubpackages: (root) => this.getSubpackages(root) },
+    );
     return this.packageHierarchyResolverHolder.resolver;
   }
 
@@ -536,9 +539,9 @@ export class AdtClient {
     return parseFunctionModuleProperties((await this.http.get(url)).body);
   }
 
-  /** Resolve by URI: some releases decorate search names with "(Function Module)". */
-  async resolveFunctionGroup(fmName: string): Promise<string | null> {
-    const results = await this.searchObject(fmName, 10);
+  /** Resolve by URI (names can carry "(Function Module)"); uppercase: 7.50 search is case-sensitive. */
+  async resolveFunctionGroup(fmName: string, request?: AdtRequestOptions): Promise<string | null> {
+    const results = await this.searchObject(fmName.toUpperCase(), 10, undefined, request);
     for (const r of results) {
       const match = r.uri.match(/\/functions\/groups\/([^/]+)\/fmodules\/([^/?#]+)(?:[/?#]|$)/i);
       if (match && decodeURIComponent(match[2]!).toUpperCase() === fmName.toUpperCase()) {
@@ -565,12 +568,12 @@ export class AdtClient {
       // nodes in a flat projectexplorer shape. Note the LOWERCASE query params — objectName/
       // objectType returns 400. Verified live on npl 7.50; §8.3 of the 2026-07-29 dossier.
       if (!isNotFoundError(err)) throw err;
-      const fallback = await this.http.get(
-        `/sap/bc/adt/repository/objectstructure?objectname=${encodeURIComponent(name)}&objecttype=${encodeURIComponent('FUGR/F')}`,
-        { Accept: accept },
-      );
-      // The fallback payload does not carry the group name — pass it through.
-      return parseFunctionGroupNodes(fallback.body, name);
+      const path = `/sap/bc/adt/repository/objectstructure?objectname=${encodeURIComponent(name)}&objecttype=${encodeURIComponent('FUGR/F')}`;
+      const fg = parseFunctionGroupNodes((await this.http.get(path, { Accept: accept })).body, name);
+      // A missing group answers 200 with no nodes; a real one always lists its TOP/UXX includes
+      // (both live on npl 7.50). Not `err`: its "No suitable resource" text draws the SICF hint.
+      if (fg.functions.length + fg.includes.length > 0) return fg;
+      throw new AdtApiError(`Function group ${name} not found`, 404, path);
     }
   }
 
@@ -690,6 +693,25 @@ export class AdtClient {
     });
   }
 
+  /** Read native business-configuration JSON. Explicit versions must not silently fall back. */
+  async getSmbc(name: string, version?: 'active' | 'inactive'): Promise<SourceReadResult> {
+    checkOperation(this.safety, OperationType.Read, 'GetSMBC');
+    const uri = `/sap/bc/adt/bct/smbctyp/${encodeURIComponent(name.toLowerCase())}`;
+    if (version) {
+      const metadata = await this.http.get(`${uri}?version=${version}`, {
+        Accept: 'application/vnd.sap.adt.blues.v1+xml',
+      });
+      const actual = parseServerDrivenMetadata(metadata.body, 'blueSource').version;
+      if (actual !== version) {
+        throw new AdtError(
+          `Cannot confirm ${version} version of SMBC ${name}: SAP metadata reports ${actual || 'no version'}. ` +
+            'Use version="auto" for the available developer view.',
+        );
+      }
+    }
+    return this.fetchSource(`${uri}/source/main`, { version, accept: 'application/json' });
+  }
+
   /** Get metadata extension source code (DDLX) */
   async getDdlx(name: string, opts?: SourceReadOptions): Promise<SourceReadResult> {
     checkOperation(this.safety, OperationType.Read, 'GetDDLX');
@@ -762,26 +784,27 @@ export class AdtClient {
 
   /** Resolve the canonical ADT URL for a TABL name (transparent table or structure)
    *  for the **read** path. Probes /tables/ first and falls back to /structures/ on
-   *  404. The source body is identical either way, so the fallback is safe for reads.
-   *  Result is cached per client.
+   *  404. On 750, the fallback exposes fields/types without full table semantics.
+   *  Result is cached per client for reads only.
    *
    *  Do NOT use this for writes/activates — on NW 7.50 the /tables/ endpoint is
    *  absent entirely, so transparent tables (TABL/DT) fall through to /structures/
    *  and a PUT there silently sets DD02L-TABCLASS=INTTAB (corruption). Use
    *  `resolveTablObjectUrlForWrite()` instead. See issue #285. */
-  async resolveTablObjectUrl(name: string): Promise<string> {
+  async resolveTablObjectUrl(name: string, options?: AdtRequestOptions): Promise<string> {
+    checkOperation(this.safety, OperationType.Read, 'ResolveTablObjectUrl');
     const upper = name.toUpperCase();
     const cached = this.tablUrlCache.get(upper);
     if (cached) return cached;
     const tableUrl = `/sap/bc/adt/ddic/tables/${encodeURIComponent(name)}`;
     const structUrl = `/sap/bc/adt/ddic/structures/${encodeURIComponent(name)}`;
     try {
-      await this.http.get(tableUrl);
+      await this.http.get(tableUrl, undefined, options);
       this.tablUrlCache.set(upper, tableUrl);
       return tableUrl;
     } catch (err) {
       if (err instanceof AdtApiError && err.statusCode === 404) {
-        await this.http.get(structUrl);
+        await this.http.get(structUrl, undefined, options);
         this.tablUrlCache.set(upper, structUrl);
         return structUrl;
       }
@@ -912,15 +935,16 @@ export class AdtClient {
     type: string,
     name: string,
     opts: { include?: string; group?: string } = {},
+    request?: AdtRequestOptions,
   ): Promise<RevisionListResult> {
     checkOperation(this.safety, OperationType.Read, 'GetRevisions');
     const url = this.revisionsUrlFor(type, name, opts);
-    const resp = await this.http.get(url, { Accept: 'application/atom+xml;type=feed' });
+    const resp = await this.http.get(url, { Accept: 'application/atom+xml;type=feed' }, request);
     return parseRevisionFeed(resp.body);
   }
 
   /** Read source content for a specific revision URI from the revisions feed. */
-  async getRevisionSource(versionUri: string): Promise<string> {
+  async getRevisionSource(versionUri: string, request?: AdtRequestOptions): Promise<string> {
     checkOperation(this.safety, OperationType.Read, 'GetRevisionSource');
     const canonicalUri = canonicalRevisionSourcePath(versionUri);
     if (!canonicalUri) {
@@ -928,7 +952,7 @@ export class AdtClient {
         'Path must be a canonical host-relative ADT path under /sap/bc/adt/ and a source URI from a VERSIONS response.',
       );
     }
-    const resp = await this.http.get(canonicalUri, { Accept: 'text/plain' });
+    const resp = await this.http.get(canonicalUri, { Accept: 'text/plain' }, request);
     return resp.body;
   }
 
@@ -942,9 +966,9 @@ export class AdtClient {
   }
 
   /** Get enhancement metadata and, for source-code plug-ins, hook locations and ABAP source. */
-  async getEnhancementImplementation(name: string): Promise<EnhancementImplementationInfo> {
+  async getEnhancementImplementation(name: string, release?: string): Promise<EnhancementImplementationInfo> {
     // The router needs searchObject to resolve the ENHO subtype, and guards the operation itself.
-    return readEnhancementImplementation(this, name);
+    return readEnhancementImplementation(this, name, release);
   }
 
   /**
@@ -996,51 +1020,15 @@ export class AdtClient {
    */
   async setApiReleaseState(
     objectUri: string,
-    opts: { state?: string; contract?: string; transport?: string } = {},
+    opts: {
+      state?: string;
+      contract?: string;
+      transport?: string;
+      visibility?: ApiReleaseVisibility;
+    } = {},
   ): Promise<ApiReleaseStateInfo & { changed: boolean }> {
     checkOperation(this.safety, OperationType.Update, 'SetApiReleaseState');
-    const state = (opts.state ?? 'RELEASED').toUpperCase();
-    const contract = (opts.contract ?? 'C1').toUpperCase();
-    if (state !== 'RELEASED' && state !== 'NOT_RELEASED') {
-      throw new Error(`apiState must be RELEASED or NOT_RELEASED, got ${opts.state}.`);
-    }
-    const accept = 'application/vnd.sap.adt.apirelease.v10+xml';
-    const encoded = encodeURIComponent(objectUri);
-    const current = await this.http.get(`/sap/bc/adt/apireleases/${encoded}`, { Accept: accept });
-    const body = buildApiReleasePutBody(current.body, contract, state);
-    const path = `/sap/bc/adt/apireleases/${encoded}/${contract.toLowerCase()}`;
-    const expectedVisibility = {
-      useInSAPCloudPlatform: /ars:useInSAPCloudPlatform="true"/.test(body),
-      useInKeyUserApps: /ars:useInKeyUserApps="true"/.test(body),
-    };
-    let changed = true;
-    try {
-      await this.http.put(
-        opts.transport ? `${path}?request=${encodeURIComponent(opts.transport)}` : path,
-        body,
-        accept,
-        { Accept: accept },
-      );
-    } catch (err) {
-      // SAP returns 400 "No changes were made" when the contract is already in the requested state.
-      // Treat that as an idempotent no-op (the desired state already holds — confirmed via read-back
-      // below) rather than surfacing a confusing error for "release something already released".
-      if (
-        err instanceof AdtApiError &&
-        err.statusCode === 400 &&
-        /no changes were made/i.test(`${err.message} ${err.responseBody ?? ''}`)
-      ) {
-        changed = false;
-      } else {
-        throw err;
-      }
-    }
-    const confirmedResp = await this.http.get(`/sap/bc/adt/apireleases/${encoded}`, { Accept: accept });
-    const confirmed = parseApiReleaseState(confirmedResp.body);
-    // On a real write, assert the full target (state + requested visibility). On an idempotent no-op,
-    // assert only that the state already matches — the pre-existing visibility is whatever SAP stored.
-    assertApiReleaseStateConfirmed(confirmed, contract, state, changed ? expectedVisibility : undefined);
-    return { ...confirmed, changed };
+    return setApiReleaseState(this.http, objectUri, opts);
   }
 
   /** List objects pending activation (inactive objects).
@@ -1060,12 +1048,19 @@ export class AdtClient {
   // ─── Search Operations ─────────────────────────────────────────────
 
   /** Search for ABAP objects by name pattern */
-  async searchObject(query: string, maxResults = 100, objectType?: string): Promise<AdtSearchResult[]> {
+  async searchObject(
+    query: string,
+    maxResults = 100,
+    objectType?: string,
+    request?: AdtRequestOptions,
+  ): Promise<AdtSearchResult[]> {
     checkOperation(this.safety, OperationType.Search, 'SearchObject');
     const limit = clampSearchResults(maxResults, 100);
     const typeFilter = objectType ? `&objectType=${encodeURIComponent(objectType)}` : '';
     const resp = await this.http.get(
       `/sap/bc/adt/repository/informationsystem/search?operation=quickSearch&query=${encodeURIComponent(query)}&maxResults=${limit}${typeFilter}`,
+      undefined,
+      request,
     );
     return parseSearchResults(resp.body);
   }
@@ -1105,13 +1100,11 @@ export class AdtClient {
       const params = new URLSearchParams({
         operation: 'quickSearch',
         query: name,
-        maxResults: String(limit),
+        maxResults: String(requiresUnfilteredIncludeSearch(objectType) ? 1000 : limit),
       });
-      if (objectType) {
-        params.set('objectType', objectType);
-      }
+      if (objectType && !requiresUnfilteredIncludeSearch(objectType)) params.set('objectType', objectType);
       const resp = await this.http.get(`/sap/bc/adt/repository/informationsystem/search?${params.toString()}`);
-      return parseSearchResults(resp.body);
+      return filterIncludeHits(parseSearchResults(resp.body), objectType);
     };
 
     const results: AdtObjectLookupResult[] = [];
@@ -1234,6 +1227,11 @@ export class AdtClient {
 
   // ─── Package Operations ────────────────────────────────────────────
 
+  /** Explicit bounded direct contents; does not replace indexed search or the safety resolver. */
+  async getDirectPackageContents(packageName: string, maxResults?: number, objectType?: string) {
+    return getDirectPackageContents(this.http, this.safety, packageName, maxResults, objectType);
+  }
+
   /**
    * Get package contents (objects and subpackages).
    *
@@ -1265,6 +1263,7 @@ export class AdtClient {
     maxResults = 200,
   ): Promise<Array<{ type: string; name: string; description: string; uri: string }>> {
     checkOperation(this.safety, OperationType.Read, 'GetPackage');
+    await requirePackageFilteredSearch(this.http);
     const limit = clampUrlLimit(maxResults, 200);
     const resp = await this.http.get(
       `/sap/bc/adt/repository/informationsystem/search?operation=quickSearch&query=*&packageName=${encodeURIComponent(packageName)}&maxResults=${limit}`,
@@ -1326,10 +1325,7 @@ export class AdtClient {
     });
     const names = parseSubpackageNodestructure(resp.body);
     const upperSelf = packageName.toUpperCase();
-    // parseSubpackageNodestructure already filters to DEVC/K, drops empty names,
-    // uppercases, and dedupes. Here we additionally exclude the queried package
-    // itself (defensive — `nodestructure` does not normally include it under
-    // its own subtree) and apply the maxResults cap.
+    // Parsed package names are already canonical and unique; exclude self and cap the result.
     const out: string[] = [];
     for (const name of names) {
       if (name === upperSelf) continue;
@@ -1345,16 +1341,18 @@ export class AdtClient {
   private dataSourceBlocklistGuard(budget: DataResponseBudget, signal?: AbortSignal): DataSourceBlocklistGuard {
     return new DataSourceBlocklistGuard(this.safety.blockedDataSources, {
       searchObject: (name, maxResults) => this.searchObject(name, maxResults),
-      // Fixed authorization metadata: public runQuery would recursively invoke this guard.
       readTableReplacement: async (name) => {
         const table = canonicalDataSourceName(name);
         const sql = `SELECT d~TABNAME, d~TABCLASS, d~VIEWREF, d~VIEWREF_ERR, d~SQLTAB, l~DDLNAME
 FROM DD02L AS d LEFT OUTER JOIN DDLDEPENDENCY AS l
 ON l~OBJECTNAME = d~VIEWREF AND l~OBJECTTYPE = 'VIEW' AND l~STATE = 'A'
 WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
-        // Two rows suffice to reject ambiguity; all bytes share the caller's result budget.
         const { rows } = parseTableContents(await this.postFreestyleQuery(sql, 2, budget, signal));
         return parseTableReplacement(table, rows);
+      },
+      readActiveDdlMetadata: async (name) => {
+        checkOperation(this.safety, OperationType.Read, 'GetDdlSourceMetadata');
+        return (await this.http.get(`/sap/bc/adt/ddic/ddl/sources/${encodeURIComponent(name)}?version=active`)).body;
       },
       dependencyGraphAccept: () => this.http.discoveryAcceptFor(CDS_DEPENDENCY_GRAPH_PATH),
       readDependencyGraph: async (path, accept) => {
@@ -1409,7 +1407,7 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
     // so the name the policy authorized is byte-for-byte the name SAP receives.
     return this.withDataResultScope(async (budget, signal) => {
       await this.dataSourceBlocklistGuard(budget, signal).enforceTableContents(source, sqlFilter);
-      return parseTableContents(
+      const result = parseTableContents(
         await this.postDataPreview(
           `/sap/bc/adt/datapreview/ddic?rowNumber=${rowLimit}&ddicEntityName=${encodeURIComponent(source)}`,
           sqlFilter,
@@ -1417,6 +1415,8 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
           signal,
         ),
       );
+      // DDIC preview may include a lookahead row beyond rowNumber (#1068).
+      return { ...result, rows: result.rows.slice(0, rowLimit) };
     });
   }
 
@@ -1427,10 +1427,8 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
   }
 
   /**
-   * Like runQuery, but also returns the datapreview metrics ADT already includes in the response
-   * (totalRows, server-side queryExecutionTimeMs, executedQueryString). Kept separate from runQuery so
-   * these — including the internal generated SQL — only surface where asked (SAPQuery), not in every
-   * runQuery consumer that JSON-stringifies the result.
+   * Also returns SAP's count, timing and SQL echo, only where asked (SAPQuery).
+   * The count is not a result total; the timing may exclude SAP's separate count query.
    */
   async runQueryWithMetrics(
     sql: string,
@@ -1455,7 +1453,7 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
    * The whole batch runs inside ONE data-result scope, so the response-memory budget (#739) is
    * cumulative across chunks rather than reset per chunk — N chunks cannot together exceed the limit
    * a single response may consume. Metrics are reported only for a single statement, because an
-   * early break on the row cap would make a summed totalRows misleading.
+   * early break on the row cap would make combined SAP metrics misleading.
    */
   async runQueryBatch(
     statements: string[],
@@ -1470,7 +1468,9 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
       const post = (sql: string, limit: number): Promise<string> => this.postFreestyleQuery(sql, limit, budget, signal);
 
       if (statements.length === 1) {
-        return parseDataPreviewResult(await post(statements[0]!, rowLimit));
+        const result = parseDataPreviewResult(await post(statements[0]!, rowLimit));
+        // SAP ignores rowNumber for UNION; keep the returned-row cap independent of backend behavior.
+        return { ...result, rows: result.rows.slice(0, rowLimit) };
       }
       return executeDataPreviewStatements(post, parseTableContents, statements, rowLimit);
     });
@@ -1495,8 +1495,8 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
    * Query a table or CDS view with structured parameters.
    * Builds the SELECT server-side from structured params. IN/NOT IN values are strictly
    * parsed as quoted literal lists (no subqueries). Uses the freestyle endpoint so
-   * multi-column WHERE and CDS views work on all SAP releases.
-   * Gated by allowDataPreview (not allowFreeSQL).
+   * multi-column WHERE uses SAP's SQL parser. Requires a working freestyle endpoint;
+   * sources/syntax depend on the backend. Gated by allowDataPreview (not allowFreeSQL).
    */
   async runTableQuery(
     tableName: string,
@@ -1504,12 +1504,14 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
       columns?: string[];
       where?: Array<{ field: string; op: string; value?: string }>;
       maxRows?: number;
+      /** Internal opt-in, verified on 758/816: retain repeated spaces through SAP's CONDENSE. */
+      preserveLiteralSpaces?: boolean;
     } = {},
   ): Promise<{ columns: string[]; rows: Record<string, string>[] }> {
     checkOperation(this.safety, OperationType.Query, 'RunTableQuery');
     // One canonical identity: authorize it, then build the statement from the SAME string.
     const source = canonicalDataSourceName(tableName, 'TABLE_QUERY table name');
-    const sql = buildTableQuerySql(source, opts.columns, opts.where);
+    const sql = buildTableQuerySql(source, opts.columns, opts.where, opts.preserveLiteralSpaces);
     const maxRows = clampPreviewRows(opts.maxRows);
     return this.withDataResultScope(async (budget, signal) => {
       await this.dataSourceBlocklistGuard(budget, signal).enforceSources([source]);
@@ -1603,21 +1605,21 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
     return readTextElementPart(this.http, this.safety, 'CLAS', name, 'symbols');
   }
 
-  /** Write one subobject of a textpool. Locks the textelements object, PUTs, unlocks. Immediately
-   *  active — no SAPActivate needed. */
+  /** Write one part, unlock, then request text-pool activation in the same stateful session.
+   *  A never-activated PROG still needs its first owner activation to activate the texts. */
   async writeTextElementPart(
     objectType: TextElementObjectType,
     name: string,
     part: TextElementPart,
     source: string,
     transport?: string,
-  ): Promise<void> {
+  ): Promise<TextElementWriteResult> {
     return writeTextElementPart(this.http, this.safety, objectType, name, part, source, transport);
   }
 
   /** Write a global class's text symbols. */
   async writeClassTextSymbols(name: string, source: string, transport?: string): Promise<void> {
-    return writeTextElementPart(this.http, this.safety, 'CLAS', name, 'symbols', source, transport);
+    await writeTextElementPart(this.http, this.safety, 'CLAS', name, 'symbols', source, transport);
   }
 
   /** Get program variants */
@@ -1708,7 +1710,7 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
    * surfaces the package as a denormalised attribute. Both shapes resolve
    * to the same package; we accept either.
    */
-  async resolveObjectPackage(objectUrl: string, accept?: string): Promise<string> {
+  async resolveObjectPackage(objectUrl: string, accept?: string, options?: AdtRequestOptions): Promise<string> {
     checkOperation(this.safety, OperationType.Read, 'ResolveObjectPackage');
     // Server-driven objects (8.16+) only render their <blue:blueSource> metadata (with the
     // adtcore:packageRef) under the blues.vN+xml Accept — callers pass it so the allowedPackages
@@ -1718,7 +1720,7 @@ WHERE d~TABNAME = '${table}' AND d~AS4LOCAL = 'A'`;
     // bindings resource), and that 406 body names no accepted type, so the generic negotiation
     // retry cannot recover. Parameters select nothing on these metadata reads.
     const bareAccept = accept?.split(';')[0]?.trim();
-    const resp = await this.http.get(objectUrl, bareAccept ? { Accept: bareAccept } : undefined);
+    const resp = await this.http.get(objectUrl, bareAccept ? { Accept: bareAccept } : undefined, options);
     const packageRefMatch = resp.body.match(/adtcore:packageRef[^>]*adtcore:name="([^"]*)"/);
     if (packageRefMatch?.[1]) return packageRefMatch[1];
     const containerRefMatch = resp.body.match(/adtcore:containerRef[^>]*adtcore:packageName="([^"]*)"/);

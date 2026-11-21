@@ -1,5 +1,32 @@
 # Updating ARC-1
 
+## XSUAA auth 1.2.1 — refresh-token migration
+
+When upgrading ARC-1 from a build with `@arc-mcp/xsuaa-auth` below **1.2.1** to one
+with **1.2.1 or later**, plan one fresh MCP sign-in per user. The library now binds
+refresh tokens to the issuing client and rejects previously issued raw refresh tokens.
+Existing access tokens remain valid until they expire or are revoked upstream.
+
+Upgrade every instance before resuming OAuth traffic. Mixed versions cannot share the
+new refresh-token format, and old instances still accept raw refresh tokens. Preserve
+your existing `ARC1_DCR_SIGNING_SECRET`; this migration does not require rotating it or
+changing the MCP server URL or client registration. After the upgrade, verify a fresh
+sign-in and token refresh. Deployments without the XSUAA OAuth proxy are unaffected.
+
+See the [xsuaa-auth 1.2.1 upgrade notes](https://github.com/arc-mcp/xsuaa-auth/releases/tag/v1.2.1).
+
+## v1.10.0 — HTTP request validation
+
+MCP POST requests must contain JSON with `Content-Type: application/json`.
+Requests without a parsed body now return **415**, including bodyless POSTs.
+
+JSON and form bodies must now be uncompressed, including authenticated MCP and OAuth
+requests. Compressed bodies previously accepted by the HTTP framework now return
+**415**. Disable request compression in custom clients or gateways before upgrading.
+MCP methods, tool schemas and OAuth fields do not depend on request compression, so this
+input-validation hardening ships in a minor release.
+Response compression and outbound SAP data-preview compression are separate.
+
 ## v1.5.0 — upgrade checks
 
 Start with the [1.5.0 upgrade checklist](release-notes.md#150-upgrade-checklist).
@@ -188,7 +215,7 @@ want "developer without CTS/Git", create your own role template referencing just
 1. Update `xs-security.json` in your repo (already done in the ARC-1 v0.7 release).
 2. For an MTA-owned service, continue with the full MTA deployment below. For a manually owned service, update with its route-specific `xs-security.landscape.json`; a service update alone does not create role collections from `mta.yaml`.
 3. Run the full MTA deployment: `npm run btp:build-deploy-ext` (or `mbt build && cf deploy mta_archives/arc1-mcp_*.mtar -e mta-overrides.mtaext`). If you don't have a `mta-overrides.mtaext` yet, copy it from the tracked `mta-overrides.mtaext.example` first. The base `mta.yaml` is deliberately target-free; the extension preserves the existing single-target names or enables multi-target mode explicitly.
-4. In BTP Cockpit, verify that all seven `ARC-1 … (<space>)` role collections exist and contain roles. Existing assignments survive, but collections added after an older deployment are not created by `cf update-service` alone and must be assigned explicitly.
+4. In BTP Cockpit, verify the current checkout's [expected role collections](btp-administration.md#role-and-user-administration) exist and contain current roles. Existing assignments survive, but `cf update-service` alone does not create collections from `mta.yaml`. Assign newly added collections only deliberately; leave All Targets unassigned unless approved.
 5. Test with a developer user: `SAPTransport(action=check)` should succeed with a read-scoped user now; `SAPTransport(action=create)` should succeed for users in `ARC-1 Developer`.
 
 ### Debugging the new model
@@ -204,7 +231,7 @@ See the full [Authorization & Roles](authorization.md) doc for the complete mode
 ## Before you update
 
 1. **Check what changed** — start with the annotated [Release Notes](release-notes.md): every release with its impact and the action it needs (usually none). The raw [CHANGELOG.md](https://github.com/arc-mcp/arc-1/blob/main/CHANGELOG.md) and the [Releases page](https://github.com/arc-mcp/arc-1/releases) list every merged PR.
-2. **Pin to a version** — in production, use exact version tags (for example `:1.5.1`), never `:latest`. Prevents surprise upgrades. <!-- x-release-please-version -->
+2. **Pin to a version** — in production, use exact version tags (for example `:1.10.1`), never `:latest`. Prevents surprise upgrades. <!-- x-release-please-version -->
 3. **Test first** — update a dev/staging instance before production. Verify MCP clients still connect and tools work as expected.
 4. **Read the startup auth line after upgrade** — a drift-free instance will log the same `auth: MCP=[...] SAP=[...]` summary before and after. If it's different, the upgrade changed something you didn't expect.
 
@@ -220,10 +247,10 @@ Use `@latest` to follow npm’s current latest tag. An unqualified `npx arc-1` c
 npx arc-1@latest
 
 # Pinned
-npx arc-1@1.5.1
+npx arc-1@1.10.1
 
 # Global install
-npm install -g arc-1@1.5.1
+npm install -g arc-1@1.10.1
 ```
 <!-- x-release-please-end -->
 
@@ -237,7 +264,7 @@ If you pin in MCP client config, update the `args`:
 
 <!-- x-release-please-start-version -->
 ```json
-{ "command": "npx", "args": ["-y", "arc-1@1.5.1"] }
+{ "command": "npx", "args": ["-y", "arc-1@1.10.1"] }
 ```
 <!-- x-release-please-end -->
 
@@ -248,7 +275,7 @@ If you pin in MCP client config, update the `args`:
 <!-- x-release-please-start-version -->
 ```bash
 # 1. Pull the new image
-docker pull ghcr.io/arc-mcp/arc-1:1.5.1
+docker pull ghcr.io/arc-mcp/arc-1:1.10.1
 
 # 2. Stop & remove the running container
 docker stop arc1 && docker rm arc1
@@ -256,7 +283,7 @@ docker stop arc1 && docker rm arc1
 # 3. Start with the new image (same env vars / config)
 docker run -d --name arc1 -p 8080:8080 \
   --env-file .env \
-  ghcr.io/arc-mcp/arc-1:1.5.1
+  ghcr.io/arc-mcp/arc-1:1.10.1
 
 # 4. Verify
 docker logs arc1 | head -20
@@ -350,9 +377,12 @@ For every mode:
 
 1. confirm process health and the exact deployed version in startup logs;
 2. inspect all expected XSUAA role collections/roles after a security-descriptor change;
-3. obtain a fresh token when roles changed;
+3. after role changes, use new application sign-in and verify effective access, not token refresh alone
+   ([role-change procedure](multi-target-administration.md#role-changes-and-revocation));
 4. for multi-target, inspect Admin `SAPTargets` and registry revision; and
-5. perform one Viewer `SAPRead SYSTEM`, then confirm the SAP user from SAP-side evidence
+5. perform a safe read with a read-only pilot user—ordinary Viewer for standard access, an
+   exact-target collection for filtered access—and test denial of an ungranted active target in
+   filtered mode. Confirm the SAP user from SAP-side evidence; `SAPRead SYSTEM` alone is not proof
    ([Verify the backend identity](principal-propagation-setup.md#verify-the-backend-identity)).
 
 Keep the previous reviewed MTAR, `.mtaext`, and DCR signing secret available. Roll back through the

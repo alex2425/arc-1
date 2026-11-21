@@ -1,9 +1,11 @@
 /**
- * SAPQuery handler — freestyle SQL execution with IN-list chunking + SQL literal parsing.
+ * SAPQuery handler — bounded business-data operations and separately gated freestyle SQL.
  */
 
 import { type AdtClient, clampPreviewRows } from '../adt/client.js';
 import { AdtApiError, extractUnknownColumn, formatUnknownColumnHint } from '../adt/errors.js';
+import { handleApplicationLog } from './application-log.js';
+import { handleLongText } from './long-text.js';
 import { classifySapQueryParserError, maskSqlStringLiterals } from './query-errors.js';
 import { errorResult, type ToolResult, textResult, toolJson } from './shared.js';
 
@@ -157,6 +159,8 @@ export async function handleSAPQuery(
   args: Record<string, unknown>,
   minimalErrors: boolean,
 ): Promise<ToolResult> {
+  if (args.action === 'application_log') return handleApplicationLog(client, args.applicationLog);
+  if (args.action === 'long_text') return handleLongText(client, args.longText, minimalErrors);
   const sql = String(args.sql ?? '');
   const maxRows = Number(args.maxRows ?? 100);
   const effectiveMaxRows = clampPreviewRows(maxRows);
@@ -169,12 +173,11 @@ export async function handleSAPQuery(
     // One logical request -> one authorization decision, whether or not IN-list chunking split it.
     // The client owns both the decision and the POSTs; the handler never gets an authorization
     // receipt it could reuse or forge. Metrics come back only for the single-statement case, because
-    // an early break on the row cap would make a summed totalRows misleading.
+    // an early break on the row cap would make combined SAP metrics misleading.
     const data = await client.runQueryBatch(chunkPlan ? chunkPlan.statements : [sql], maxRows);
-    // Surface ADT's own metrics first (real match count + server-side time) — most useful for perf triage
-    // ("847 ms, 511927 rows matched") and not buried under a long rows array.
+    // SAP's separate count query can count input rows or fail independently of the data SELECT.
     const out: Record<string, unknown> = {};
-    if (data.totalRows !== undefined) out.totalRows = data.totalRows;
+    if (data.totalRows !== undefined) out.sapReportedTotalRows = data.totalRows;
     if (data.queryExecutionTimeMs !== undefined) out.queryExecutionTimeMs = data.queryExecutionTimeMs;
     if (data.executedQueryString) out.executedQueryString = data.executedQueryString;
     if (rowLimitClamped) {
@@ -183,6 +186,7 @@ export async function handleSAPQuery(
       out.effectiveMaxRows = effectiveMaxRows;
     }
     out.rowsReturned = data.rows.length;
+    out.rowLimitReached = data.rows.length >= effectiveMaxRows;
     out.columns = data.columns;
     out.rows = data.rows;
     return textResult(toolJson(out));

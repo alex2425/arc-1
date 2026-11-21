@@ -26,19 +26,18 @@ import {
   supportsExplicitTransportTarget,
   type TransportReleaseResult,
 } from '../adt/transport.js';
-import { diffTransportObject, type LogicalTransportObject, rollupTransportObjects } from '../adt/transport-diff.js';
 import type { InactiveObject, ObjectTransportHistory, TransportReleaseReport, TransportRequest } from '../adt/types.js';
 import { logger } from '../server/logger.js';
 import type { ServerConfig } from '../server/types.js';
+import { getCachedFeatures } from './feature-cache.js';
+import { resolveIncludeGroup } from './include-group.js';
 import { functionGroupObjectUrl, functionModuleObjectUrl, objectUrlForType } from './object-types.js';
 import { errorResult, type ToolResult, textResult, toolJson } from './shared.js';
+import { handleTransportReview } from './transport-review.js';
 
 /** Default page size for `list`. Object lists dominate the payload, so the backlog sets the cost. */
 const DEFAULT_TRANSPORT_RESULTS = 50;
 const DEFAULT_TRANSPORT_CHECK_RESULTS = 10;
-/** `diff` page size. Cap matches SAP's own transport-diff tool (pageSize max 40) so results compare. */
-const DEFAULT_DIFF_OBJECTS = 20;
-const MAX_DIFF_OBJECTS = 40;
 
 /**
  * Pre-release guard: find inactive objects that belong to `transportId`. Releasing a transport that
@@ -200,6 +199,7 @@ async function resolveTransportObjectUrl(
   type: string,
   name: string,
   group: string | undefined,
+  allowMissingInclude = false,
 ): Promise<string> {
   let parent = group?.trim();
   if (type === 'FUNC' && !parent) {
@@ -207,6 +207,7 @@ async function resolveTransportObjectUrl(
     if (!parent)
       throw new Error(`Cannot resolve function group for FM "${name}". Provide the "group" parameter explicitly.`);
   }
+  if (type === 'INCL' && !parent) parent = await resolveIncludeGroup(client, name, allowMissingInclude);
   if (type === 'FUNC' && parent) return functionModuleObjectUrl(parent, name);
   if (type === 'INCL' && parent)
     return `${functionGroupObjectUrl(parent)}/includes/${encodeURIComponent(name.toLowerCase())}`;
@@ -259,83 +260,17 @@ export async function handleSAPTransport(
       if (!transport) return textResult(`Transport ${id} not found.`);
       return textResult(toolJson(transport));
     }
-    case 'diff': {
-      const id = String(args.id ?? '');
-      if (!id) return errorResult('Transport ID is required for "diff" action.');
-      const transport = await getTransport(client.http, client.safety, id);
-      if (!transport) return textResult(`Transport ${id} not found.`);
-
-      // A transport of copies records its objects on the REQUEST, not under a task, so
-      // reviewing only `tasks` returns an empty change set. A released workbench request also
-      // MIRRORS its task objects at request level — add only the entries no task already
-      // carries, otherwise the request id lands in `taskIds` and reads as an extra task.
-      const taskObjectKeys = new Set(
-        transport.tasks.flatMap((t) => t.objects.map((o) => `${o.pgmid}:${o.type}:${o.name}`.toUpperCase())),
-      );
-      const requestOnly = (transport.requestObjects ?? []).filter(
-        (o) => !taskObjectKeys.has(`${o.pgmid}:${o.type}:${o.name}`.toUpperCase()),
-      );
-      const objects = rollupTransportObjects([
-        ...transport.tasks,
-        ...(requestOnly.length ? [{ id: transport.id, objects: requestOnly }] : []),
-      ]);
-      const offset = Math.max(0, Number(args.offset ?? 0) || 0);
-      const limit = Math.min(
-        clampSearchResults(args.limit as number | undefined, DEFAULT_DIFF_OBJECTS),
-        MAX_DIFF_OBJECTS,
-      );
-      // Stable order across pages: the transport is re-read per call, and SAP does not promise
-      // a fixed task/object sequence, so an unsorted slice could skip or repeat an object.
-      // Plain code-point comparison, NOT localeCompare — collation is ICU/locale dependent
-      // (da-DK sorts "AA" after "Z"), so two instances behind a load balancer would page
-      // differently. The key mirrors the rollup key so entries can never compare equal.
-      const sortKey = (o: LogicalTransportObject) => `${o.pgmid}:${o.type}:${o.name}`;
-      objects.sort((a, b) => (sortKey(a) < sortKey(b) ? -1 : sortKey(a) > sortKey(b) ? 1 : 0));
-      const page = objects.slice(offset, offset + limit);
-
-      // Match the request AND its tasks: version records reference the request on the systems
-      // verified so far, but matching both can only add correct matches, never remove one.
-      const transportIds = new Set<string>([transport.id, ...transport.tasks.map((t) => t.id)].filter(Boolean));
-
-      // Objects are independent reads; http.ts caps real concurrency via the shared Semaphore.
-      const diffs = await Promise.all(
-        page.map((object) =>
-          diffTransportObject(client, object, transportIds, { minimalErrors: config.minimalErrors }),
-        ),
-      );
-
-      return textResult(
-        toolJson({
-          transport: {
-            id: transport.id,
-            description: transport.description,
-            owner: transport.owner,
-            status: transport.status,
-          },
-          // One model for released and open transports alike: while a transport is open its
-          // objects are locked, so the active revision carries its id and matches the same way.
-          comparison: 'transport-correction-to-immediate-previous',
-          totalObjects: objects.length,
-          offset,
-          shown: page.length,
-          // parseTransportList only harvests objects nested under <tm:task>; a request whose
-          // objects sit at request level would otherwise read as "nothing changed".
-          ...(objects.length === 0 ? { note: 'This transport records no reviewable objects.' } : {}),
-          ...(offset + page.length < objects.length
-            ? { hint: `Showing ${page.length} of ${objects.length}. Next page: offset=${offset + page.length}.` }
-            : {}),
-          objects: diffs,
-        }),
-      );
-    }
+    case 'diff':
+      return handleTransportReview(client, args, config);
     case 'create': {
       const description = String(args.description ?? '');
       if (!description) return errorResult('Description is required for "create" action.');
       // Distinguish "target omitted" from "target present but empty": an explicit but
       // blank target is a caller mistake, not a request to use the package/layer path.
+      const requestType = args.requestType === 'W' ? 'W' : 'K';
       const targetProvided = args.target !== undefined && args.target !== null;
       const explicitTarget = targetProvided ? String(args.target).trim() : undefined;
-      if (targetProvided && !explicitTarget) {
+      if (requestType === 'K' && targetProvided && !explicitTarget) {
         return errorResult(
           '"target" was provided but is empty. Pass a transport target — a system (C11), ' +
             'system.client (C11.021), or target group (/GROUP/) — or omit target to let SAP resolve it from the package.',
@@ -344,14 +279,17 @@ export async function handleSAPTransport(
 
       // Shared guidance when this release's ADT stack can't set an explicit target.
       const targetUnsupportedMsg =
-        "This system's ADT stack does not support setting an explicit transport target — the tm:root/newrequest " +
-        'action is not implemented (an ADT-framework limitation on SAP_BASIS 7.50, verified on SP02 and SP32, ' +
-        'independent of STMS/CTC config). It works on newer ABAP Platform / S/4HANA releases. Workaround here: ' +
-        'create the request without "target", then set the Transportziel manually in SE09/SE10 (SAP GUI), which ' +
-        'works when CTC and the target group are configured.';
+        requestType === 'W'
+          ? 'This system cannot create Customizing requests through ADT. Create the request in SE09/SE10.'
+          : "This system's ADT stack does not support setting an explicit transport target — the tm:root/newrequest " +
+            'action is not implemented (an ADT-framework limitation on SAP_BASIS 7.50, verified on SP02 and SP32, ' +
+            'independent of STMS/CTC config). It works on newer ABAP Platform / S/4HANA releases. Workaround here: ' +
+            'create the request without "target", then set the Transportziel manually in SE09/SE10 (SAP GUI), which ' +
+            'works when CTC and the target group are configured.';
 
       let id: string;
-      if (explicitTarget) {
+      const newRequest = Boolean(explicitTarget) || requestType === 'W';
+      if (newRequest) {
         // Discovery-gate first — the same capability SAP's own Eclipse client checks: the TM
         // resource that sets an explicit target is advertised in ADT discovery only on releases
         // that implement it (the transportorganizer Accept type on cts/transportrequests). When
@@ -369,8 +307,9 @@ export async function handleSAPTransport(
             client.http,
             client.safety,
             description,
-            explicitTarget,
+            explicitTarget ?? '',
             client.username,
+            requestType,
           );
         } catch (err) {
           if (err instanceof AdtApiError && (err.statusCode === 400 || err.statusCode === 404)) {
@@ -411,15 +350,35 @@ export async function handleSAPTransport(
       const target = created?.target?.trim() ?? '';
       const targetDesc = created?.targetDesc?.trim() ?? '';
 
-      if (!created) return textResult(`Created transport request: ${id}`);
-      if (target) {
+      const tasks = !newRequest
+        ? ''
+        : !created
+          ? '\nTask count unavailable.'
+          : `\nTasks: ${created.tasks.length}${created.tasks.length === 0 ? '. No task was created.' : ''}`;
+      const heading = `Created transport request: ${id}${tasks}`;
+
+      // Only a Customizing create is verified; a Workbench create keeps its result whatever the read-back reports.
+      if (requestType === 'W') {
+        if (created?.type !== 'W')
+          return errorResult(
+            (created?.type
+              ? `SAP created transport request ${id} with type ${created.type}. Requested type was W.`
+              : `SAP created transport request ${id}, but its type could not be verified.`) + tasks,
+          );
         return textResult(
-          `Created transport request: ${id}\nTransport target: ${target}${targetDesc ? ` (${targetDesc})` : ''}`,
+          `${heading}\nRequest type: W (Customizing)\nTransport target: ${target || '<none> (local)'}${targetDesc ? ` (${targetDesc})` : ''}`,
         );
       }
+      if (!created) return textResult(heading);
+      if (target) {
+        return textResult(`${heading}\nTransport target: ${target}${targetDesc ? ` (${targetDesc})` : ''}`);
+      }
+      const local = `${heading}\nTransport target: <none>${targetDesc ? ` — "${targetDesc}"` : ''}. This is a LOCAL request — it cannot be transported onward.`;
+      if ((config.systemType === 'auto' ? getCachedFeatures()?.systemType : config.systemType) === 'btp')
+        return textResult(`${local}\nUse SAPTransport(action="targets") to list available transport targets.`);
       return textResult(
-        `Created transport request: ${id}\n` +
-          `Transport target: <none>${targetDesc ? ` — "${targetDesc}"` : ''}. This is a LOCAL request — it cannot be transported onward.\n\n` +
+        local +
+          '\n\n' +
           'To create a request that targets another system, either:\n' +
           '  • set an explicit target — pass target=<system | system.client | /group/> (e.g. target="/TRG/" or "C11"); ' +
           'the group and system.client forms require extended transport control (CTC) to be active; or\n' +
@@ -583,13 +542,14 @@ export async function handleSAPTransport(
       if (!objectType || !objectName) return errorResult('"type" and "name" are required for "check" action.');
       if (!pkg) return errorResult('"package" is required for "check" action.');
 
+      const operation = args.operation === 'modify' ? 'modify' : 'create';
       const objectUrl = await resolveTransportObjectUrl(
         client,
         objectType,
         objectName,
         args.group as string | undefined,
+        operation === 'create',
       );
-      const operation = args.operation === 'modify' ? 'modify' : 'create';
       const info = await getTransportInfo(
         client.http,
         client.safety,
@@ -597,6 +557,8 @@ export async function handleSAPTransport(
         pkg,
         operation === 'create' ? 'I' : '',
       );
+      if (info.lockedTransportAmbiguous || (info.lockedTasks.length > 0 && !info.lockedTransport))
+        return errorResult('SAP returned ambiguous CTS lock holders. Inspect the object in CTS before editing.');
       const transportRequired = !info.isLocal && (info.recording || Boolean(info.lockedTransport));
       const transportAssignmentRequired = !info.isLocal && info.recording && !info.lockedTransport;
       const candidateLimit = clampSearchResults(args.maxResults as number | undefined, DEFAULT_TRANSPORT_CHECK_RESULTS);
@@ -656,36 +618,60 @@ export async function handleSAPTransport(
       );
       const primary = await getObjectTransports(client.http, client.safety, objectUrl);
       let candidateTransports = primary.candidateTransports;
+      let lockedTransport = primary.lockedTransport;
+      let relatedTransports = primary.relatedTransports;
+      let lockStatusUnknown = false;
 
       // Fallback: if per-object transport lookup is empty, derive the package via
       // the object metadata endpoint and ask transportchecks for candidate transports.
       if (primary.relatedTransports.length === 0 && candidateTransports.length === 0) {
         try {
           const pkg = await client.resolveObjectPackage(objectUrl);
-          if (pkg && pkg !== '$TMP') {
+          if (!pkg) lockStatusUnknown = true;
+          else if (pkg !== '$TMP') {
             const info = await getTransportInfo(client.http, client.safety, objectUrl, pkg, '');
             candidateTransports = info.existingTransports;
+            // transportchecks reports locks (incl. other users') that /transports omitted.
+            if (info.lockedTransportAmbiguous || (info.lockedTasks.length > 0 && !info.lockedTransport)) {
+              lockStatusUnknown = true;
+            } else if (info.lockedTransport) {
+              lockedTransport = info.lockedTransport;
+              const owner = info.lockedTransportOwner ?? '';
+              relatedTransports = [
+                {
+                  id: info.lockedTransport,
+                  description: candidateTransports.find((t) => t.id === info.lockedTransport)?.description ?? '',
+                  owner,
+                  status: 'D',
+                },
+              ];
+            } else if (info.result !== 'S') {
+              lockStatusUnknown = true;
+            }
           }
         } catch {
-          // best-effort-fallback
+          lockStatusUnknown = true;
         }
       }
 
-      const lockOwner = primary.relatedTransports[0]?.owner;
+      const lockOwner = relatedTransports[0]?.owner;
       const candidateTotal = candidateTransports.length;
       const candidateLimit = clampSearchResults(args.maxResults as number | undefined, DEFAULT_TRANSPORT_RESULTS);
       const boundedCandidates = candidateTransports.slice(0, candidateLimit);
       const candidateTruncated = candidateTotal > boundedCandidates.length;
-      const summary = primary.lockedTransport
-        ? `Object ${objectName} is locked in transport ${primary.lockedTransport}${lockOwner ? ` by ${lockOwner}` : ''}.`
-        : candidateTotal > 0
-          ? `Object ${objectName} has no active lock; ${candidateTotal} transport(s) available for assignment.`
-          : `Object ${objectName} has no current lock or assignment candidates.`;
+      const summary = lockStatusUnknown
+        ? `The current CTS lock for ${objectName} could not be verified. Inspect it in CTS before editing.`
+        : lockedTransport
+          ? `Object ${objectName} is locked in transport ${lockedTransport}${lockOwner ? ` by ${lockOwner}` : ''}.`
+          : candidateTotal > 0
+            ? `Object ${objectName} has no active lock; ${candidateTotal} transport(s) available for assignment.`
+            : `Object ${objectName} has no current lock or assignment candidates.`;
 
       const history: ObjectTransportHistory = {
         object: { type: objectType, name: objectName, uri: objectUrl },
-        ...(primary.lockedTransport ? { lockedTransport: primary.lockedTransport } : {}),
-        relatedTransports: primary.relatedTransports,
+        ...(lockedTransport ? { lockedTransport } : {}),
+        ...(lockStatusUnknown ? { lockStatusUnknown: true } : {}),
+        relatedTransports,
         candidateTransports: boundedCandidates,
         candidateTotal,
         candidateTruncated,

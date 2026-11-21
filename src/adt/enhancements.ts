@@ -12,11 +12,21 @@
  * 2. The ENHO resource has NO `/source/main`. A source plug-in's coding is served by the
  *    ENHANCED object: `{objectUri}/source/main/enhancements?context={mainProgramUri}`, with the
  *    ABAP itself base64-encoded in `<enh:source>`.
+ *
+ * ENHO read routing covers XHB BAdIs, XHH source plug-ins, the legacy/generic XH route, the VIT
+ * workbench wrapper for metadata and the enhancement include's revision feed for source.
  */
 
+import { XMLValidator } from 'fast-xml-parser';
 import type { AdtClient } from './client.js';
-import { AdtApiError, AdtError } from './errors.js';
+import { enhancementIncludeName, readEnhancementIncludeRevision } from './enhancement-include.js';
+import { withFilterConditions } from './enho-filter.js';
+import { AdtApiError, AdtError, extractExceptionType } from './errors.js';
+import { detectAbapRelease } from './features.js';
 import type { AdtHttpClient } from './http.js';
+import type { AdtRequestOptions } from './http-deadline.js';
+import { parseReleaseNumber } from './release.js';
+import { RevisionHistoryError } from './revision-feed.js';
 import { checkOperation, OperationType } from './safety.js';
 import type {
   EnhancementImplementationInfo,
@@ -156,8 +166,11 @@ export function parseEnhancementImplementation(xml: string): EnhancementImplemen
   // For a source plug-in (ENHO/XH) that is the enhanced include, with mainObjectReference
   // naming its main program — exactly the (uri, context) pair the enhancement feed needs.
   const referencedObject = findDeepNodes(contentCommon, 'referencedObject')[0] ?? {};
-  const enhancedObject = toEnhancementObjectRef(referencedObject.objectReference);
-  const mainObject = toEnhancementObjectRef(referencedObject.mainObjectReference);
+  // A BAdI implementation's usage is its enhancement spot, not an enhanced object.
+  const referenced = toEnhancementObjectRef(referencedObject.objectReference);
+  const isSpot = referenced?.type.toUpperCase().startsWith('ENHS') ?? false;
+  const enhancedObject = isSpot ? undefined : referenced;
+  const mainObject = isSpot ? undefined : toEnhancementObjectRef(referencedObject.mainObjectReference);
 
   return {
     name: String(objectData['@_name'] ?? ''),
@@ -591,31 +604,147 @@ export async function resolveAnchorFeedTargets(
 }
 
 /**
- * Read an enhancement implementation: collection candidates first, workbench wrapper as the
- * last resort. Kept here rather than in the client facade so the whole release-quirk story for
- * enhancements lives in one file.
- */
-/**
  * ADT route per ENHO subtype. `enhoxhh` is the HOOK representation: where a release serves it, its
  * `hookImplementation` entries carry the `overwrite` flag per method — the only ADT source for
  * "replaces the SAP implementation" versus "runs around it".
  */
-const SUBTYPE_ROUTES = {
+const ROUTES = {
   'ENHO/XHB': ['enhoxhb', 'application/vnd.sap.adt.enh.enhoxhb.v4+xml'],
   'ENHO/XHH': ['enhoxhh', 'application/vnd.sap.adt.enh.enhoxhh.v3+xml'],
   'ENHO/XH': ['enhoxh', 'application/vnd.sap.adt.enh.enho.v1+xml'],
 } as const;
-type EnhancementSubtype = keyof typeof SUBTYPE_ROUTES;
+type Subtype = keyof typeof ROUTES;
 
 /**
  * Statuses that mean "wrong subtype or wrong representation" and may be re-routed. Reading the
- * wrong collection is not always a clean 404: SAP also answers 400 with a transformation error and
- * 500 when the representation handler is missing. Auth and network failures must never reroute.
+ * wrong collection is not always a clean 404: SAP also answers 400 with a transformation error,
+ * 406/415 for a representation it does not serve and 500 when the representation handler is
+ * missing. Auth, throttling and network failures must never reroute.
  */
-const REROUTE_STATUS = [400, 404, 406, 415, 500];
+const REROUTE_STATUSES = [400, 404, 406, 415, 500];
 
-const subtypePath = (subtype: EnhancementSubtype, name: string) =>
-  `/sap/bc/adt/enhancements/${SUBTYPE_ROUTES[subtype][0]}/${encodeURIComponent(name)}`;
+/** Release-scoped wire evidence; an arbitrary server error never authorizes a source fallback. */
+export function enhancementSourceUnavailable(error: unknown, release?: string): boolean {
+  if (!(error instanceof AdtApiError)) return false;
+  if (error.statusCode === 404) return true;
+  if (error.statusCode !== 500) return false;
+  const body = error.responseBody ?? '';
+  const type = extractExceptionType(body);
+  if (type === 'ExceptionResourceReadFailure') return true;
+  if (parseReleaseNumber(release) === 750 && type === 'ExceptionInternalServerError')
+    return /Enhancement technology (?:CLASENH|HOOK_IMPL) is not supported yet\./.test(body);
+  return (
+    parseReleaseNumber(release) === 758 &&
+    type === undefined &&
+    /<span id="msgText">Dereferencing of the NULL reference\s*<\/span>/.test(body)
+  );
+}
+
+/** Read one already discovered ENHO at its exact subtype, with an explicitly active representation. */
+export async function readActiveClassEnhancementSource(
+  client: Pick<AdtClient, 'http' | 'safety' | 'getRevisions' | 'getRevisionSource'>,
+  identity: { name: string; type: string },
+  request: AdtRequestOptions,
+  expectedOwners: ReadonlyArray<{ name: string; type: string; uri: string }>,
+  release?: string,
+): Promise<EnhancementImplementationInfo | undefined> {
+  checkOperation(client.safety, OperationType.Read, 'GetEnhancementImplementation');
+  if (!expectedOwners.length) throw new RevisionHistoryError();
+  const include = enhancementIncludeName(identity.name);
+  if (identity.type !== 'ENHO/XH' && identity.type !== 'ENHO/XHH')
+    throw new AdtError('No qualified class enhancement source provider for this native type.');
+  const readGeneratedSource = async (): Promise<EnhancementImplementationInfo | undefined> => {
+    const read = await readEnhancementIncludeRevision(client, include, { ...request, version: 'active' });
+    if (!read) return undefined;
+    return {
+      name: identity.name,
+      description: '',
+      package: '',
+      technology: '',
+      badiImplementations: [],
+      source: read.source,
+      enhancementInclude: { name: read.include, revision: read.revision },
+      note: 'Generated active include revision; technology and runtime switch applicability remain unknown.',
+    };
+  };
+  // The owning-class relation already established this identity. On 758 the generic serializer
+  // dumps for class enhancements; use the labelled source representation without probing it first.
+  if (identity.type === 'ENHO/XH' && parseReleaseNumber(release) === 758) return readGeneratedSource();
+  const [collection, accept] = ROUTES[identity.type];
+  const path = `/sap/bc/adt/enhancements/${collection}/${encodeURIComponent(identity.name.toLowerCase())}`;
+  try {
+    const xml = (await client.http.get(`${path}?version=active`, { Accept: accept }, request)).body;
+    if (/<!DOCTYPE|<!ENTITY/i.test(xml) || XMLValidator.validate(xml) !== true) throw new RevisionHistoryError();
+    const document = parseXml(xml);
+    const metadata = (document.enhancement ?? document.objectData) as Record<string, unknown> | undefined;
+    if (metadata?.['@_version'] && metadata['@_version'] !== 'active') throw new RevisionHistoryError();
+    let result: EnhancementImplementationInfo;
+    try {
+      result = parseEnhancementMetadata(xml);
+    } catch {
+      throw new RevisionHistoryError();
+    }
+    if (result.name.toUpperCase() !== identity.name.toUpperCase()) throw new RevisionHistoryError();
+    if (
+      result.enhancedObject &&
+      !expectedOwners.some(
+        (owner) =>
+          (result.enhancedObject!.uri === owner.uri ||
+            (owner.type === 'ENHO/XHH' && result.enhancedObject!.uri === `${owner.uri}/source/main`)) &&
+          result.enhancedObject!.type === owner.type &&
+          result.enhancedObject!.name.toUpperCase() === owner.name.toUpperCase(),
+      )
+    )
+      throw new RevisionHistoryError();
+    if (identity.type === 'ENHO/XHH')
+      result.source = (
+        await client.http.get(`${path}/source/main?version=active`, { Accept: 'text/plain' }, request)
+      ).body;
+    return result;
+  } catch (error) {
+    // This path is only for a known class-bound ENHO. Never search/reroute on an unexpected failure.
+    if (request.attemptBudget?.authorizationFailureObserved || !enhancementSourceUnavailable(error, release))
+      throw error;
+    const read = await readGeneratedSource();
+    if (!read) throw error;
+    return read;
+  }
+}
+
+/** Active source when ENHO metadata is unavailable or unsafe; undefined lets the caller explain the missing source. */
+async function readGeneratedEnhancementSource(
+  client: Pick<AdtClient, 'safety' | 'getRevisions' | 'getRevisionSource'>,
+  name: string,
+  attempted: string[],
+): Promise<EnhancementImplementationInfo | undefined> {
+  const include = enhancementIncludeName(name);
+  attempted.push(`programs/includes/${include}/source/main/versions`);
+  let read: Awaited<ReturnType<typeof readEnhancementIncludeRevision>>;
+  try {
+    read = await readEnhancementIncludeRevision(client, include);
+  } catch (error) {
+    if (error instanceof RevisionHistoryError) return undefined;
+    if (error instanceof AdtApiError && REROUTE_STATUSES.includes(error.statusCode)) return undefined;
+    throw error;
+  }
+  if (!read) return undefined;
+  return {
+    name,
+    description: '',
+    package: '',
+    // Source-code plug-ins and class enhancements both store `ENHANCEMENT n` blocks here; the include
+    // does not identify the technology, so it is left empty rather than guessed.
+    technology: '',
+    badiImplementations: [],
+    source: read.source,
+    enhancementInclude: { name: read.include, revision: read.revision },
+    note:
+      'Source is the active revision of its enhancement include; direct enhancement metadata is unavailable. ' +
+      'Technology (source-code plug-in or class enhancement), ' +
+      'description, package, enhanced object, hook positions and switch state are not available here — ' +
+      'use SE19/SE80 or Eclipse for them.',
+  };
+}
 
 /**
  * Parse an ENHO representation, whichever root its subtype serves.
@@ -626,7 +755,9 @@ const subtypePath = (subtype: EnhancementSubtype, name: string) =>
  */
 export function parseEnhancementMetadata(xml: string): EnhancementImplementationInfo {
   const parsed = parseXml(xml);
-  if (parsed.objectData && typeof parsed.objectData === 'object') return parseEnhancementImplementation(xml);
+  if (parsed.objectData && typeof parsed.objectData === 'object') {
+    return withFilterConditions(parsed, parseEnhancementImplementation(xml));
+  }
   const root = parsed.enhancement as Record<string, unknown> | undefined;
   if (!root || typeof root !== 'object' || Array.isArray(root)) {
     throw new AdtError('Invalid ENHO metadata: expected objectData or enhancement.');
@@ -635,7 +766,7 @@ export function parseEnhancementMetadata(xml: string): EnhancementImplementation
   const common = (root.contentCommon ?? {}) as Record<string, unknown>;
   const specific = (root.contentSpecific ?? {}) as Record<string, unknown>;
   const hook = (specific.hookTechnology ?? {}) as Record<string, unknown>;
-  const enhanced = toEnhancementObjectRef(hook.enhancedObject);
+  const enhanced = toEnhancementObjectRef(hook.enhancedObject) ?? { name: '', type: '', uri: '' };
   return {
     name: String(root['@_name'] ?? ''),
     description: decodeXmlEntities(String(root['@_description'] ?? '')),
@@ -643,7 +774,7 @@ export function parseEnhancementMetadata(xml: string): EnhancementImplementation
     technology: String(common['@_toolType'] ?? ''),
     switchSupported: String(common['@_switchSupported'] ?? '') === 'true',
     badiImplementations: [],
-    ...(enhanced ? { enhancedObject: enhanced } : {}),
+    enhancedObject: enhanced,
     hookImplementations: getNestedArray(specific, 'hookTechnology', 'hookImplementation').map((item) => ({
       id: String(item['@_id'] ?? ''),
       spotName: String(item['@_spotname'] ?? ''),
@@ -659,28 +790,19 @@ export function parseEnhancementMetadata(xml: string): EnhancementImplementation
   };
 }
 
-/**
- * Ask the object directory which subtype this enhancement actually is — more reliable than
- * guessing, because SAP's error status does not identify the right collection.
- */
-async function resolveEnhancementSubtype(
-  client: Pick<AdtClient, 'searchObject'>,
+/** Reduced metadata from the VIT workbench wrapper, or undefined when the wrapper fails as well. */
+async function readWorkbenchEnhancementMetadata(
+  http: AdtHttpClient,
   name: string,
-): Promise<EnhancementSubtype | undefined> {
-  const matches = await client.searchObject(name, 100, 'ENHO');
-  const subtypes = new Set(
-    matches
-      .filter(
-        (m) =>
-          m.objectName.toUpperCase() === name.toUpperCase() ||
-          // 7.50 decorates names with a display label; the relative object URI still identifies it.
-          (Object.hasOwn(SUBTYPE_ROUTES, m.objectType) &&
-            m.uri.toUpperCase() === subtypePath(m.objectType as EnhancementSubtype, name).toUpperCase()),
-      )
-      .map((m) => m.objectType),
-  );
-  const subtype = subtypes.size === 1 ? [...subtypes][0] : undefined;
-  return subtype && Object.hasOwn(SUBTYPE_ROUTES, subtype) ? (subtype as EnhancementSubtype) : undefined;
+  attempted: string[],
+): Promise<EnhancementImplementationInfo | undefined> {
+  attempted.push(`vit/wb/object_type/${ENHO_WORKBENCH_TYPE}`);
+  try {
+    const { body, uri } = await fetchEnhancementMetadataViaWorkbench(http, name, ENHO_WORKBENCH_TYPE);
+    return { ...parseWorkbenchEnhancementMetadata(body), uri };
+  } catch {
+    return undefined;
+  }
 }
 
 /**
@@ -690,24 +812,25 @@ async function resolveEnhancementSubtype(
  * which subtype this is, because SAP's status does not identify the right collection. A search
  * failure propagates deliberately — it tells the caller that read permission alone is not enough.
  *
- * ARC-1 adds one fallback on top: NW 7.50 had no enhancement editor before 7.53, and its only
- * collection answers 500 for the tool types that editor owned — HOOK_IMPL and CLASENH. BADI_IMPL
- * is served normally there (live-verified), so the fallback is not a blanket release rule and
- * must stay keyed on the status, never on the release. Where it does trigger, the VIT workbench
- * wrapper still returns reduced metadata, which beats no answer at all. The original error is
- * preserved if that fails too.
+ * Where the generic route cannot serve the object (NW 7.50 had no enhancement editor before 7.53
+ * and answers 500 for HOOK_IMPL and CLASENH; 758 dumps on class enhancements), the source comes
+ * from the enhancement include's revision feed. A 500 that no other route answered falls back to
+ * the VIT workbench wrapper, which still serves reduced metadata.
+ * The original error is preserved if every fallback fails.
  */
 export async function readEnhancementImplementation(
-  client: Pick<AdtClient, 'http' | 'safety' | 'searchObject'>,
+  client: Pick<AdtClient, 'http' | 'safety' | 'searchObject' | 'getRevisions' | 'getRevisionSource'>,
   name: string,
+  release?: string,
 ): Promise<EnhancementImplementationInfo> {
   checkOperation(client.safety, OperationType.Read, 'GetEnhancementImplementation');
   const attempted: string[] = [];
-  const read = async (subtype: EnhancementSubtype): Promise<EnhancementImplementationInfo> => {
-    const [collection, accept] = SUBTYPE_ROUTES[subtype];
+  const pathFor = (subtype: Subtype) => `/sap/bc/adt/enhancements/${ROUTES[subtype][0]}/${encodeURIComponent(name)}`;
+  const read = async (subtype: Subtype): Promise<EnhancementImplementationInfo> => {
+    const [collection, accept] = ROUTES[subtype];
     attempted.push(collection);
     // Construct only known endpoints. Repository/source links are data, never request URLs.
-    const path = subtypePath(subtype, name);
+    const path = pathFor(subtype);
     const result: EnhancementImplementationInfo = {
       ...parseEnhancementMetadata((await client.http.get(path, { Accept: accept })).body),
       uri: path,
@@ -716,28 +839,72 @@ export async function readEnhancementImplementation(
       result.source = (await client.http.get(`${path}/source/main`, { Accept: 'text/plain' })).body;
     return result;
   };
-
+  const findSubtype = async (): Promise<Subtype | undefined> => {
+    const matches = await client.searchObject(name, 100, 'ENHO');
+    const subtypes = new Set(
+      matches
+        .filter(
+          (m) =>
+            m.objectName.toUpperCase() === name.toUpperCase() ||
+            // 7.50 decorates names with a display label; its exact relative object URI still identifies the object.
+            (Object.hasOwn(ROUTES, m.objectType) &&
+              m.uri.toUpperCase() === pathFor(m.objectType as Subtype).toUpperCase()),
+        )
+        .map((m) => m.objectType),
+    );
+    const subtype = subtypes.size === 1 ? [...subtypes][0] : undefined;
+    return subtype && Object.hasOwn(ROUTES, subtype) ? (subtype as Subtype) : undefined;
+  };
+  // Public client callers and restricted startup probes can have no release yet. Resolve it as
+  // this caller before choosing a route; unavailable detection must never authorize a risky probe.
+  release ??= await detectAbapRelease(client.http, { deadline: Date.now() + 5000, retryTransientErrors: false });
+  const releaseNumber = parseReleaseNumber(release);
+  if (releaseNumber === 758 || releaseNumber === undefined) {
+    // On 758 even the wrong-subtype XHB probe dumps for a class enhancement.
+    const subtype = await findSubtype();
+    if (!subtype)
+      throw new AdtError(
+        `Repository search found no single ENHO subtype for ${name}. Check the name with SAPSearch; if it exists, inspect it in SE80/SE19.`,
+      );
+    if (subtype !== 'ENHO/XH') return read(subtype);
+    if (releaseNumber === undefined)
+      throw new AdtError(
+        'SAP did not report its ABAP release; the generic ENHO metadata route may dump. ' +
+          'Run SAPManage probe and retry, or configure SAP_ABAP_RELEASE for a single target.',
+      );
+    const source = await readGeneratedEnhancementSource(client, name, attempted);
+    if (source) return source;
+    throw new AdtError(
+      'Active enhancement include source is unavailable. Unsafe ENHO metadata was not requested on SAP 758. ' +
+        'Inspect the enhancement in SE80/SE19 or Eclipse.',
+    );
+  }
   try {
     try {
       return await read('ENHO/XHB');
     } catch (initial) {
       // These statuses include SAP's wrong-subtype transformation errors. Do not reroute auth or network failures.
-      if (!(initial instanceof AdtApiError) || !REROUTE_STATUS.includes(initial.statusCode)) throw initial;
-      const subtype = await resolveEnhancementSubtype(client, name);
+      if (!(initial instanceof AdtApiError) || !REROUTE_STATUSES.includes(initial.statusCode)) throw initial;
+      const subtype = await findSubtype();
       if (!subtype || subtype === 'ENHO/XHB') throw initial;
-      return await read(subtype);
+      try {
+        return await read(subtype);
+      } catch (generic) {
+        // Only the generic route has no source resource of its own; SAP fails there for source-code
+        // plug-ins on releases that advertise nothing else (750). Keep every other failure as it is.
+        if (subtype !== 'ENHO/XH' || !enhancementSourceUnavailable(generic, release)) throw generic;
+        const fallback = await readGeneratedEnhancementSource(client, name, attempted);
+        if (fallback) return fallback;
+        throw generic;
+      }
     }
   } catch (error) {
     // 7.50 dumps on the representation itself; the workbench wrapper answers with reduced metadata.
     if (error instanceof AdtApiError && error.statusCode === 500) {
-      try {
-        const { body, uri } = await fetchEnhancementMetadataViaWorkbench(client.http, name, ENHO_WORKBENCH_TYPE);
-        return { ...parseWorkbenchEnhancementMetadata(body), uri };
-      } catch {
-        // The wrapper is a consolation prize, not the request the caller made — report the real error.
-      }
+      const workbench = await readWorkbenchEnhancementMetadata(client.http, name, attempted);
+      if (workbench) return workbench;
     }
-    if (error instanceof AdtApiError && REROUTE_STATUS.includes(error.statusCode)) {
+    if (error instanceof AdtApiError && REROUTE_STATUSES.includes(error.statusCode)) {
       error.extraHint = `ENHO read attempted ${attempted.join(', ')}. If this enhancement cannot be exposed by ADT, inspect it in SAP GUI (SE80/SE19) or Eclipse's SAP GUI integration.`;
     }
     throw error;
@@ -761,7 +928,7 @@ export async function readEnhancementSpot(http: AdtHttpClient, name: string): Pr
  * refuses a deliberately mis-padded name with 500 as well: the status does NOT distinguish a
  * wrong name from a refused one, so never read it as "URL correct". REPOSRC is the authority.
  */
-export function enhancementIncludeName(enhancement: string, part: 0 | 1 = 0): string {
+export function enhancementPartIncludeName(enhancement: string, part: 0 | 1 = 0): string {
   const padded = enhancement.toUpperCase().padEnd(30, String.fromCharCode(61));
   return part === 0 ? padded + String.fromCharCode(69) : padded + String.fromCharCode(69, 73, 77, 80);
 }

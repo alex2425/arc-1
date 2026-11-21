@@ -21,6 +21,7 @@ import type { ResolvedFeatures } from '../../../src/adt/types.js';
 import { MemoryCache } from '../../../src/cache/memory.js';
 import { getToolRegistry } from '../../../src/handlers/dispatch.js';
 import { resetCachedFeatures, setCachedFeatures } from '../../../src/handlers/feature-cache.js';
+import { createQueryDefinition } from '../../../src/handlers/query-tool.js';
 import { getToolDefinitions } from '../../../src/handlers/tools.js';
 import { defineTool } from '../../../src/public/index.js';
 import { SYSTEM_LABEL_MAX_LENGTH } from '../../../src/server/config.js';
@@ -47,6 +48,7 @@ import {
   runStartupAuthPreflightWithClient,
   VERSION,
 } from '../../../src/server/server.js';
+import { NATIVE_NAVIGATION_INSTRUCTIONS } from '../../../src/server/server-instructions.js';
 import { DEFAULT_CONFIG } from '../../../src/server/types.js';
 
 type RequestHandler = (
@@ -110,7 +112,7 @@ describe('MCP Server', () => {
     const labeled = (await initializeServer({ ...DEFAULT_CONFIG, systemLabel: 'ERP production (read-only)' }))
       .instructions;
 
-    expect(baseline).toMatch(/^ARC-1 gives this SAP ABAP system/);
+    expect(baseline).toMatch(/^Use ARC-1 for SAP ABAP source/);
     expect(baseline).not.toContain('Connected SAP system:');
     expect(labeled).toBe(`Connected SAP system: ERP production (read-only).\n\n${baseline}`);
   });
@@ -136,6 +138,7 @@ describe('MCP Server', () => {
       expect(instructions).toContain('finish with observed source behavior and unverified intent/compliance');
       expect(instructions).toContain('Do not broaden the policy search');
       expect(instructions).toContain('Unavailable or failed syntax/ATC/test checks are not passes');
+      expect(instructions).toContain(NATIVE_NAVIGATION_INSTRUCTIONS);
     },
   );
 
@@ -144,6 +147,22 @@ describe('MCP Server', () => {
       await initializeServer({ ...DEFAULT_CONFIG, systemLabel: 'x'.repeat(SYSTEM_LABEL_MAX_LENGTH) })
     ).instructions;
     expect(instructions?.length).toBeLessThan(2_048);
+  });
+
+  it('advertises the SAP URI handler while retaining native-navigation identity and failure boundaries', () => {
+    const instructions = NATIVE_NAVIGATION_INSTRUCTIONS;
+    expect(instructions).toContain('VS Code on request: if available, use SAP ADT MCP');
+    expect(instructions).not.toContain('prefer ARC-1 links');
+    expect(instructions).not.toContain('abap:/flat');
+    // Preserve the returned URI when generating the outer query value. Downstream editor
+    // URL decoding is separate; the live acceptance only qualifies the tested characters.
+    expect(instructions).toContain(
+      'Link returned abap: URIs via vscode://sapse.adt-vscode/open?abapUri= + encodeURIComponent(exact URI)',
+    );
+    expect(instructions).toContain('Require user-confirmed destination for backend/client');
+    expect(instructions).toContain('Verify name/type/source, not .json');
+    expect(instructions).toContain('On mismatch/error stop; no resolver/bridge/destination retries');
+    expect(instructions).toContain('never edit/activate natively');
   });
 
   it('rejects an overlong system label even when ServerConfig is constructed directly', () => {
@@ -365,19 +384,62 @@ describe('MCP Server', () => {
   });
 
   it('keeps only query for sql-scoped users in hyperfocused mode', () => {
-    const tools = getToolDefinitions({
+    const config = {
       ...DEFAULT_CONFIG,
-      toolMode: 'hyperfocused',
+      toolMode: 'hyperfocused' as const,
       allowWrites: true,
       allowFreeSQL: true,
       allowTransportWrites: true,
-    });
-    const filtered = filterToolsByAuthScope(tools, ['sql']);
+    };
+    const tools = getToolDefinitions(config);
+    const filtered = filterToolsByAuthScope(tools, ['sql'], [], createQueryDefinition(config));
     const sap = filtered.find((tool) => tool.name === 'SAP');
     expect(sap).toBeDefined();
     const schema = sap!.inputSchema as Record<string, any>;
     const actionEnum: string[] = schema.properties.action.enum;
     expect(actionEnum).toEqual(['query']);
+  });
+
+  it.each([
+    { preview: false, sql: true, scopes: ['read', 'data'], deny: [], visible: false },
+    { preview: false, sql: true, scopes: ['sql'], deny: [], visible: true },
+    { preview: true, sql: false, scopes: ['data'], deny: [], visible: true },
+    { preview: true, sql: true, scopes: ['data'], deny: ['SAPQuery.sql'], visible: true },
+    { preview: true, sql: true, scopes: ['data'], deny: ['SAPQuery.long_text'], visible: true },
+    { preview: true, sql: true, scopes: ['data'], deny: ['SAPQuery.application_log'], visible: true },
+    {
+      preview: true,
+      sql: true,
+      scopes: ['data'],
+      deny: ['SAPQuery.long_text', 'SAPQuery.application_log'],
+      visible: false,
+    },
+    { preview: true, sql: true, scopes: ['admin'], deny: ['SAPQuery.*'], visible: false },
+    { preview: true, sql: true, scopes: ['admin'], deny: ['SAPQuery'], visible: false },
+    { preview: true, sql: true, scopes: ['admin'], deny: ['SAP.query'], visible: false },
+  ])(
+    'lists hyperfocused query only for usable concrete actions: %j',
+    async ({ preview, sql, scopes, deny, visible }) => {
+      const config = {
+        ...DEFAULT_CONFIG,
+        toolMode: 'hyperfocused' as const,
+        allowDataPreview: preview,
+        allowFreeSQL: sql,
+        denyActions: deny,
+      };
+      const server = createServer(config);
+      const handler = requestHandler(server, ListToolsRequestSchema.shape.method.value);
+      const result = await handler({ method: 'tools/list', params: {} }, { authInfo: { ...readAuth(), scopes } });
+      const sap = result.tools.find((tool: { name: string }) => tool.name === 'SAP');
+      expect(sap?.inputSchema.properties.action.enum.includes('query') ?? false).toBe(visible);
+      expect(sap?.description.includes('query') ?? false).toBe(visible);
+      await server.close();
+    },
+  );
+
+  it('fails closed for hyperfocused query when no concrete definition is supplied', () => {
+    const tools = getToolDefinitions({ ...DEFAULT_CONFIG, toolMode: 'hyperfocused', allowFreeSQL: true });
+    expect(filterToolsByAuthScope(tools, ['sql'])).toEqual([]);
   });
 
   it('passes explicit nullable-optionals mode through tools/list', async () => {
@@ -788,6 +850,31 @@ function writeCookieFixture(content: string): { file: string; cleanup: () => voi
 }
 
 describe('buildAdtConfig', () => {
+  it('gives every multi-target per-user client the pinned write barrier policy', () => {
+    const multiTargetWrite = {
+      target: 'A4H/001',
+      enabled: true,
+      allowedPackages: ['$TMP'],
+      allowedTransports: ['A4HK900001'],
+      serverAllowedTransports: [],
+    };
+    const client = new AdtClient(
+      buildAdtConfig(
+        {
+          ...DEFAULT_CONFIG,
+          url: 'http://sap.example.com:8000',
+          targetId: 'A4H/001',
+          multiTargetEndpoints: true,
+          multiTargetWrite,
+        },
+        undefined,
+        undefined,
+        { perUser: true },
+      ),
+    );
+    expect((client.http as unknown as { config: { pinnedWrite?: unknown } }).config.pinnedWrite).toBe(multiTargetWrite);
+  });
+
   it('includes username/password in shared config', () => {
     const cfg = buildAdtConfig({
       ...DEFAULT_CONFIG,

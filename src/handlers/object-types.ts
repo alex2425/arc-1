@@ -5,7 +5,7 @@
  * LLM arg-stripping, and class-include helpers.
  */
 
-import { SDO_REGISTRY } from '../adt/server-driven.js';
+import { SDO_REGISTRY, serverDrivenObjectUrl } from '../adt/server-driven.js';
 
 // ─── Object URL Mapping ──────────────────────────────────────────────
 
@@ -20,6 +20,7 @@ import { SDO_REGISTRY } from '../adt/server-driven.js';
 // Production callers should keep using normalizeObjectType().
 export const SLASH_TYPE_MAP: Record<string, string> = {
   'PROG/P': 'PROG', // docs/research/abap-types/types/prog.md
+  'PROG/PX': 'REPT', // program text pool — docs/research/abap-types/types/rept.md
   'PROG/I': 'INCL', // docs/research/abap-types/types/incl.md
   'CLAS/OC': 'CLAS', // docs/research/abap-types/types/clas.md
   // 'CLAS/LI' removed — invented; absent from Eclipse apidoc; no live ADT response
@@ -50,6 +51,7 @@ export const SLASH_TYPE_MAP: Record<string, string> = {
   'STRU/DS': 'TABL', // docs/research/abap-types/types/tabl.md (legacy alias)
   'DOMA/DD': 'DOMA', // docs/research/abap-types/types/doma.md
   'DTEL/DE': 'DTEL', // docs/research/abap-types/types/dtel.md
+  'SHLP/DH': 'SHLP', // metadata only — docs/research/abap-types/types/shlp.md
   'MSAG/N': 'MSAG', // docs/research/abap-types/types/msag.md
   'DEVC/K': 'DEVC', // docs/research/abap-types/types/devc.md
   // TRAN/T (was TRAN/O — invented). Live a4h + npl 2026-05-08 both return
@@ -59,6 +61,7 @@ export const SLASH_TYPE_MAP: Record<string, string> = {
   // adtcore:type="VIEW/DV" for V_USR_NAME.
   'VIEW/DV': 'VIEW', // docs/research/abap-types/types/view.md
   'SKTD/TYP': 'SKTD', // docs/research/abap-types/types/sktd.md
+  'SMBC/TYP': 'SMBC', // docs/research/abap-types/types/smbc.md
   'TTYP/DA': 'TTYP', // docs/research/abap-types/types/ttyp.md — live a4h 758 + 816 return adtcore:type="TTYP/DA"
   'ENQU/DL': 'ENQU', // docs/research/abap-types/types/enqu.md — live 758 + 816 return adtcore:type="ENQU/DL"
 };
@@ -71,6 +74,7 @@ export const SLASH_TYPE_MAP: Record<string, string> = {
  */
 export const SLASH_TYPE_EVIDENCE: Record<string, string> = {
   'PROG/P': 'docs/research/abap-types/types/prog.md',
+  'PROG/PX': 'docs/research/abap-types/types/rept.md',
   'PROG/I': 'docs/research/abap-types/types/incl.md',
   'CLAS/OC': 'docs/research/abap-types/types/clas.md',
   'INTF/OI': 'docs/research/abap-types/types/intf.md',
@@ -87,11 +91,13 @@ export const SLASH_TYPE_EVIDENCE: Record<string, string> = {
   'STRU/DS': 'docs/research/abap-types/types/tabl.md',
   'DOMA/DD': 'docs/research/abap-types/types/doma.md',
   'DTEL/DE': 'docs/research/abap-types/types/dtel.md',
+  'SHLP/DH': 'docs/research/abap-types/types/shlp.md',
   'MSAG/N': 'docs/research/abap-types/types/msag.md',
   'DEVC/K': 'docs/research/abap-types/types/devc.md',
   'TRAN/T': 'docs/research/abap-types/types/tran.md',
   'VIEW/DV': 'docs/research/abap-types/types/view.md',
   'SKTD/TYP': 'docs/research/abap-types/types/sktd.md',
+  'SMBC/TYP': 'docs/research/abap-types/types/smbc.md',
   'TTYP/DA': 'docs/research/abap-types/types/ttyp.md',
   'ENQU/DL': 'docs/research/abap-types/types/enqu.md',
 };
@@ -110,7 +116,9 @@ const FRIENDLY_TYPE_ALIAS_MAP: Record<string, string> = {
  * guard prevents from reoccurring.
  */
 export const KNOWN_BASE_TYPES = new Set([
+  'SHLP',
   'PROG',
+  'REPT',
   'CLAS',
   'INTF',
   'INCL',
@@ -123,6 +131,7 @@ export const KNOWN_BASE_TYPES = new Set([
   'SRVB',
   'DDLX',
   'TABL',
+  'TABL/DTT',
   'DOMA',
   'DTEL',
   'MSAG',
@@ -130,8 +139,12 @@ export const KNOWN_BASE_TYPES = new Set([
   'TRAN',
   'VIEW',
   'SKTD',
+  'SMBC',
+  'SOD1',
+  'SOD2',
   'TTYP',
   'ENQU',
+  'ENHO',
 ]);
 
 /** Normalize ADT type codes and aliases to ARC-1 canonical short types. */
@@ -269,13 +282,26 @@ export function normalizeTypeArgsForValidation(
         ...cleaned,
         type: normalizeObjectType(String(cleaned.type ?? '')),
         objectType:
-          cleaned.objectType === undefined ? undefined : normalizeObjectType(String(cleaned.objectType ?? '')),
+          cleaned.objectType === undefined
+            ? undefined
+            : normalizeObjectType(String(cleaned.type ?? '')) === 'DEVC' && cleaned.packageScope === 'direct'
+              ? String(cleaned.objectType).trim().toUpperCase()
+              : normalizeObjectType(String(cleaned.objectType)),
       };
+    case 'SAPManage':
+      // Strict-schema clients populate optional fields on unrelated actions and revoke.
+      // Only a release consumes this selection; keep [] meaningful there.
+      if (cleaned.action !== 'set_api_state' || cleaned.apiState === 'NOT_RELEASED') delete cleaned.apiVisibility;
+      return cleaned;
     case 'SAPWrite': {
       const action = String(cleaned.action ?? '');
       // A text-pool PUT replaces the selected part; an explicit empty string clears it.
       // Null/omitted source remains a missing-source error; other actions keep normal stripping.
       if (action === 'edit_text_symbols' && typeof args.source === 'string') cleaned.source = args.source;
+      if (action === 'edit_content') {
+        if (typeof args.oldContent === 'string') cleaned.oldContent = args.oldContent;
+        if (typeof args.newContent === 'string') cleaned.newContent = args.newContent;
+      }
       // SAPWrite preserves TABL/DT and TABL/DS so the create path can route by subtype.
       const normType = cleaned.type === undefined ? undefined : normalizeWriteObjectType(String(cleaned.type ?? ''));
       // Drop an inapplicable `include`: it is only meaningful for a CLAS local-include
@@ -328,19 +354,21 @@ export function normalizeTypeArgsForValidation(
         delete cleaned.depth;
         delete cleaned.expandPackages;
       }
-      // Only normalize `type` (for URL building). `objectType` is passed to SAP's
-      // where-used scope API in slash format (e.g., CLAS/OC) — normalizing it would break the filter.
+      // Only normalize `type` (for URL building). Keep `objectType` in slash format
+      // (e.g., CLAS/OC) for where-used filtering; normalizing it would lose the subtype.
       return {
         ...cleaned,
         type: cleaned.type === undefined ? undefined : normalizeObjectType(String(cleaned.type ?? '')),
       };
     case 'SAPDiagnose':
+      // Empty optional filter selections preserve the ordinary call, including strict-client filler.
+      if (Array.isArray(cleaned.filters) && cleaned.filters.length === 0) delete cleaned.filters;
       // Strict-schema clients may supply an empty placeholder on single-object
-      // or unrelated actions. An actual empty ATC batch remains a validation error.
+      // or unrelated actions. An actual empty ATC/syntax batch remains a validation error.
       if (
         Array.isArray(cleaned.objects) &&
         cleaned.objects.length === 0 &&
-        (cleaned.action !== 'atc' ||
+        (!['atc', 'syntax'].includes(String(cleaned.action)) ||
           cleaned.name !== undefined ||
           cleaned.type !== undefined ||
           cleaned.url !== undefined)
@@ -407,10 +435,17 @@ export function functionModuleObjectUrl(group: string, name: string): string {
 }
 
 export function objectBasePath(type: string): string {
+  if (normalizeObjectType(type) === 'SHLP') {
+    throw new Error('SHLP has a specialized metadata reader; generic source URLs and operations are unsupported.');
+  }
   if (Object.hasOwn(SDO_REGISTRY, type)) return `${SDO_REGISTRY[type as keyof typeof SDO_REGISTRY].href}/`;
   switch (type) {
+    case 'SMBC':
+      return '/sap/bc/adt/bct/smbctyp/';
     case 'PROG':
       return '/sap/bc/adt/programs/programs/';
+    case 'REPT':
+      return '/sap/bc/adt/textelements/programs/';
     case 'CLAS':
       return '/sap/bc/adt/oo/classes/';
     case 'INTF':
@@ -433,7 +468,7 @@ export function objectBasePath(type: string): string {
           `single base path — it requires the parent function group via ` +
           `client.getFunction(group, name) or an explicit /sap/bc/adt/functions/` +
           `groups/{group}/fmodules/{name} URI. Caller must take the FUNC-aware ` +
-          `path or pass 'uri' directly. See PR #223 codex follow-up.`,
+          `path and resolve the function group first. See PR #223 codex follow-up.`,
       );
     case 'INCL':
       return '/sap/bc/adt/programs/includes/';
@@ -456,6 +491,8 @@ export function objectBasePath(type: string): string {
       // Bare TABL defaults to transparent table. For reads, callers should use
       // AdtClient.resolveTablObjectUrl(name) which falls back to /structures/ on 404.
       return '/sap/bc/adt/ddic/tables/';
+    case 'TABL/DTT':
+      return '/sap/bc/adt/ddic/db/settings/';
     case 'TABL/DS':
       // DDIC structures only route through this collection; see follow-up to #285.
       return '/sap/bc/adt/ddic/structures/';
@@ -470,6 +507,10 @@ export function objectBasePath(type: string): string {
     case 'ENQU':
       // DDIC lock objects: XML metadata, no source/main. Live 8.16: docs/research/abap-types/types/enqu.md.
       return '/sap/bc/adt/ddic/lockobjects/sources/';
+    case 'ENHO':
+      // BAdI enhancement implementations (XHB), the only writable ENHO subtype. SAPRead routes
+      // XHH/XH itself (src/adt/enhancements.ts). docs/research/abap-types/types/enho.md.
+      return '/sap/bc/adt/enhancements/enhoxhb/';
     case 'MSAG':
       return '/sap/bc/adt/messageclass/';
     case 'DEVC':
@@ -487,6 +528,12 @@ export function objectBasePath(type: string): string {
       return '/sap/bc/adt/vit/wb/object_type/viewdv/object_name/';
     case 'SKTD':
       return '/sap/bc/adt/documentation/ktd/documents/';
+    case 'SOD1':
+      // API packages; Eclipse ADT 3.60 on 8.16. docs/research/abap-types/types/sod1.md.
+      return '/sap/bc/adt/aps/com/sod1/';
+    case 'SOD2':
+      // API package assignments; Eclipse ADT 3.60 on 8.16. docs/research/abap-types/types/sod2.md.
+      return '/sap/bc/adt/aps/com/sod2/';
     default:
       // Exhaustiveness guard: canonical types in KNOWN_BASE_TYPES MUST have a
       // switch case — that catches the silent-fallthrough bug class (VIEW pre-PR).
@@ -524,8 +571,9 @@ export function objectBasePath(type: string): string {
 
 /** Map object type + name to the ADT object URL used by CRUD/DevTools/etc. Name is URI-encoded. */
 export function objectUrlForType(type: string, name: string): string {
-  // KTD endpoints require lowercase object names in the URL path (confirmed via Eclipse ADT trace).
-  const effectiveName = type === 'SKTD' ? name.toLowerCase() : name;
+  if (type === 'TABL/DTI') return serverDrivenObjectUrl(type, name);
+  // KTD, SMBC, SOD1 and SOD2 use lowercase names in their verified ADT paths.
+  const effectiveName = ['SKTD', 'SMBC', 'SOD1', 'SOD2'].includes(type) ? name.toLowerCase() : name;
   return `${objectBasePath(type)}${encodeURIComponent(effectiveName)}`;
 }
 
@@ -536,15 +584,6 @@ export function inferObjectType(name: string): string {
   if (upper.startsWith('CL_') || upper.startsWith('ZCL_') || upper.startsWith('YCL_')) return 'CLAS';
   if (upper.startsWith('CX_') || upper.startsWith('ZCX_') || upper.startsWith('YCX_')) return 'CLAS';
   return '';
-}
-
-/**
- * Map object type + name to the ADT object URL WITHOUT encoding the name.
- * Used for API release state where the full URI is encoded as a single path segment by the caller.
- */
-export function objectUrlForTypeRaw(type: string, name: string): string {
-  const effectiveName = type === 'SKTD' ? name.toLowerCase() : name;
-  return `${objectBasePath(type)}${effectiveName}`;
 }
 
 /** Get the source URL for an object (appends /source/main) */

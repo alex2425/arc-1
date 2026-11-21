@@ -31,7 +31,8 @@ import { fetchDiscoveryDocument, resolveAcceptType } from './discovery.js';
 import { AdtApiError, AdtError } from './errors.js';
 import type { AdtHttpClient } from './http.js';
 import { checkOperation, OperationType, type SafetyConfig } from './safety.js';
-import type { ServerDrivenObjectResult } from './types.js';
+import { parseTableIndexName, TABLE_INDEX_COLLECTION, tableIndexParentUrl } from './table-index.js';
+import type { DiscoveryMap, ServerDrivenObjectResult } from './types.js';
 import { escapeXmlAttr, parseServerDrivenMetadata, parseXml } from './xml-parser.js';
 
 /** Registry entry for a curated server-driven object type. */
@@ -75,6 +76,13 @@ export interface SdoRegistryEntry {
    * application/json. Live-verified per type on 816.
    */
   sourceFormat: SdoSourceFormat;
+  /** Object URLs use the lower-case name (SAP's own clients address these types in lower case). */
+  lowercaseName?: true;
+  /**
+   * Check source against the schema SAP serves (`<object>/schema`, before a create `<collection>/$new/schema`)
+   * before saving, because SAP drops invalid values silently.
+   */
+  schemaCheck?: true;
 }
 
 /** AFF JSON body vs plain DDL text. Required per entry — a wrong guess is a hard 415 from SAP. */
@@ -112,6 +120,11 @@ export function serverDrivenSourceContentType(code: string): string {
   }
 }
 
+/** True when creates and updates of the type are checked against SAP's object schema first. */
+export function serverDrivenSchemaCheck(code: string): boolean {
+  return sdoEntry(code).schemaCheck === true;
+}
+
 /** Declared source flavor for a registered type (drives the client-side JSON parse gate). */
 export function serverDrivenSourceFormat(code: string): SdoSourceFormat {
   return sdoEntry(code).sourceFormat;
@@ -137,6 +150,10 @@ export const SDO_TYPES = [
   'APLO',
   'SAJC',
   'SAJT',
+  'RONT',
+  'NONT',
+  'TABL/DTI',
+  'SMBC',
 ] as const;
 
 /** Curated registry of high-value server-driven object types — keys are exactly SDO_TYPES. */
@@ -259,6 +276,46 @@ export const SDO_REGISTRY = {
     ...BLUE_METADATA,
     sourceFormat: 'json',
   },
+  // SAP object type and its node types (RAP business object modeling): blues v2, AFF JSON source.
+  RONT: {
+    href: '/sap/bc/adt/businessobjects/rontrot',
+    label: 'SAP Object Type',
+    createType: 'RONT/ROT',
+    metadataContentType: BLUES_V2,
+    ...BLUE_METADATA,
+    sourceFormat: 'json',
+  },
+  NONT: {
+    href: '/sap/bc/adt/businessobjects/nontnot',
+    label: 'SAP Object Node Type',
+    createType: 'NONT/NOT',
+    metadataContentType: BLUES_V2,
+    ...BLUE_METADATA,
+    sourceFormat: 'json',
+  },
+  'TABL/DTI': {
+    href: TABLE_INDEX_COLLECTION,
+    label: 'Table secondary index',
+    createType: 'TABL/DTI',
+    metadataContentType: BLUES_V1,
+    ...BLUE_METADATA,
+    sourceFormat: 'json',
+    lowercaseName: true,
+  },
+  // Business Configuration Maintenance Object. Create, update and delete follow the blue pattern;
+  // discovery advertises no $new templates, but `$new/schema` answers. The smbc object generator
+  // remains the route when service and data model do not exist yet.
+  // Evidence: docs/research/abap-types/types/smbc.md
+  SMBC: {
+    href: '/sap/bc/adt/bct/smbctyp',
+    label: 'Business Configuration Maintenance Object',
+    createType: 'SMBC/TYP',
+    metadataContentType: BLUES_V1,
+    ...BLUE_METADATA,
+    sourceFormat: 'json',
+    lowercaseName: true,
+    schemaCheck: true,
+  },
 } satisfies Record<(typeof SDO_TYPES)[number], SdoRegistryEntry>;
 
 // String-indexed view of the registry for the unknown-code lookups below (the satisfies-typed
@@ -279,7 +336,14 @@ function sdoEntry(code: string): SdoRegistryEntry {
 
 /** ADT object URL for a server-driven object: collection href + url-encoded name. */
 export function serverDrivenObjectUrl(code: string, name: string): string {
-  return `${sdoEntry(code).href}/${encodeURIComponent(name)}`;
+  if (code === 'TABL/DTI') parseTableIndexName(name);
+  const entry = sdoEntry(code);
+  return `${entry.href}/${encodeURIComponent(entry.lowercaseName ? name.toLowerCase() : name)}`;
+}
+
+/** URL SAP serves create-time resources under (`<collection>/$new`, e.g. `$new/schema`). */
+export function serverDrivenNewObjectUrl(code: string): string {
+  return `${sdoEntry(code).href}/$new`;
 }
 
 /**
@@ -287,8 +351,13 @@ export function serverDrivenObjectUrl(code: string, name: string): string {
  * where the metadata root's packageRef only renders under this Accept) and the create POST
  * Content-Type. Per type (EVTO → blues v2, DTDC → its own dtdc type). Throws for an unknown code.
  */
-export function serverDrivenMetadataContentType(code: string): string {
-  return sdoEntry(code).metadataContentType;
+export async function serverDrivenMetadataContentType(
+  http: AdtHttpClient,
+  safety: SafetyConfig,
+  code: string,
+): Promise<string> {
+  const support = code === 'COTA' && (await ensureServerDrivenSupport(http, safety, code));
+  return support ? support.metadataContentType : sdoEntry(code).metadataContentType;
 }
 
 /**
@@ -302,11 +371,14 @@ export function supportsServerDrivenObject(http: AdtHttpClient, code: string): b
   const entry = REGISTRY_BY_CODE[code];
   if (!entry) return false;
   if (!http.hasDiscoveryData()) return undefined;
-  return (http.discoveryAcceptFor(entry.href) ?? '').includes(entry.discoveryMarker);
+  const accept = http.discoveryAcceptFor(entry.href);
+  // SAP lists a collection without media types for a user who may not create the object type.
+  if (!accept && http.hasDiscoveryCollection(entry.href)) return undefined;
+  return (accept ?? '').includes(entry.discoveryMarker);
 }
 
 /**
- * Resolve SDO availability, fetching ADT discovery when it has not been loaded yet.
+ * Return the supported metadata media type, or false when the collection is unavailable.
  *
  * The sync check returns `undefined` on a cold discovery map — which the CLI always is
  * (`handleToolCall` runs without the startup probe). Callers that treated only an explicit `false`
@@ -320,26 +392,36 @@ export function supportsServerDrivenObject(http: AdtHttpClient, code: string): b
  * before every tool call, and writing to the shared client would leak one user's capability view
  * under the non-strict principal-propagation fallback.
  *
- * Still-unknown resolves to `true` (proceed): `hasDiscoveryData()` cannot tell "discovery
+ * Still-unknown uses the registry media type (proceed): `hasDiscoveryData()` cannot tell "discovery
  * unreachable" from "discovery empty", and failing closed would break every SDO read on a system
  * where /sap/bc/adt/discovery is 403'd. This gate only improves the error message — the real
  * controls are checkOperation and the package allowlist.
+ *
+ * Re-check a cached negative with the caller's identity. Keep it if the caller supplies no evidence.
  */
 export async function ensureServerDrivenSupport(
   http: AdtHttpClient,
   safety: SafetyConfig,
   code: string,
-): Promise<boolean> {
-  const known = supportsServerDrivenObject(http, code);
-  if (known !== undefined) return known;
+): Promise<{ metadataContentType: string; discovery?: DiscoveryMap } | false> {
   const entry = REGISTRY_BY_CODE[code];
   if (!entry) return false;
-  checkOperation(safety, OperationType.Read, 'FetchDiscovery');
-  const { map } = await fetchDiscoveryDocument(http); // never throws
-  // Empty map = discovery unreachable, NOT "collection absent" — those must not collapse together,
-  // or a 403'd discovery would block every SDO read. A populated map lacking the href IS unsupported.
-  if (map.size === 0) return true;
-  return (resolveAcceptType(map, entry.href) ?? '').includes(entry.discoveryMarker);
+  const cached = supportsServerDrivenObject(http, code);
+  let accept = http.discoveryAcceptFor(entry.href);
+  let discovery: DiscoveryMap | undefined;
+  if (cached !== true) {
+    checkOperation(safety, OperationType.Read, 'FetchDiscovery');
+    const { map } = await fetchDiscoveryDocument(http);
+    if (map.size === 0)
+      return cached === false ? false : { metadataContentType: entry.metadataContentType, discovery: map };
+    discovery = map;
+    accept = resolveAcceptType(map, entry.href);
+    if (accept ? !accept.includes(entry.discoveryMarker) : !map.has(entry.href)) return false;
+  }
+  return {
+    metadataContentType: code === 'COTA' && accept === BLUES_V2 ? BLUES_V2 : entry.metadataContentType,
+    discovery,
+  };
 }
 
 /** Shared "this release does not have this type" message for the three SDO entry points. */
@@ -363,13 +445,17 @@ export async function getServerDrivenObject(
   code: string,
   name: string,
   version?: 'active' | 'inactive',
+  metadataContentType?: string,
 ): Promise<ServerDrivenObjectResult> {
   checkOperation(safety, OperationType.Read, 'GetServerDrivenObject');
   const entry = sdoEntry(code);
   const objUrl = serverDrivenObjectUrl(code, name);
 
-  const query = version ? `?version=${version}` : '';
-  const metaResp = await http.get(`${objUrl}${query}`, { Accept: entry.metadataContentType });
+  const selectedVersion = version ?? (code === 'TABL/DTI' ? 'inactive' : undefined);
+  const query = selectedVersion ? `?version=${selectedVersion}` : '';
+  const metaResp = await http.get(`${objUrl}${query}`, {
+    Accept: metadataContentType ?? (await serverDrivenMetadataContentType(http, safety, code)),
+  });
   const metadata = parseServerDrivenMetadata(metaResp.body, entry.metadataRootLocalName);
 
   // SAP can substitute the other version when the requested one does not exist.
@@ -414,10 +500,14 @@ export function buildServerDrivenMetadataXml(
 ): string {
   const entry = sdoEntry(code);
   const [prefix] = entry.metadataRootQName.split(':');
+  const container =
+    code === 'TABL/DTI'
+      ? `  <adtcore:containerRef adtcore:name="${escapeXmlAttr(parseTableIndexName(name).table)}" adtcore:type="TABL/DT" adtcore:uri="${escapeXmlAttr(tableIndexParentUrl(name))}"/>\n`
+      : '';
   return `<?xml version="1.0" encoding="UTF-8"?>
 <${entry.metadataRootQName} xmlns:${prefix}="${entry.metadataNamespace}" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:type="${escapeXmlAttr(entry.createType)}" adtcore:name="${escapeXmlAttr(name)}" adtcore:description="${escapeXmlAttr(description)}"${code === 'UIAD' && uiadLanguageVersion ? ` adtcore:abapLanguageVersion="${escapeXmlAttr(uiadLanguageVersion)}"` : ''}>
   <adtcore:packageRef adtcore:name="${escapeXmlAttr(pkg)}"/>
-${creationProperties ? `  <blue:additionalCreationProperties><adtcore:content adtcore:type="application/vnd.sap.adt.objecttype.new.content.additional.v1+json">${escapeXmlAttr(JSON.stringify(creationProperties))}</adtcore:content></blue:additionalCreationProperties>\n` : ''}</${entry.metadataRootQName}>`;
+${container}${creationProperties ? `  <blue:additionalCreationProperties><adtcore:content adtcore:type="application/vnd.sap.adt.objecttype.new.content.additional.v1+json">${escapeXmlAttr(JSON.stringify(creationProperties))}</adtcore:content></blue:additionalCreationProperties>\n` : ''}</${entry.metadataRootQName}>`;
 }
 
 /** Options shared by the SDO write operations. */
@@ -444,6 +534,7 @@ export async function createServerDrivenObject(
     transport?: string;
     uiadLanguageVersion?: UiadLanguageVersion;
     creationProperties?: Record<string, string>;
+    metadataContentType?: string;
   },
 ): Promise<string> {
   checkOperation(safety, OperationType.Create, 'CreateServerDrivenObject');
@@ -457,7 +548,12 @@ export async function createServerDrivenObject(
     opts.creationProperties,
   );
   const url = opts.transport ? `${entry.href}?corrNr=${encodeURIComponent(opts.transport)}` : entry.href;
-  const resp = await postCreate(http, url, body, entry.metadataContentType);
+  const resp = await postCreate(
+    http,
+    url,
+    body,
+    opts.metadataContentType ?? (await serverDrivenMetadataContentType(http, safety, code)),
+  );
   return resp.body;
 }
 
@@ -486,7 +582,14 @@ export async function updateServerDrivenObjectSource(
       const params = [`lockHandle=${encodeURIComponent(lock.lockHandle)}`];
       if (transport) params.push(`corrNr=${encodeURIComponent(transport)}`);
       opts.onSourceWrite?.('attempted');
-      await session.put(`${objUrl}/source/main?${params.join('&')}`, source, serverDrivenSourceContentType(code));
+      await session.put(
+        `${objUrl}/source/main?${params.join('&')}`,
+        source,
+        serverDrivenSourceContentType(code),
+        undefined,
+        // Keep an uncertain index save as one attempt; report its state instead of replaying it.
+        code === 'TABL/DTI' ? { retryTransientErrors: false } : undefined,
+      );
       opts.onSourceWrite?.('confirmed');
     } finally {
       try {
@@ -511,13 +614,14 @@ async function checkServerDrivenDeletion(
   safety: SafetyConfig,
   objUrl: string,
   lockHandle: string,
+  discovery?: DiscoveryMap,
 ): Promise<void> {
   const path = '/sap/bc/adt/deletion/check';
   const contentType = 'application/vnd.sap.adt.deletion.check.request.v1+xml';
   checkOperation(safety, OperationType.Read, 'CheckDeletion');
   let advertised = http.discoveryAcceptFor(path);
-  if (!http.hasDiscoveryData()) {
-    const { map } = await fetchDiscoveryDocument(http);
+  if (discovery || !http.hasDiscoveryData()) {
+    const map = discovery ?? (await fetchDiscoveryDocument(http)).map;
     if (map.size === 0) throw new AdtError('Deletion check availability could not be determined. No DELETE was sent.');
     advertised = resolveAcceptType(map, path);
   }
@@ -536,6 +640,21 @@ async function checkServerDrivenDeletion(
       'SAP did not confirm that this object can be deleted. Review its deletion check in ADT and resolve dependencies or other refusals. No DELETE was sent.',
     );
   }
+  // This path deletes only the locked object. ADT can include children in the same deletion.
+  const included = Array.isArray(object.includedObject) ? object.includedObject : [object.includedObject];
+  for (const child of included) {
+    if (child?.['@_type'] === 'SKTD/TYP') {
+      const name = String(child['@_name'] ?? '');
+      throw new AdtError(
+        `SAP lists the knowledge transfer document ${name} as part of this deletion. Delete it first with SAPWrite(action="delete", type="SKTD", name="${name}"), then retry. No DELETE was sent.`,
+      );
+    }
+    if (child?.['@_mustBeDeletedWithParent'] === 'true') {
+      throw new AdtError(
+        'SAP requires an included object to be deleted with its parent. Review the deletion in ADT. No DELETE was sent.',
+      );
+    }
+  }
 }
 
 /** Delete under a lock, then verify canonical metadata absence in a fresh request. */
@@ -544,15 +663,20 @@ export async function deleteServerDrivenObject(
   safety: SafetyConfig,
   code: string,
   name: string,
-  opts: ServerDrivenWriteOptions = {},
+  opts: ServerDrivenWriteOptions & { metadataContentType?: string; discovery?: DiscoveryMap } = {},
 ): Promise<void> {
   checkOperation(safety, OperationType.Delete, 'DeleteServerDrivenObject');
+  let { metadataContentType, discovery } = opts;
+  if (code === 'COTA' && !metadataContentType) {
+    const support = await ensureServerDrivenSupport(http, safety, code);
+    if (support) ({ metadataContentType, discovery } = support);
+  }
   const objUrl = serverDrivenObjectUrl(code, name);
   await http.withStatefulSession(async (session) => {
     const lock = await lockObject(session, safety, objUrl, 'MODIFY');
     const transport = opts.transport ?? (lock.corrNr || undefined);
     try {
-      await checkServerDrivenDeletion(session, safety, objUrl, lock.lockHandle);
+      await checkServerDrivenDeletion(session, safety, objUrl, lock.lockHandle, discovery);
       let url = `${objUrl}?lockHandle=${encodeURIComponent(lock.lockHandle)}`;
       if (transport) url += `&corrNr=${encodeURIComponent(transport)}`;
       await session.delete(url);
@@ -568,7 +692,10 @@ export async function deleteServerDrivenObject(
   try {
     await http.get(
       objUrl,
-      { Accept: serverDrivenMetadataContentType(code), 'Cache-Control': 'no-cache' },
+      {
+        Accept: metadataContentType ?? sdoEntry(code).metadataContentType,
+        'Cache-Control': 'no-cache',
+      },
       { suppressNotFoundLog: true },
     );
   } catch (error) {

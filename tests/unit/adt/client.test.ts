@@ -666,6 +666,7 @@ describe('AdtClient', () => {
   });
 
   describe('getRevisions', () => {
+    beforeEach(() => mockFetch.mockResolvedValue(mockResponse(200, '<feed/>', { 'x-csrf-token': 'T' })));
     it('returns parsed revision list for a program', async () => {
       mockFetch.mockReset();
       mockFetch.mockResolvedValue(mockResponse(200, loadFixture('revision-feed-prog.xml'), { 'x-csrf-token': 'T' }));
@@ -703,14 +704,14 @@ describe('AdtClient', () => {
       const client = createClient();
       await client.getRevisions('DDLS', 'Z_VIEW');
       const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
-      expect(urls.some((u) => u.includes('/ddic/ddl/sources/Z_VIEW/versions?'))).toBe(true);
+      expect(urls.some((u) => u.endsWith('/ddic/ddl/sources/Z_VIEW/versions'))).toBe(true);
     });
 
     it('uses the object-level revisions endpoint for DCLS', async () => {
       const client = createClient();
       await client.getRevisions('DCLS', 'Z_ACCESS');
       const urls = mockFetch.mock.calls.map((c: any[]) => String(c[0]));
-      expect(urls.some((u) => u.includes('/acm/dcl/sources/Z_ACCESS/versions?'))).toBe(true);
+      expect(urls.some((u) => u.endsWith('/acm/dcl/sources/Z_ACCESS/versions'))).toBe(true);
     });
 
     it('keeps the source/main revisions endpoint for SRVD and BDEF', async () => {
@@ -1190,7 +1191,7 @@ describe('AdtClient', () => {
         mockResponse(200, loadFixture('enhancement-implementation.xml'), { 'x-csrf-token': 'T' }),
       );
       const client = createClient();
-      const enho = await client.getEnhancementImplementation('SFW_BCF_TCD');
+      const enho = await client.getEnhancementImplementation('SFW_BCF_TCD', '816');
       expect(enho.name).toBe('SFW_BCF_TCD');
       expect(enho.package).toBe('SFWTOOLS');
       expect(enho.technology).toBe('BADI_IMPL');
@@ -1221,7 +1222,7 @@ describe('AdtClient', () => {
         .mockResolvedValueOnce(mockResponse(200, searchXml('ZENH_HOOK_DEMO', 'ENHO/XH')))
         .mockResolvedValueOnce(mockResponse(200, loadFixture('enhancement-implementation.xml')));
       const client = createClient();
-      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO');
+      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO', '750');
 
       expect(mockFetch.mock.calls[0]?.[0]).toContain('/sap/bc/adt/enhancements/enhoxhb/ZENH_HOOK_DEMO');
       expect(mockFetch.mock.calls[2]?.[0]).toContain('/sap/bc/adt/enhancements/enhoxh/ZENH_HOOK_DEMO');
@@ -1245,7 +1246,7 @@ describe('AdtClient', () => {
           ),
         );
       const client = createClient();
-      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO');
+      const enho = await client.getEnhancementImplementation('ZENH_HOOK_DEMO', '750');
 
       expect(mockFetch.mock.calls[3]?.[0]).toContain(
         '/sap/bc/adt/vit/wb/object_type/enhoxh/object_name/ZENH_HOOK_DEMO',
@@ -1262,14 +1263,16 @@ describe('AdtClient', () => {
         .mockResolvedValueOnce(mockResponse(500, 'dump'))
         .mockResolvedValueOnce(mockResponse(404, 'no workbench wrapper here'));
       const client = createClient();
-      await expect(client.getEnhancementImplementation('ZENH_HOOK_DEMO')).rejects.toMatchObject({ statusCode: 500 });
+      await expect(client.getEnhancementImplementation('ZENH_HOOK_DEMO', '750')).rejects.toMatchObject({
+        statusCode: 500,
+      });
     });
 
     it('surfaces an auth failure instead of trying another endpoint', async () => {
       mockFetch.mockReset();
       mockFetch.mockResolvedValue(mockResponse(403, 'Forbidden'));
       const client = createClient();
-      await expect(client.getEnhancementImplementation('ZENHO')).rejects.toBeInstanceOf(AdtApiError);
+      await expect(client.getEnhancementImplementation('ZENHO', '750')).rejects.toBeInstanceOf(AdtApiError);
       expect(mockFetch).toHaveBeenCalledTimes(1);
     });
 
@@ -1487,141 +1490,6 @@ describe('AdtClient', () => {
     });
   });
 
-  describe('getPackageContents (search-endpoint based)', () => {
-    /**
-     * Hand-crafted minimal `adtcore:objectReferences` XML covering the case
-     * the legacy `nodestructure` endpoint got wrong: a sub-package whose own
-     * description was attributed to a contained class. Each reference here
-     * has its description correctly attached to its own name.
-     */
-    const SEARCH_RESPONSE = `<?xml version="1.0" encoding="utf-8"?>
-<adtcore:objectReferences xmlns:adtcore="http://www.sap.com/adt/core">
-  <adtcore:objectReference adtcore:uri="/sap/bc/adt/packages/zsubpkg" adtcore:type="DEVC/K" adtcore:name="ZSUBPKG" adtcore:packageName="ZSUBPKG" adtcore:description="Sub-package own description"/>
-  <adtcore:objectReference adtcore:uri="/sap/bc/adt/oo/classes/zcl_one" adtcore:type="CLAS/OC" adtcore:name="ZCL_ONE" adtcore:packageName="ZPARENT" adtcore:description="First class"/>
-  <adtcore:objectReference adtcore:uri="/sap/bc/adt/programs/programs/zreport" adtcore:type="PROG/P" adtcore:name="ZREPORT" adtcore:packageName="ZPARENT" adtcore:description="A report"/>
-</adtcore:objectReferences>`;
-
-    it('hits the search endpoint, NOT nodestructure', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      await client.getPackageContents('ZPARENT');
-      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('/sap/bc/adt/repository/informationsystem/search');
-      expect(url).toContain('packageName=ZPARENT');
-      expect(url).toContain('operation=quickSearch');
-      expect(url).toContain('query=*');
-      expect(url).not.toContain('/nodestructure');
-      // GET, not POST — no CSRF round-trip needed
-      const method = (mockFetch.mock.calls[0]?.[1] as RequestInit)?.method ?? 'GET';
-      expect(method).toBe('GET');
-    });
-
-    it('returns objects with descriptions correctly aligned to names', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      const contents = await client.getPackageContents('ZPARENT');
-      expect(contents).toHaveLength(3);
-      const sub = contents.find((c) => c.name === 'ZSUBPKG');
-      const clas = contents.find((c) => c.name === 'ZCL_ONE');
-      const prog = contents.find((c) => c.name === 'ZREPORT');
-      // The bug we are fixing: each row's description must be its OWN, not a sibling's.
-      expect(sub?.description).toBe('Sub-package own description');
-      expect(clas?.description).toBe('First class');
-      expect(prog?.description).toBe('A report');
-    });
-
-    it('maps search field names to DEVC contract (objectType→type, objectName→name)', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      const contents = await client.getPackageContents('ZPARENT');
-      // Public contract is { type, name, description, uri } — verify the rename happened
-      // and that no `objectType`/`objectName`/`packageName` leak through.
-      for (const c of contents) {
-        expect(c).toHaveProperty('type');
-        expect(c).toHaveProperty('name');
-        expect(c).toHaveProperty('description');
-        expect(c).toHaveProperty('uri');
-        expect(c).not.toHaveProperty('objectType');
-        expect(c).not.toHaveProperty('objectName');
-        expect(c).not.toHaveProperty('packageName');
-      }
-      const clas = contents.find((c) => c.name === 'ZCL_ONE');
-      expect(clas?.type).toBe('CLAS/OC');
-      expect(clas?.uri).toBe('/sap/bc/adt/oo/classes/zcl_one');
-    });
-
-    it('honors maxResults parameter (passed through to query string)', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      await client.getPackageContents('ZPARENT', 50);
-      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('maxResults=50');
-    });
-
-    it('clamps maxResults to [1, 1000]', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      await client.getPackageContents('ZPARENT', 5000);
-      let url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('maxResults=1000');
-
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      await client.getPackageContents('ZPARENT', 0);
-      url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('maxResults=1');
-
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      await client.getPackageContents('ZPARENT', -1);
-      url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('maxResults=1');
-    });
-
-    it('uses default maxResults=200 when not specified', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      await client.getPackageContents('ZPARENT');
-      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('maxResults=200');
-    });
-
-    it('floors a fractional maxResults and falls back to default on NaN (no float reaches the URL)', async () => {
-      // SAPReadSchema now accepts any number (the advertised `type: number` contract); flooring +
-      // range handling is this sink's job — see docs/research/2026-06-12-maxresults-contract-asymmetry.md.
-      // NOTE: 'maxResults=50' is a SUBSTRING of the un-floored 'maxResults=50.5', so each row also
-      // pins the absence of the raw input — without that, the toContain is vacuous for floats.
-      const client = createClient();
-      for (const [input, expected, mustNotContain] of [
-        [50.5, 'maxResults=50', 'maxResults=50.5'],
-        [0.4, 'maxResults=1', 'maxResults=0.4'],
-        [Number.NaN, 'maxResults=200', 'maxResults=NaN'],
-      ] as const) {
-        mockFetch.mockReset();
-        mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-        await client.getPackageContents('ZPARENT', input);
-        const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-        expect(url).toContain(expected);
-        expect(url).not.toContain(mustNotContain);
-      }
-    });
-
-    it('encodes special characters in package names', async () => {
-      mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, SEARCH_RESPONSE));
-      const client = createClient();
-      await client.getPackageContents('/NAMESPACE/PKG');
-      const url = String(mockFetch.mock.calls[0]?.[0] ?? '');
-      expect(url).toContain('packageName=%2FNAMESPACE%2FPKG');
-    });
-  });
-
   describe('getSubpackages (direct DEVCLASS children — repository/nodestructure)', () => {
     // Live fixture captured from S/4HANA 2023 (a4h.marianzeis.de):
     //   POST /sap/bc/adt/repository/nodestructure?parent_type=DEVC/K&parent_name=SABP_UNIT
@@ -1776,37 +1644,45 @@ describe('AdtClient', () => {
       expect(cloned.getPackageHierarchyResolver()).toBe(original.getPackageHierarchyResolver());
     });
 
-    it('resolver is wired to client.getSubpackages — descends real subtree from the nodestructure endpoint', async () => {
-      // Mock the BFS via nodestructure: ZROOT -> [ZA], ZA -> [].
-      // All mocked responses carry x-csrf-token so the POST's CSRF preflight succeeds.
-      const CSRF = { 'x-csrf-token': 'T' };
-      mockFetch.mockReset();
-      mockFetch.mockImplementation(async (url: unknown) => {
-        const s = String(url);
-        if (s.includes('/sap/bc/adt/repository/nodestructure') && s.includes('parent_name=ZROOT')) {
-          return mockResponse(
-            200,
-            `<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>
-<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>ZA</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>
-</TREE_CONTENT></DATA></asx:values></asx:abap>`,
-            CSRF,
-          );
-        }
-        if (s.includes('/sap/bc/adt/repository/nodestructure') && s.includes('parent_name=ZA')) {
-          return mockResponse(200, '', CSRF);
-        }
-        // CSRF preflight target — return empty body + token so the POST proceeds.
-        return mockResponse(200, '', CSRF);
+    /** `GET /sap/bc/adt/packages/{name}` body with the given super-package (empty = top-level). */
+    const packageXml = (name: string, superPackage: string) =>
+      `<?xml version="1.0" encoding="utf-8"?><pak:package xmlns:pak="http://www.sap.com/adt/packages" ` +
+      `xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="${name}" adtcore:type="DEVC/K">` +
+      `<pak:superPackage adtcore:name="${superPackage}"/></pak:package>`;
+
+    it('resolver walks the chain from GET /sap/bc/adt/packages/{name}', async () => {
+      const parents: Record<string, string> = { ZA2: 'ZA', ZA: 'ZROOT', ZROOT: '' };
+      mockFetch.mockReset().mockImplementation(async (url: unknown) => {
+        const path = new URL(String(url)).pathname;
+        const name = decodeURIComponent(path.replace('/sap/bc/adt/packages/', '')).toUpperCase();
+        if (path.startsWith('/sap/bc/adt/packages/') && name in parents)
+          return mockResponse(200, packageXml(name, parents[name]!));
+        return mockResponse(404, 'not found');
       });
-      const client = createClient();
-      const resolver = client.getPackageHierarchyResolver();
-      expect(await resolver.isDescendantOrSelf('ZROOT', 'ZA')).toBe(true);
-      expect(await resolver.isDescendantOrSelf('ZROOT', 'ZNOTHERE')).toBe(false);
+      expect(await createClient().getPackageHierarchyResolver().isDescendantOrSelf('ZROOT', 'ZA2')).toBe(true);
+      const paths = mockFetch.mock.calls.map(([url]) => new URL(String(url)).pathname);
+      expect(paths).toEqual(['/sap/bc/adt/packages/ZA2', '/sap/bc/adt/packages/ZA', '/sap/bc/adt/packages/ZROOT']);
     });
 
-    it('invalidatePackageHierarchy() drops cached subtrees', async () => {
+    it('resolver falls back to repository/nodestructure when the checked package is not found (before 7.52)', async () => {
+      const xml = (f: string) => readFileSync(new URL(`../../fixtures/xml/${f}.xml`, import.meta.url), 'utf8');
+      mockFetch.mockReset().mockImplementation(async (url: unknown) => {
+        const u = new URL(String(url));
+        if (u.pathname === '/sap/bc/adt/discovery') return mockResponse(200, '<service/>', { 'x-csrf-token': 'T' });
+        if (!u.pathname.endsWith('/nodestructure')) return mockResponse(404, 'not found');
+        const sub = u.searchParams.get('parent_name') === 'SABP_UNIT' ? 'sabp_unit-devc' : 'empty';
+        return mockResponse(200, xml(`nodestructure-${sub}`));
+      });
+      const resolver = createClient().getPackageHierarchyResolver();
+      expect(await resolver.isDescendantOrSelf('SABP_UNIT', 'SABP_UNIT_CORE')).toBe(true);
+      expect(await resolver.isDescendantOrSelf('SABP_UNIT', 'ZNOTHERE')).toBe(false);
+      const rootPosts = mockFetch.mock.calls.filter(([url]) => String(url).includes('parent_name=SABP_UNIT&'));
+      expect(rootPosts).toHaveLength(1); // subtree expanded once, then cached
+    });
+
+    it('invalidatePackageHierarchy() drops cached chains', async () => {
       mockFetch.mockReset();
-      mockFetch.mockResolvedValue(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+      mockFetch.mockResolvedValue(mockResponse(200, packageXml('ZA', '')));
       const client = createClient();
       const resolver = client.getPackageHierarchyResolver();
       await resolver.isDescendantOrSelf('ZROOT', 'ZA');

@@ -17,18 +17,20 @@ import { resolveCookies } from '../adt/cookies.js';
 import { AdtApiError } from '../adt/errors.js';
 import { shouldWarnPreStatefulRelease } from '../adt/release.js';
 import { deriveUserSafety, deriveUserSafetyFromProfile } from '../adt/safety.js';
+import type { SamlBearerIdp } from '../adt/saml-bearer.js';
 import { Semaphore } from '../adt/semaphore.js';
 import { hasRequiredScope } from '../authz/policy.js';
-import type { Cache } from '../cache/cache.js';
-import { CachingLayer } from '../cache/caching-layer.js';
-import { MemoryCache } from '../cache/memory.js';
+import type { CachingLayer } from '../cache/caching-layer.js';
 import { getToolRegistry, handleToolCall } from '../handlers/dispatch.js';
 import {
+  cacheProbedFeatures,
   getCachedDiscovery,
   getCachedFeatures,
+  hasCompletedFeatureProbe,
   setCachedDiscovery,
   setCachedFeatures,
 } from '../handlers/feature-cache.js';
+import { createQueryDefinition } from '../handlers/query-tool.js';
 import type { ToolResult } from '../handlers/shared.js';
 import { getToolDefinitions, type ToolDefinition, type ToolDefinitionOptions } from '../handlers/tools.js';
 import { VERSION } from '../version.js';
@@ -38,20 +40,26 @@ import { generateRequestId } from './context.js';
 import { isActionDenied } from './deny-actions.js';
 import { canonicalDestinationUrl, opaqueDestinationValue } from './destination-discovery.js';
 import {
-  DestinationRegistry,
+  type DestinationRegistry,
   duplicateSingleTargetIds,
   sharedBasicSingleTargetConflicts,
   type TargetDescriptor,
   targetConnectionFingerprint,
 } from './destination-registry.js';
+import { resolveHttpIdeContext } from './ide-request.js';
 import { authLibLogger, initLogger, logger } from './logger.js';
 import { createMcpRateLimiter, type McpRateLimiter } from './mcp-rate-limit.js';
+import {
+  assertMultiTargetAuthorizationStartup,
+  discoverMultiTargetRegistry,
+} from './multi-target-authorization-startup.js';
 import { handleSharedBasicCall } from './multi-target-basic-auth.js';
 import {
   RuntimeDestinationLevelError,
   resolveRuntimeSubaccountPpDestination,
 } from './multi-target-destination-runtime.js';
-import { ensureMultiTargetFeatureProbe, hasAuthorizationLimitedFeatureEvidence } from './multi-target-feature-state.js';
+import { ensureMultiTargetFeatureProbe } from './multi-target-feature-state.js';
+import type { MultiTargetRequestProjection } from './multi-target-request-projection.js';
 import {
   buildAggregateToolSurfaceConfig,
   buildMultiTargetConfig,
@@ -67,8 +75,12 @@ import {
 } from './multi-target-server.js';
 import { MultiTargetSharedAuthState } from './multi-target-shared-auth-state.js';
 import { injectTargetSchema, multiTargetToolDefinitions, sapTargetsDefinition } from './multi-target-tools.js';
+import { type PerUserClient, PerUserTransportPool } from './per-user-transport.js';
 import { loadPlugins } from './plugin-loader.js';
+import { strictPpNonJwtError } from './pp-strict.js';
 import { createDataResultSemaphore, runtimeMemoryEnvelope } from './runtime-memory.js';
+import { loadSamlBearerIssuer, runSamlBearerToolCall } from './saml-bearer-client.js';
+import { createCachingLayer } from './server-cache.js';
 import { buildServerInstructions } from './server-instructions.js';
 import { closeHttpServer, registerShutdownHandlers } from './shutdown.js';
 import { FileSink } from './sinks/file.js';
@@ -78,6 +90,8 @@ import { startLocalUiServer, type UiServerDeps } from './ui.js';
 import { UiLogBufferSink } from './ui-log-buffer.js';
 
 export { VERSION } from '../version.js';
+export { assertMultiTargetAuthorizationStartup } from './multi-target-authorization-startup.js';
+export { createCachingLayer } from './server-cache.js';
 
 // Soft warning for an unusually large served tools/list. It is re-sent on every conversation (a
 // recurring token + latency cost), and some MCP clients cap tool-list size. CI's
@@ -215,6 +229,9 @@ export function buildAdtConfig(
   adtSemaphore?: Semaphore,
   dataResultSemaphore?: Semaphore,
 ): Partial<AdtClientConfig> {
+  if (config.targetId && config.multiTargetEndpoints && !config.multiTargetWrite) {
+    throw new Error('Missing multi-target write policy context');
+  }
   const adtConfig: Partial<AdtClientConfig> = {
     baseUrl: config.url,
     client: config.client,
@@ -231,6 +248,7 @@ export function buildAdtConfig(
     maxConcurrentDataResults: config.maxConcurrentDataResults,
     dataResultSemaphore,
     safety: {
+      multiTargetWrite: config.multiTargetWrite,
       allowWrites: config.allowWrites,
       allowDataPreview: config.allowDataPreview,
       allowFreeSQL: config.allowFreeSQL,
@@ -310,7 +328,8 @@ async function createPerUserClient(
   adtSemaphore?: Semaphore,
   dataResultSemaphore?: Semaphore,
   multiTarget?: { target: TargetDescriptor; instanceConfig: ServerConfig },
-): Promise<AdtClient> {
+  transports?: PerUserTransportPool,
+): Promise<PerUserClient> {
   const { createConnectivityProxy, lookupDestinationWithUserToken } = await import('@arc-mcp/xsuaa-auth/btp');
   const destName = resolvePpDestinationName(config);
   if (!destName) {
@@ -368,7 +387,10 @@ async function createPerUserClient(
 
   applyPerUserAuthTokens(adtConfig, authTokens, displayUsername, destName);
 
-  return new AdtClient(adtConfig);
+  // Single-target PP reuses the user's own SAP login; multi-target clients stay request-local (OPS-06).
+  return transports && !multiTarget
+    ? transports.client(adtConfig, destName)
+    : { client: new AdtClient(adtConfig), transportReuse: 'request-local' };
 }
 
 /**
@@ -428,13 +450,9 @@ export function applyPerUserAuthTokens(
 }
 
 /**
- * Run a one-time feature probe against the SAP system using the shared/default client.
- * Returns a promise that resolves once probe results are stored in cachedFeatures.
- * In PP mode (when btpConfig is available for per-user client creation), auth failures
- * (401/403) on textSearch are treated as "unknown" so the tool schema doesn't hide
- * source_code from users who might have authorization. A shared Basic target is the narrow
- * exception: every caller uses the same reviewed SAP identity, so authorization-limited
- * evidence is definitive for that credential generation and may be cached.
+ * Probe through the selected client and retain conclusive backend facts per target.
+ * PP authorization-limited fields remain unknown; unrelated successful evidence survives.
+ * Shared Basic targets may retain permissions for their one credential generation.
  */
 export async function probeClientFeatures(
   config: ServerConfig,
@@ -449,36 +467,21 @@ export async function probeClientFeatures(
   fc.abapGit = config.featureAbapGit as 'auto' | 'on' | 'off';
   fc.gcts = config.featureGcts as 'auto' | 'on' | 'off';
   fc.rap = config.featureRap as 'auto' | 'on' | 'off';
-  fc.amdp = config.featureAmdp as 'auto' | 'on' | 'off';
   fc.ui5 = config.featureUi5 as 'auto' | 'on' | 'off';
   fc.transport = config.featureTransport as 'auto' | 'on' | 'off';
   fc.ui5repo = config.featureUi5Repo as 'auto' | 'on' | 'off';
   fc.flp = config.featureFlp as 'auto' | 'on' | 'off';
-  const features = await probeFeatures(client.http, fc, config.systemType);
-  if (
-    !cacheAuthorizationLimitedEvidence &&
-    config.ppEnabled &&
-    btpConfig &&
-    features.textSearch &&
-    !features.textSearch.available
-  ) {
-    const reason = features.textSearch.reason ?? '';
-    if (reason.includes('authorization') || reason.includes('401') || reason.includes('403')) {
-      features.textSearch = undefined;
-    }
-  }
-  if (config.targetId && !cacheAuthorizationLimitedEvidence && hasAuthorizationLimitedFeatureEvidence(features)) {
-    throw new Error(
-      'Multi-target feature evidence remains unknown because one or more probes were authorization-limited.',
-    );
-  }
+  const request = { retryUnavailable: !config.targetId };
+  const features = await probeFeatures(client.http, fc, config.systemType, request);
   // Log authorization probe results
   if (features.authProbe) {
     const ap = features.authProbe;
     if (ap.searchAccess) {
       logger.info('Authorization probe: object search access is available');
     } else {
-      logger.warn(`Authorization probe: object search access denied — ${ap.searchReason ?? 'unknown reason'}`);
+      logger.warn(
+        `Authorization probe: object search access is not confirmed — ${ap.searchReason ?? 'unknown reason'}`,
+      );
     }
     if (ap.transportAccess) {
       logger.info('Authorization probe: transport access is available');
@@ -487,7 +490,7 @@ export async function probeClientFeatures(
     }
   }
   const featureKey = config.targetId ?? config.destinationName;
-  setCachedFeatures(features, featureKey);
+  cacheProbedFeatures(features, config.ppEnabled && !!btpConfig && !cacheAuthorizationLimitedEvidence, featureKey);
   // Proactive warning: on SAP_BASIS < 7.51 the ADT REST handler does not honor the
   // stateful-session header over HTTP, so object writes fail with 423 "invalid lock
   // handle" until the abapfs_extensions enhancement is installed. Warn at startup —
@@ -501,7 +504,7 @@ export async function probeClientFeatures(
         'installed and you can ignore this. See docs/sap-trial-setup.md (423 troubleshooting).',
     );
   }
-  const discoveryMap = features.discoveryMap ?? new Map();
+  const discoveryMap = getCachedFeatures(featureKey)?.discoveryMap ?? new Map();
   setCachedDiscovery(discoveryMap, featureKey);
   // Direct calls immediately reuse the probed client, so install its evidence too.
   client.http.setDiscoveryMap(discoveryMap);
@@ -671,6 +674,9 @@ export interface CreateServerOptions {
   multiTarget?: MultiTargetServerOptions;
   /** Shared SAP transport (cookies, CSRF token); each request still gets its own AdtClient and caches. */
   defaultHttp?: AdtClient['http'];
+  /** Single-target PP transports keyed by per-user credential; never consulted for multi-target clients. */
+  perUserTransports?: PerUserTransportPool;
+  samlBearerIdp?: SamlBearerIdp;
 }
 
 // Mark startup-401 cookies stale once per transport, preserving cookies refreshed by earlier HTTP calls.
@@ -680,6 +686,7 @@ export const SHARED_TRANSPORT_MAX_AGE_MS = 10 * 60_000;
 
 export function createServer(config: ServerConfig, options: CreateServerOptions = {}): Server {
   const {
+    samlBearerIdp,
     btpProxy,
     btpConfig,
     bearerTokenProvider,
@@ -691,6 +698,14 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
     mcpRateLimiter,
     multiTarget,
   } = options;
+  const enforced = multiTarget?.instanceConfig.multiTargetAuthorization === 'xsuaa-attribute';
+  const projection = enforced ? multiTarget.authorization : undefined;
+  const visibleTargets = enforced ? (projection?.targets ?? []) : (multiTarget?.registry.targets ?? []);
+  if (enforced && multiTarget.mode === 'aggregate') {
+    // Compute the capability union from this caller before instructions and schemas exist.
+    // The no-auth bootstrap server has an empty surface and cannot dispatch target calls.
+    config = buildAggregateToolSurfaceConfig(multiTarget.instanceConfig, visibleTargets);
+  }
   const server = new Server(
     { name: config.serverName, version: VERSION },
     {
@@ -736,19 +751,36 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
     if (multiTarget) {
       tools =
         !multiTarget.registry.available ||
-        (multiTarget.mode === 'aggregate' && multiTarget.registry.targets.length === 0)
+        (enforced && !projection?.read) ||
+        (multiTarget.mode === 'aggregate' && visibleTargets.length === 0)
           ? []
           : multiTargetToolDefinitions(tools, config);
       if (multiTarget.mode === 'aggregate') {
-        if (tools.length > 0) tools = tools.map((tool) => injectTargetSchema(tool, multiTarget.registry.targets));
-        const isAdmin = extra.authInfo ? hasRequiredScope(extra.authInfo.scopes, 'admin') : false;
-        if (multiTarget.registry.targets.length > 1 || isAdmin) tools.push(sapTargetsDefinition());
+        if (tools.length > 0) tools = tools.map((tool) => injectTargetSchema(tool, visibleTargets));
+        const isAdmin = enforced
+          ? projection?.admin
+          : extra.authInfo
+            ? hasRequiredScope(extra.authInfo.scopes, 'admin')
+            : false;
+        if (visibleTargets.length > 1 || isAdmin) tools.push(sapTargetsDefinition(enforced));
       }
     }
 
     // When authenticated, only show tools the user has scopes for
-    if (extra.authInfo) {
-      tools = filterToolsByAuthScope(tools, extra.authInfo.scopes, config.denyActions);
+    if (enforced) {
+      tools = filterToolsByAuthScope(
+        tools,
+        [...(projection?.scopes ?? [])],
+        config.denyActions,
+        createQueryDefinition(config, features),
+      );
+    } else if (extra.authInfo) {
+      tools = filterToolsByAuthScope(
+        tools,
+        extra.authInfo.scopes,
+        config.denyActions,
+        createQueryDefinition(config, features),
+      );
     }
 
     // FEAT-61: append plugin (Custom_*) tools, gated identically to built-ins (deny-list + scope +
@@ -846,7 +878,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
           const cacheAuthorizationLimitedEvidence = selectedTarget?.authentication === 'BasicAuthentication';
           await ensureMultiTargetFeatureProbe(
             targetKey,
-            !!targetKey && !!getCachedFeatures(targetKey),
+            !!targetKey && hasCompletedFeatureProbe(targetKey),
             () => probeClientFeatures(activeConfig, resolvedClient, btpConfig, cacheAuthorizationLimitedEvidence),
             () => setCachedFeatures(undefined, targetKey),
           );
@@ -884,6 +916,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
         requestId,
         postDispatchResult,
         extra.signal,
+        resolveHttpIdeContext(activeConfig, extra.requestInfo?.headers),
       );
       return { ...result } as Record<string, unknown>;
     };
@@ -906,7 +939,16 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
       });
     }
 
-    if (activeConfig.ppEnabled && isJwt) {
+    if (activeConfig.ppEnabled && isJwt && samlBearerIdp && !multiTarget) {
+      return runSamlBearerToolCall(
+        samlBearerIdp,
+        token,
+        requestId,
+        (extra.authInfo?.extra?.userName ?? extra.authInfo?.clientId) as string | undefined,
+        () => buildAdtConfig(activeConfig, undefined, undefined, { perUser: true }, adtSemaphore, dataResultSemaphore),
+        (samlClient) => dispatchWithClient(samlClient, true),
+      );
+    } else if (activeConfig.ppEnabled && isJwt) {
       const ppUser = (extra.authInfo?.extra?.userName ?? extra.authInfo?.clientId) as string | undefined;
       const ppDest = resolvePpDestinationName(activeConfig) ?? '';
       if (!btpConfig) {
@@ -937,7 +979,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
         } as Record<string, unknown>;
       }
       try {
-        client = await createPerUserClient(
+        const perUser = await createPerUserClient(
           activeConfig,
           btpConfig,
           btpProxy,
@@ -947,7 +989,9 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
           selectedTarget
             ? { target: selectedTarget, instanceConfig: multiTarget?.instanceConfig ?? config }
             : undefined,
+          multiTarget ? undefined : options.perUserTransports,
         );
+        client = perUser.client;
         isPerUserClient = true;
         logger.emitAudit({
           timestamp: new Date().toISOString(),
@@ -959,6 +1003,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
           target: activeConfig.targetId,
           identity: activeConfig.targetId ? 'per-user' : undefined,
           success: true,
+          transportReuse: perUser.transportReuse,
         });
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
@@ -993,24 +1038,7 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
         } as Record<string, unknown>;
       }
     } else if (activeConfig.ppStrictExplicit && activeConfig.ppStrict && activeConfig.ppEnabled && !isJwt) {
-      // Strict mode with non-JWT token (e.g., API key) — reject
-      if (multiTarget) {
-        return multiError(
-          'PP_SETUP_FAILED',
-          'Multi-target routes require an XSUAA JWT for strict principal propagation. Sign in with XSUAA and try again.',
-          { retryable: true },
-          'pp_exchange_failed',
-        );
-      }
-      return {
-        content: [
-          {
-            type: 'text' as const,
-            text: 'Principal propagation requires a JWT token (SAP_PP_STRICT=true). API key authentication is not supported in strict PP mode.',
-          },
-        ],
-        isError: true,
-      } as Record<string, unknown>;
+      return strictPpNonJwtError(!!multiTarget, multiError);
     }
 
     if (!client) {
@@ -1046,51 +1074,12 @@ export function createServer(config: ServerConfig, options: CreateServerOptions 
   return server;
 }
 
-/**
- * Create a CachingLayer based on config.
- * Returns undefined if caching is disabled.
- *
- * SqliteCache is loaded dynamically so that better-sqlite3 (a native module)
- * is only required when actually used. This allows the server to start in
- * memory-cache or no-cache mode even when better-sqlite3 is not installed
- * (e.g. cross-platform deploys where native binaries were compiled elsewhere).
- */
-export async function createCachingLayer(config: ServerConfig): Promise<CachingLayer | undefined> {
-  const mode = config.cacheMode;
-
-  if (mode === 'none') return undefined;
-
-  let cache: Cache;
-  if (mode === 'sqlite') {
-    logger.warn(
-      'ARC1_CACHE=sqlite stores SAP source in plaintext at rest; use ARC1_CACHE=memory/none or encrypted storage for IP-sensitive landscapes.',
-    );
-    // Persistent cache is explicit opt-in because SQLite stores full source bodies.
-    try {
-      const { SqliteCache } = await import('../cache/sqlite.js');
-      cache = new SqliteCache(config.cacheFile);
-    } catch (err) {
-      logger.warn('SQLite cache unavailable (better-sqlite3 not loaded) — falling back to memory cache', {
-        error: err instanceof Error ? err.message : String(err),
-      });
-      cache = new MemoryCache();
-    }
-  } else {
-    // Memory cache for auto/default and explicit memory mode. Avoids source-at-rest by default.
-    cache = new MemoryCache();
-  }
-
-  const maxActivityEntries = config.uiMode === 'off' ? 0 : undefined;
-  return new CachingLayer(cache, maxActivityEntries);
-}
-
-/**
- * Create and start the MCP server.
- */
+/** Create and start the MCP server. */
 export async function createAndStartServer(
   config: ServerConfig,
   sources?: Record<string, import('./types.js').ConfigSource>,
 ): Promise<Server> {
+  assertMultiTargetAuthorizationStartup(config);
   initLogger(config.logFormat, config.logLevel);
   const startedAt = new Date().toISOString();
   const uiLogBuffer = config.uiMode !== 'off' ? new UiLogBufferSink() : undefined;
@@ -1277,14 +1266,7 @@ export async function createAndStartServer(
         'ARC1_MULTI_TARGET_ENDPOINTS=true requires Destination and Connectivity service bindings in VCAP_SERVICES.',
       );
     }
-    try {
-      const { discoverDestinations } = await import('./destination-discovery.js');
-      registry = DestinationRegistry.fromDiscovery(await discoverDestinations(btpConfig), config);
-    } catch (error) {
-      const message = error instanceof Error ? error.message : 'Destination discovery failed.';
-      registry = DestinationRegistry.unavailable({ code: 'REGISTRY_DISCOVERY_ERROR', message });
-      logger.error('Multi-target destination discovery failed', { error: message });
-    }
+    registry = await discoverMultiTargetRegistry(config, btpConfig);
     logger.info('Multi-target registry loaded', {
       available: registry.available,
       targets: registry.targets.length,
@@ -1321,7 +1303,10 @@ export async function createAndStartServer(
     if (config.multiTargetAllowBasicAuth) {
       logger.warn(
         'Experimental multi-target Basic authentication is enabled: Basic targets use a shared SAP identity, ' +
-          'are visible to all read-scoped users, remain mutation-free, and require exactly one CF app instance.',
+          (config.multiTargetAuthorization === 'xsuaa-attribute'
+            ? 'require target grants, '
+            : 'are visible to all read-scoped users, ') +
+          'remain mutation-free, and require exactly one CF app instance.',
       );
     }
   }
@@ -1397,6 +1382,8 @@ export async function createAndStartServer(
     }
     return shared.http;
   };
+  const perUserTransports = new PerUserTransportPool(SHARED_TRANSPORT_MAX_AGE_MS); // same bound per PP user
+  const samlBearerIdp = loadSamlBearerIssuer(config);
   const buildDefaultServer = () =>
     createServer(config, {
       btpProxy,
@@ -1409,17 +1396,24 @@ export async function createAndStartServer(
       dataResultSemaphore,
       mcpRateLimiter,
       defaultHttp: defaultHttp(),
+      perUserTransports,
+      samlBearerIdp,
     });
-  const aggregateConfig = registry ? buildAggregateToolSurfaceConfig(config, registry.targets) : undefined;
+  const aggregateConfig = registry
+    ? buildAggregateToolSurfaceConfig(
+        config,
+        config.multiTargetAuthorization === 'xsuaa-attribute' ? [] : registry.targets,
+      )
+    : undefined;
   const buildAggregateServer =
     registry && aggregateConfig && btpConfig
-      ? () =>
+      ? (authorization?: MultiTargetRequestProjection) =>
           createServer(aggregateConfig, {
             btpConfig,
             adtSemaphore,
             dataResultSemaphore,
             mcpRateLimiter,
-            multiTarget: { mode: 'aggregate', registry, instanceConfig: config, sharedAuthState },
+            multiTarget: { mode: 'aggregate', registry, instanceConfig: config, sharedAuthState, authorization },
           })
       : undefined;
   const serveSingleTargetEndpoint = shouldStartSingleTarget;
@@ -1458,15 +1452,23 @@ export async function createAndStartServer(
       registry && btpConfig && buildAggregateServer
         ? {
             registry,
+            authorizationMode: config.multiTargetAuthorization,
             aggregateFactory: buildAggregateServer,
-            createPinnedServer: (target: TargetDescriptor) => {
-              const targetConfig = buildMultiTargetConfig(config, target);
+            createPinnedServer: (target: TargetDescriptor, authorization?: MultiTargetRequestProjection) => {
+              const targetConfig = buildMultiTargetConfig(config, target, { mode: 'pinned', authorization });
               return createServer(targetConfig, {
                 btpConfig,
                 adtSemaphore,
                 dataResultSemaphore,
                 mcpRateLimiter,
-                multiTarget: { mode: 'pinned', registry, instanceConfig: config, target, sharedAuthState },
+                multiTarget: {
+                  mode: 'pinned',
+                  registry,
+                  instanceConfig: config,
+                  target,
+                  sharedAuthState,
+                  authorization,
+                },
               });
             },
           }

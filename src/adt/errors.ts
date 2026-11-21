@@ -20,11 +20,14 @@ import { decodeXmlEntities } from './xml-entities.js';
 
 /** Base error for all ADT-related errors */
 export class AdtError extends Error {
-  /** A create request failed without establishing whether SAP committed it. */
-  creationOutcome?: 'unknown';
+  /** Creation was confirmed before a later failure, or its outcome could not be established. */
+  creationOutcome?: 'unknown' | 'confirmed';
 
   /** A plugin POST failed without establishing whether its service executed it. */
   pluginPostOutcome?: 'unknown';
+
+  /** Activation failed without establishing whether SAP completed it. */
+  activationOutcome?: 'unknown';
 
   /**
    * Optional remediation hint attached by a handler when it has context the
@@ -75,7 +78,9 @@ export interface SapErrorClassification {
     | 'object-exists'
     | 'method-not-supported'
     | 'icf-handler-not-bound'
+    | 'program-variants-unavailable'
     | 'icf-service-inactive'
+    | 'gateway-service-not-found'
     | 'bdef-base-not-extensible'
     | 'include-not-initialized'
     | 'data-view-not-authorized'
@@ -110,12 +115,18 @@ export class AdtApiError extends AdtError {
   /** The handler withheld unsafe diagnostics; generic cause/retry advice cannot be inferred. */
   diagnosticsOmitted?: boolean;
 
+  /**
+   * A 404 without `sap-cache-control`: SAP's ICM repeats it for the same URL for about a minute (#1261).
+   * 7.50 omits the header; 7.58 and 8.16 send "+0".
+   */
+  notFoundMayBeReplayed?: boolean;
+
   constructor(
     message: string,
     public readonly statusCode: number,
     public readonly path: string,
     public readonly responseBody?: string,
-    options: { plainText?: boolean } = {},
+    options: { plainText?: boolean; sapCache?: string | null } = {},
   ) {
     // Extract a human-readable message, stripping raw XML/HTML — but only from a raw SAP body.
     // Try the truncated message first; if that only yields a generic title (e.g., "Application Server Error"),
@@ -133,6 +144,7 @@ export class AdtApiError extends AdtError {
     }
     super(`ADT API error: status ${statusCode} at ${path}: ${clean}`);
     this.name = 'AdtApiError';
+    if (statusCode === 404 && options.sapCache === null) this.notFoundMayBeReplayed = true;
   }
 
   /**
@@ -613,14 +625,32 @@ export function classifySapDomainError(
   const bodyLower = bodyRaw.toLowerCase();
   const typeId = extractExceptionType(bodyRaw);
 
-  // Un-initialised class-local include (issue #303 follow-up). A content PUT to a
-  // class include that doesn't exist yet (notably testclasses/CCAU on a fresh class)
-  // fails with HTTP 500 ExceptionResourceSaveFailure + "…CCAU does not have any
-  // inactive version". Checked BEFORE the activation-dependency branch below, which
-  // also matches /inactive/. ARC-1's update include= path now auto-creates the
-  // include before writing, so this hint covers only paths that bypass auto-init
-  // (e.g. a direct source PUT to an un-initialised include).
-  if (/does not have any inactive version/i.test(bodyRaw)) {
+  // Gateway MED/170 is a service-resolution failure, even though it returns 403.
+  // Verified on 7.50/8.16; match the structured code, not localized message text (SAP KBA 2498534).
+  if (statusCode === 403 && path?.startsWith('/sap/opu/odata/')) {
+    let code: unknown;
+    try {
+      code = JSON.parse(bodyRaw)?.error?.code;
+    } catch {
+      // Non-JSON responses retain their existing classification.
+    }
+    if (code === '/IWFND/MED/170') {
+      return {
+        category: 'gateway-service-not-found',
+        hint: 'SAP Gateway could not resolve the OData service. Ask Basis to check service registration and routing in /IWFND/MAINT_SERVICE and /IWBEP/REG_SERVICE before retrying.',
+        transaction: '/IWFND/MAINT_SERVICE',
+      };
+    }
+  }
+
+  // A direct save to an uninitialized CCAU include fails with this error (#303).
+  // NW 7.50 uses the same message for missing programs, which need the normal not-found hint.
+  if (
+    statusCode === 500 &&
+    typeId === 'ExceptionResourceSaveFailure' &&
+    /^\/sap\/bc\/adt\/oo\/classes\/[^/?]+\/includes\/testclasses(?:\?|$)/i.test(path ?? '') &&
+    /does not have any inactive version/i.test(bodyRaw)
+  ) {
     return {
       category: 'include-not-initialized',
       hint: 'This class-local include is not initialised yet (a fresh class has no testclasses/CCAU include until first write). Write to it via SAPWrite(action="update", type="CLAS", include="testclasses", source=…) — ARC-1 auto-creates the include before writing.',
@@ -787,6 +817,23 @@ export function classifySapDomainError(
     };
   }
 
+  // Captured: EN on 750/758/816, DE on 758/816. The exact path scopes these markers so callers
+  // without release metadata get the same classification.
+  if (
+    statusCode === 404 &&
+    path &&
+    /^\/sap\/bc\/adt\/programs\/programs\/[^/?]+\/variants(?:\?|$)/i.test(path) &&
+    /No suitable resource found|Keine geeignete Ressource gefunden/i.test(bodyRaw)
+  ) {
+    return {
+      category: 'program-variants-unavailable',
+      hint:
+        'SAP has no program-variant ADT resource for this request, so ARC-1 cannot read program variants here. ' +
+        'This 404 does not show whether the program exists or has variants. ' +
+        'Use SE38 in SAP GUI to inspect variants.',
+    };
+  }
+
   // Some ADT endpoints return `HTTP 404 "No suitable resource found"` for every
   // verb while still appearing in `/discovery` — this is the ADT framework's
   // way of saying the resource URI didn't match any registered handler inside
@@ -896,7 +943,7 @@ export function classifySapDomainError(
   return undefined;
 }
 
-function looksLikeIcfServiceInactivePage(body: string): boolean {
+export function looksLikeIcfServiceInactivePage(body: string): boolean {
   return /<(?:title|h1)[^>]*>\s*Service cannot be reached\s*<\/(?:title|h1)>/i.test(body);
 }
 
@@ -1042,6 +1089,11 @@ function extractInlineLineNumber(text: string): number | undefined {
   return match?.[1] ? parseOptionalInt(match[1]) : undefined;
 }
 
+/** A control request failed before the intended data operation could receive a response. */
+export class AdtCsrfBootstrapError extends AdtApiError {
+  override name = 'AdtCsrfBootstrapError';
+}
+
 /** Network-level error (DNS, connection refused, timeout) */
 export class AdtNetworkError extends AdtError {
   constructor(
@@ -1050,6 +1102,14 @@ export class AdtNetworkError extends AdtError {
   ) {
     super(`ADT network error: ${message}`);
     this.name = 'AdtNetworkError';
+  }
+
+  get isTimeout(): boolean {
+    return this.cause?.name === 'TimeoutError';
+  }
+
+  get isCancelled(): boolean {
+    return this.cause?.name === 'AbortError';
   }
 }
 

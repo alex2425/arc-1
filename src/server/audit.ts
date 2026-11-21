@@ -8,6 +8,7 @@
  * including nested HTTP requests and auth events.
  */
 
+import { createHash } from 'node:crypto';
 import type { LogLevel } from './logger.js';
 
 /** Base shape for all audit events */
@@ -86,6 +87,16 @@ export interface DataResponseLimitedEvent extends AuditEventBase {
   queueWaitMs: number;
 }
 
+/** Optional extension discovery, with no source, response or authentication bodies. */
+export interface ExtensionDiscoveryEvent extends AuditEventBase {
+  event: 'extension_discovery';
+  providers: Array<{ id: string; status: string }>;
+  nodes: number;
+  sources: number;
+  omissions: Partial<Record<string, number>>;
+  consumed: { sends: number; responseBytes: number; elapsedMs: number };
+}
+
 /** One CSRF probe response; an unsuccessful probe can be followed by a successful fallback. */
 export interface HttpCsrfFetchEvent extends AuditEventBase {
   event: 'http_csrf_fetch';
@@ -109,6 +120,7 @@ export interface AuthScopeDeniedEvent extends AuditEventBase {
 /** Per-user ADT client created via principal propagation */
 export interface AuthPPCreatedEvent extends AuditEventBase {
   event: 'auth_pp_created';
+  transportReuse?: 'pooled-new' | 'pooled-reused' | 'request-local';
   success: boolean;
   errorMessage?: string;
 }
@@ -133,6 +145,10 @@ export interface MultiTargetStageFailedEvent extends AuditEventBase {
     | 'target_policy_denied';
   tool: string;
   errorCode: string;
+  /** Avoid credential-like field names so the central secret redactor preserves this enum. */
+  targetAccessMode?: 'xsuaa-attribute';
+  grantMode?: 'none' | 'exact' | 'all';
+  exactGrantCount?: number;
 }
 
 /** Safety system blocked an operation */
@@ -212,6 +228,15 @@ export interface OAuthClientRegisteredEvent extends AuditEventBase {
   idBytes: number;
 }
 
+/** OAuth DCR: registration was refused before a client_id was issued. */
+export interface OAuthClientRegistrationRejectedEvent extends AuditEventBase {
+  event: 'oauth_client_registration_rejected';
+  clientName?: string;
+  /** Parsed host only; never the submitted path, query or credentials. */
+  redirectUriHost?: string;
+  reason: string;
+}
+
 /** OAuth DCR: getClient was called with an unrecognised, malformed, or
  *  forged-signature client_id. Useful for detecting probing/replay attempts. */
 export interface OAuthClientLookupFailedEvent extends AuditEventBase {
@@ -260,6 +285,27 @@ export interface CorsRejectedEvent extends AuditEventBase {
   path: string;
 }
 
+/** `ARC1_ALLOWED_CLIENT_IPS` refused a request with 403 before body parsing and authentication.
+ *  Not forwarded to the BTP Audit Log: unauthenticated traffic can trigger it at will. */
+export interface ClientIpRejectedEvent extends AuditEventBase {
+  event: 'client_ip_rejected';
+  reason: 'not_allowed' | 'missing_header' | 'invalid_header';
+  /** Raw `x-cf-true-client-ip` value, capped at 64 characters. May be malformed — treat as untrusted. */
+  clientIp?: string;
+  method: string;
+  path: string;
+}
+
+/** An authenticated multi-target MCP request was refused at the HTTP edge, before tool dispatch.
+ *  Carries no target, path alias, token or body: the caller may not see the target inventory. */
+export interface McpRouteDeniedEvent extends AuditEventBase {
+  event: 'mcp_route_denied';
+  route: 'pinned-mcp' | 'aggregate-mcp';
+  /** `user_token_required`: a valid XSUAA token that is not a user principal (no user/client ID available). */
+  reason: 'missing_scope' | 'user_token_required';
+  requiredScope?: 'read';
+}
+
 /** Layer 1: a per-IP HTTP-edge rate limit fired. Either OAuth (`/register`, `/authorize`,
  *  `/token`, `/revoke`) or `/mcp` (pre-bearer-auth probing). Returned a 429 with
  *  `Retry-After` and RFC 9331 `RateLimit-*` headers. See docs_page/rate-limiting.md. */
@@ -290,6 +336,7 @@ export interface McpRateLimitedEvent extends AuditEventBase {
 
 /** Discriminated union of all audit events */
 export type AuditEvent =
+  | ExtensionDiscoveryEvent
   | DataSourcePolicyDecisionEvent
   | ToolCallStartEvent
   | ToolCallEndEvent
@@ -304,10 +351,13 @@ export type AuditEvent =
   | ServerStartEvent
   | ActivationPreauditEvent
   | OAuthClientRegisteredEvent
+  | OAuthClientRegistrationRejectedEvent
   | OAuthClientLookupFailedEvent
   | OAuthRedirectUriRegisteredEvent
   | OAuthRedirectUriRejectedEvent
   | CorsRejectedEvent
+  | ClientIpRejectedEvent
+  | McpRouteDeniedEvent
   | AuthRateLimitedEvent
   | McpRateLimitedEvent;
 
@@ -386,6 +436,22 @@ const KNOWN_SENSITIVE_FIELD_KEYS = new Set([
 const KNOWN_SAFE_FIELD_KEYS = new Set(['includesignature']);
 
 const PAYLOAD_BODY_KEYS = new Set(['errorbody', 'errormessage', 'requestbody', 'responsebody', 'resultpreview']);
+/** Source and business-content argument keys: audited as length + SHA-256 prefix only. */
+const CONTENT_KEYS = new Set([
+  'source',
+  'content',
+  'oldcontent',
+  'newcontent',
+  'proposalusercontent',
+  'fixedvalues',
+  'messages',
+  'shorttexts',
+  'parameters',
+]);
+/** SAPSearch tadir_lookup `source` routing enum (drives sql-scope escalation), not content. */
+const SOURCE_ROUTING_VALUES = new Set(['adt', 'db', 'both']);
+// ponytail: a caller can still forge one well-formed summary (≤9 digits + 12 hex); no source fits in it.
+const CONTENT_SUMMARY_PATTERN = /^\[REDACTED content \d{1,9} chars sha256:[0-9a-f]{12}\]$/;
 const REDACTION_LIMIT_MARKER = '[TRUNCATED: redaction budget exceeded]';
 const MAX_REDACTION_DEPTH = 16;
 const MAX_REDACTION_ENTRIES = 512;
@@ -471,7 +537,7 @@ function sanitizeUrlAssignments(value: string): string {
 }
 
 function sanitizeUrl(value: string): string {
-  const normalizedValue = normalizeEscapedUrlSlashes(value);
+  const normalizedValue = redactApplicationLogUrl(normalizeEscapedUrlSlashes(value));
   try {
     const parsed = new URL(normalizedValue);
     let changed = parsed.username.length > 0 || parsed.password.length > 0;
@@ -516,12 +582,20 @@ function sanitizeUrl(value: string): string {
 }
 
 function sanitizeText(value: string): string {
-  const normalized = normalizeEscapedUrlSlashes(value);
+  const normalized = redactApplicationLogUrl(normalizeEscapedUrlSlashes(value));
   return redactCredentialAssignments(normalized).replace(/https?:\/\/[^\s<>"']+/gi, (candidate) => {
     const trailing = candidate.match(/[),.;]+$/)?.[0] ?? '';
     const core = trailing ? candidate.slice(0, -trailing.length) : candidate;
     return `${sanitizeUrl(core)}${trailing}`;
   });
+}
+
+/** Log numbers and opaque handles in native OData paths are business identifiers. */
+function redactApplicationLogUrl(value: string): string {
+  return value.replace(
+    /(\/sap\/opu\/odata\/sap\/APL_LOG_MANAGEMENT_SRV\/)[^\r\n]*/giu,
+    '$1[REDACTED application-log request]',
+  );
 }
 
 function boundAuditString(value: string, originalLength = value.length): string {
@@ -560,10 +634,45 @@ function redactPayloadValue(value: unknown): string {
   return '[REDACTED]';
 }
 
+function summarizeContent(key: string, value: unknown): unknown {
+  if (value == null) return value;
+  if (typeof value === 'string') {
+    // The sink redactor runs again over sanitizeArgs output; keep an exact summary stable.
+    if (CONTENT_SUMMARY_PATTERN.test(value)) return value;
+    if (canonicalKey(key) === 'source' && SOURCE_ROUTING_VALUES.has(value)) return value;
+  }
+  let text: string;
+  try {
+    text = typeof value === 'string' ? value : (JSON.stringify(value) ?? String(value));
+  } catch {
+    return '[REDACTED content]';
+  }
+  const digest = createHash('sha256').update(text).digest('hex').slice(0, 12);
+  return `[REDACTED content ${text.length} chars sha256:${digest}]`;
+}
+
+/** Long-text keys and phrases are business data, including on requests rejected before validation. */
+function summarizeLongTextArgs(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return '[REDACTED stored-text parameters]';
+  const input = value as Record<string, unknown>;
+  const mode =
+    typeof input.mode === 'string' && ['discover', 'read', 'search'].includes(input.mode) ? input.mode : 'invalid';
+  // Accept our existing summary too: sanitizeArgs and the final sink redactor both run.
+  const keyCount = Array.isArray(input.keys) ? input.keys.length : input.keyCount;
+  return {
+    mode,
+    ...(typeof keyCount === 'number' && Number.isSafeInteger(keyCount) && keyCount >= 0 ? { keyCount } : {}),
+  };
+}
+
 function redactValue(key: string, value: unknown, state: RedactionState, depth: number, mode: RedactionMode): unknown {
   if (depth > MAX_REDACTION_DEPTH || state.remainingEntries <= 0) return REDACTION_LIMIT_MARKER;
   state.remainingEntries -= 1;
+  if (canonicalKey(key) === 'longtext') return summarizeLongTextArgs(value);
+  if (canonicalKey(key) === 'applicationlog') return '[REDACTED application-log parameters]';
   if (isSensitiveKey(key)) return '[REDACTED]';
+  // Schema keys are ASCII; a non-ASCII key (e.g. a homoglyph `sоurce`) is summarized before validation rejects it.
+  if (CONTENT_KEYS.has(canonicalKey(key)) || /[^\x20-\x7e]/.test(key)) return summarizeContent(key, value);
   if (mode === 'audit-event' && PAYLOAD_BODY_KEYS.has(canonicalKey(key))) {
     if (value == null) return value;
     return redactPayloadValue(value);
@@ -587,6 +696,35 @@ function redactValue(key: string, value: unknown, state: RedactionState, depth: 
     return result;
   }
   if (value && typeof value === 'object') {
+    const input = value as Record<string, unknown>;
+    const inputAction = Array.isArray(input.action) && input.action.length === 1 ? input.action[0] : input.action;
+    const params =
+      input.params && typeof input.params === 'object' ? (input.params as Record<string, unknown>) : undefined;
+    const paramsAction =
+      Array.isArray(params?.action) && params.action.length === 1 ? params.action[0] : params?.action;
+    const logAction = typeof inputAction === 'string' && /^application_log$/iu.test(inputAction);
+    const nestedLogAction =
+      typeof inputAction === 'string' &&
+      /^query$/iu.test(inputAction) &&
+      typeof paramsAction === 'string' &&
+      /^application_log$/iu.test(paramsAction);
+    if (logAction || nestedLogAction) {
+      const safe = { action: 'application_log', applicationLog: '[REDACTED application-log parameters]' };
+      return nestedLogAction ? { action: 'query', params: safe } : safe;
+    }
+    const textAction = typeof inputAction === 'string' && /^long_text$/iu.test(inputAction);
+    const nestedTextAction =
+      typeof inputAction === 'string' &&
+      /^query$/iu.test(inputAction) &&
+      typeof paramsAction === 'string' &&
+      /^long_text$/iu.test(paramsAction);
+    if (textAction || nestedTextAction) {
+      // Include malformed invocations too: old-style top-level name/phrase fields must not
+      // become a business-data logging path before long-text validation rejects them.
+      const summary = summarizeLongTextArgs(input.longText ?? params?.longText);
+      if (nestedTextAction) return { action: 'query', params: { action: 'long_text', longText: summary } };
+      return { action: 'long_text', longText: summary };
+    }
     if (state.seen.has(value)) return REDACTION_LIMIT_MARKER;
     state.seen.add(value);
     const result: Record<string, unknown> = {};

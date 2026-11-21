@@ -19,8 +19,10 @@
 import { parseBlockedDataSourcesCsv } from '../adt/data-source-name.js';
 import type { SafetyConfig } from '../adt/safety.js';
 import { resolveSapUserAgent } from '../adt/user-agent.js';
+import { assertClientIpAllowlistPlatform, parseAllowedClientIps } from './client-ip-allowlist.js';
 import { parseDenyActions, validateDenyActions } from './deny-actions.js';
 import { logger } from './logger.js';
+import { SAP_SYSID_PATTERN } from './multi-target-identity.js';
 import type {
   ConfigSource,
   FeatureToggle,
@@ -29,7 +31,7 @@ import type {
   TransportType,
   UiMode,
 } from './types.js';
-import { DEFAULT_CONFIG } from './types.js';
+import { DEFAULT_CONFIG, MAX_HTTP_REQUEST_BYTES } from './types.js';
 
 /**
  * Parse metadata for configuration flags accepted by the CLI.
@@ -78,8 +80,15 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
   { name: 'cookie-string', valueName: 'cookies', description: 'SAP Cookie header value' },
   { name: 'transport', valueName: 'transport', description: 'MCP transport: stdio or http-streamable' },
   { name: 'http-addr', valueName: 'host:port', description: 'HTTP transport bind address' },
+  { name: 'max-http-request-bytes', valueName: 'bytes', description: 'MCP HTTP JSON body limit (1–16777216 bytes)' },
   { name: 'port', valueName: 'port', description: 'HTTP transport port override' },
   { name: 'server-name', valueName: 'name', description: 'MCP server name' },
+  {
+    name: 'ide-links',
+    valueName: 'mode',
+    description: 'Eclipse source links: off (default) or eclipse; VS Code uses SAP ADT MCP',
+  },
+  { name: 'ide-system-id', valueName: 'sid', description: 'Real SAP SID for Eclipse links (single-target only)' },
   { name: 'system-label', valueName: 'label', description: 'Connected-system label shown in MCP instructions' },
   {
     name: 'ui',
@@ -91,7 +100,11 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
   { name: 'ui-port', valueName: 'port', description: 'Admin UI port override' },
   { name: 'ui-open', valueName: 'boolean', description: 'Open the local admin UI in a browser (true/false)' },
   { name: 'allow-writes', valueName: 'boolean', description: 'Enable SAP mutations (true/false)' },
-  { name: 'allow-data-preview', valueName: 'boolean', description: 'Enable table data preview (true/false)' },
+  {
+    name: 'allow-data-preview',
+    valueName: 'boolean',
+    description: 'Enable table data preview, stored SAPscript texts and saved application logs (true/false)',
+  },
   { name: 'allow-free-sql', valueName: 'boolean', description: 'Enable freestyle SQL (true/false)' },
   {
     name: 'allow-transport-writes',
@@ -109,8 +122,8 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
   { name: 'deny-actions', valueName: 'patterns', description: 'Action deny patterns or file path' },
   { name: 'feature-abapgit', valueName: 'mode', description: 'abapGit feature toggle: auto/on/off' },
   { name: 'feature-gcts', valueName: 'mode', description: 'gCTS feature toggle: auto/on/off' },
+  { name: 'feature-amdp', valueName: 'mode', description: 'Ignored; AMDP probe removed' },
   { name: 'feature-rap', valueName: 'mode', description: 'RAP feature toggle: auto/on/off' },
-  { name: 'feature-amdp', valueName: 'mode', description: 'AMDP feature toggle: auto/on/off' },
   { name: 'feature-ui5', valueName: 'mode', description: 'UI5 feature toggle: auto/on/off' },
   { name: 'feature-transport', valueName: 'mode', description: 'Transport feature toggle: auto/on/off' },
   { name: 'feature-hana', valueName: 'mode', description: 'HANA feature toggle: auto/on/off' },
@@ -126,12 +139,23 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
   { name: 'oidc-scopes', valueName: 'scopes', description: 'OIDC scopes' },
   { name: 'xsuaa-auth', valueName: 'boolean', description: 'Enable XSUAA MCP authentication (true/false)' },
   { name: 'allow-http-no-auth', valueName: 'boolean', description: 'Allow unauthenticated HTTP MCP (true/false)' },
+  { name: 'oauth-dcr-enabled', valueName: 'boolean', description: 'Allow new OAuth client registrations' },
+  {
+    name: 'oauth-dcr-redirect-uri-patterns',
+    valueName: 'patterns',
+    description: 'Allowed return addresses for new and existing OAuth client registrations',
+  },
   { name: 'oauth-dcr-ttl-seconds', valueName: 'seconds', description: 'OAuth DCR client lifetime' },
   { name: 'dcr-signing-secret', valueName: 'secret', description: 'OAuth DCR signing secret' },
   { name: 'btp-service-key', valueName: 'json', description: 'BTP ABAP service-key JSON' },
   { name: 'btp-service-key-file', valueName: 'path', description: 'BTP ABAP service-key file' },
   { name: 'btp-oauth-callback-port', valueName: 'port', description: 'BTP OAuth callback port' },
   { name: 'multi-target-endpoints', valueName: 'boolean', description: 'Enable multi-target endpoints (true/false)' },
+  {
+    name: 'multi-target-authorization',
+    valueName: 'mode',
+    description: 'Multi-target authorization: standard (default) or xsuaa-attribute',
+  },
   {
     name: 'multi-target-allow-basic-auth',
     valueName: 'boolean',
@@ -144,6 +168,23 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
     valueName: 'boolean',
     description: 'Allow shared cookies beside principal propagation (true/false)',
   },
+  {
+    name: 'pp-saml-idp-key-file',
+    valueName: 'path',
+    description: 'Experimental: PEM key signing local SAML bearer assertions',
+  },
+  {
+    name: 'pp-saml-idp-cert-file',
+    valueName: 'path',
+    description: 'Experimental: PEM certificate trusted by the SAP system',
+  },
+  { name: 'pp-saml-issuer', valueName: 'id', description: 'Experimental: SAML issuer / entity ID' },
+  { name: 'pp-saml-audience', valueName: 'id', description: 'Experimental: SAML audience (SAP local provider name)' },
+  { name: 'pp-saml-recipient', valueName: 'url', description: 'Experimental: SAML recipient (default SAP URL)' },
+  { name: 'pp-saml-nameid-claim', valueName: 'claim', description: 'Experimental: JWT claim used as SAML NameID' },
+  { name: 'pp-saml-nameid-format', valueName: 'format', description: 'Experimental: email or unspecified' },
+  { name: 'pp-saml-authn-context', valueName: 'uri', description: 'Experimental: AuthnContextClassRef URI' },
+  { name: 'pp-saml-ttl-seconds', valueName: 'seconds', description: 'Experimental: assertion validity (30-3600)' },
   { name: 'disable-saml', valueName: 'boolean', description: 'Disable SAP SAML redirects (true/false)' },
   { name: 'tool-mode', valueName: 'mode', description: 'Tool mode: standard or hyperfocused' },
   {
@@ -181,6 +222,11 @@ export const CLI_CONFIG_OPTION_SPECS: readonly CliConfigOptionSpec[] = [
   { name: 'auth-rate-limit', valueName: 'per-minute', description: 'OAuth requests per IP per minute' },
   { name: 'rate-limit', valueName: 'per-minute', description: 'MCP calls per user per minute' },
   { name: 'allowed-origins', valueName: 'origins', description: 'Comma-separated browser CORS origins' },
+  {
+    name: 'allowed-client-ips',
+    valueName: 'addresses',
+    description: 'Comma-separated client IPs/CIDR ranges (SAP BTP CF only)',
+  },
   { name: 'log-file', valueName: 'path', description: 'Audit/log output file' },
   { name: 'log-level', valueName: 'level', description: 'Log level: debug/info/warn/error' },
   { name: 'log-format', valueName: 'format', description: 'Log format: text or json' },
@@ -320,6 +366,11 @@ export function parseApiKeys(raw: string): Array<{ key: string; profile: string 
     throw new Error('ARC1_API_KEYS is set but contains no valid entries. Format: "key1:profile1,key2:profile2"');
   }
   return entries;
+}
+
+/** Comma or whitespace separated redirect-URI globs; neither occurs inside a pattern. */
+export function splitRedirectPatterns(raw: string): string[] {
+  return raw.split(/[,\s]+/).filter((pattern) => pattern.length > 0);
 }
 
 function parseUiMode(raw: string, transport: TransportType): UiMode {
@@ -603,6 +654,17 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
     config.httpAddr = `${addrHost}:${parsedPort}`;
     sources.httpAddr = getFlag('port') !== undefined ? { flag: '--port' } : { env: 'ARC1_PORT' };
   }
+  config.maxHttpRequestBytes = resolvePositiveSafeInteger(
+    'max-http-request-bytes',
+    'ARC1_MAX_HTTP_REQUEST_BYTES',
+    DEFAULT_CONFIG.maxHttpRequestBytes,
+    'maxHttpRequestBytes',
+  );
+  if (config.maxHttpRequestBytes > MAX_HTTP_REQUEST_BYTES) {
+    throw new Error(
+      `ARC1_MAX_HTTP_REQUEST_BYTES / --max-http-request-bytes must not exceed ${MAX_HTTP_REQUEST_BYTES}.`,
+    );
+  }
   config.serverName = resolveStr('server-name', 'ARC1_SERVER_NAME', DEFAULT_CONFIG.serverName, 'serverName');
   config.systemLabel = normalizeSystemLabel(
     resolveStr('system-label', 'ARC1_SYSTEM_LABEL', DEFAULT_CONFIG.systemLabel, 'systemLabel'),
@@ -726,11 +788,14 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
     sources.denyActions = 'default';
   }
 
+  if (getFlag('feature-amdp') !== undefined || process.env.SAP_FEATURE_AMDP !== undefined) {
+    console.error('[warn] --feature-amdp / SAP_FEATURE_AMDP is ignored; the unused AMDP probe was removed.');
+  }
+
   // ── Features ───────────────────────────────────────────────────────
   config.featureAbapGit = resolveFeature('feature-abapgit', 'SAP_FEATURE_ABAPGIT', 'featureAbapGit');
   config.featureGcts = resolveFeature('feature-gcts', 'SAP_FEATURE_GCTS', 'featureGcts');
   config.featureRap = resolveFeature('feature-rap', 'SAP_FEATURE_RAP', 'featureRap');
-  config.featureAmdp = resolveFeature('feature-amdp', 'SAP_FEATURE_AMDP', 'featureAmdp');
   config.featureUi5 = resolveFeature('feature-ui5', 'SAP_FEATURE_UI5', 'featureUi5');
   config.featureTransport = resolveFeature('feature-transport', 'SAP_FEATURE_TRANSPORT', 'featureTransport');
   config.featureHana = resolveFeature('feature-hana', 'SAP_FEATURE_HANA', 'featureHana');
@@ -771,6 +836,19 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
     sources.oidcScopes = 'default';
   }
   config.xsuaaAuth = resolveBool('xsuaa-auth', 'SAP_XSUAA_AUTH', false, 'xsuaaAuth');
+  config.oauthDcrEnabled = resolveBool('oauth-dcr-enabled', 'ARC1_OAUTH_DCR_ENABLED', true, 'oauthDcrEnabled');
+  // An explicitly empty policy must deny all DCR redirects, never restore defaults.
+  const dcrRedirectFlag = getFlag('oauth-dcr-redirect-uri-patterns');
+  const dcrRedirectEnv = process.env.ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS;
+  const dcrRedirectPatterns = dcrRedirectFlag ?? dcrRedirectEnv;
+  config.oauthDcrRedirectUriPatterns =
+    dcrRedirectPatterns === undefined ? undefined : splitRedirectPatterns(dcrRedirectPatterns);
+  sources.oauthDcrRedirectUriPatterns =
+    dcrRedirectFlag !== undefined
+      ? { flag: '--oauth-dcr-redirect-uri-patterns' }
+      : dcrRedirectEnv !== undefined
+        ? { env: 'ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS' }
+        : 'default';
   config.allowHttpNoAuth = resolveBool('allow-http-no-auth', 'ARC1_ALLOW_HTTP_NO_AUTH', false, 'allowHttpNoAuth');
 
   // OAuth DCR client_id lifetime. Default: 0 = never expire (no per-client
@@ -817,6 +895,26 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
     false,
     'multiTargetEndpoints',
   );
+  const targetAuthorizationFlag = getFlag('multi-target-authorization');
+  if (targetAuthorizationFlag === undefined && args.includes('--multi-target-authorization')) {
+    throw new Error('--multi-target-authorization requires standard or xsuaa-attribute.');
+  }
+  const targetAuthorizationEnv = process.env.ARC1_MULTI_TARGET_AUTHORIZATION;
+  const targetAuthorizationRaw = targetAuthorizationFlag ?? targetAuthorizationEnv;
+  if (targetAuthorizationRaw === undefined) {
+    // Unlike resolveStr, an explicit empty value must never disable enforcement.
+    sources.multiTargetAuthorization = 'default';
+  } else {
+    const mode = targetAuthorizationRaw.trim();
+    if (mode !== 'standard' && mode !== 'xsuaa-attribute') {
+      throw new Error('ARC1_MULTI_TARGET_AUTHORIZATION must be standard or xsuaa-attribute; empty values are invalid.');
+    }
+    config.multiTargetAuthorization = mode;
+    sources.multiTargetAuthorization =
+      targetAuthorizationFlag !== undefined
+        ? { flag: '--multi-target-authorization' }
+        : { env: 'ARC1_MULTI_TARGET_AUTHORIZATION' };
+  }
   config.multiTargetAllowBasicAuth = resolveBool(
     'multi-target-allow-basic-auth',
     'ARC1_MULTI_TARGET_ALLOW_BASIC_AUTH',
@@ -851,8 +949,48 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
     'ppAllowSharedCookies',
   );
 
+  // ── Experimental local SAML bearer issuer ──
+  config.samlIdpKeyFile = resolveOptionalStr('pp-saml-idp-key-file', 'SAP_PP_SAML_IDP_KEY_FILE', 'samlIdpKeyFile');
+  config.samlIdpCertFile = resolveOptionalStr('pp-saml-idp-cert-file', 'SAP_PP_SAML_IDP_CERT_FILE', 'samlIdpCertFile');
+  config.samlIdpIssuer = resolveOptionalStr('pp-saml-issuer', 'SAP_PP_SAML_ISSUER', 'samlIdpIssuer');
+  config.samlAudience = resolveOptionalStr('pp-saml-audience', 'SAP_PP_SAML_AUDIENCE', 'samlAudience');
+  config.samlRecipient = resolveOptionalStr('pp-saml-recipient', 'SAP_PP_SAML_RECIPIENT', 'samlRecipient');
+  config.samlNameIdClaim = resolveOptionalStr('pp-saml-nameid-claim', 'SAP_PP_SAML_NAMEID_CLAIM', 'samlNameIdClaim');
+  const samlNameIdFormat = resolveStr(
+    'pp-saml-nameid-format',
+    'SAP_PP_SAML_NAMEID_FORMAT',
+    'email',
+    'samlNameIdFormat',
+  );
+  if (samlNameIdFormat !== 'email' && samlNameIdFormat !== 'unspecified') {
+    throw new Error('SAP_PP_SAML_NAMEID_FORMAT must be email or unspecified');
+  }
+  config.samlNameIdFormat = samlNameIdFormat;
+  config.samlAuthnContextClassRef = resolveStr(
+    'pp-saml-authn-context',
+    'SAP_PP_SAML_AUTHN_CONTEXT',
+    'urn:oasis:names:tc:SAML:2.0:ac:classes:PreviousSession',
+    'samlAuthnContextClassRef',
+  );
+  const samlTtl = resolvePositiveSafeInteger(
+    'pp-saml-ttl-seconds',
+    'SAP_PP_SAML_TTL_SECONDS',
+    300,
+    'samlAssertionTtlSeconds',
+  );
+  config.samlAssertionTtlSeconds = Math.min(3600, Math.max(30, samlTtl));
+
   // ── SAML Behavior ──────────────────────────────────────────────────
   config.disableSaml2 = resolveBool('disable-saml', 'SAP_DISABLE_SAML', false, 'disableSaml2');
+
+  const ideLinks = resolveStr('ide-links', 'ARC1_IDE_LINKS', 'off', 'ideLinks');
+  if (ideLinks !== 'off' && ideLinks !== 'eclipse') {
+    throw new Error(
+      'ARC1_IDE_LINKS must be off or eclipse. VS Code navigation uses the local SAP ADT MCP resolver; remove old IDE destination mappings.',
+    );
+  }
+  config.ideLinks = ideLinks;
+  config.ideSystemId = resolveStr('ide-system-id', 'ARC1_IDE_SYSTEM_ID', '', 'ideSystemId');
 
   // ── Tool Mode ──────────────────────────────────────────────────────
   const toolMode = resolveStr('tool-mode', 'ARC1_TOOL_MODE', 'standard', 'toolMode');
@@ -983,6 +1121,16 @@ export function resolveConfig(args: string[]): { config: ServerConfig; sources: 
     sources.allowedOrigins = 'default';
   }
 
+  const clientIpsFlag = getFlag('allowed-client-ips');
+  const clientIpsRaw = clientIpsFlag ?? process.env.ARC1_ALLOWED_CLIENT_IPS;
+  if (clientIpsRaw !== undefined) {
+    const label = clientIpsFlag !== undefined ? '--allowed-client-ips' : 'ARC1_ALLOWED_CLIENT_IPS';
+    config.allowedClientIps = parseAllowedClientIps(clientIpsRaw, label);
+    sources.allowedClientIps = clientIpsFlag !== undefined ? { flag: label } : { env: label };
+  } else {
+    sources.allowedClientIps = 'default';
+  }
+
   // ── Logging ────────────────────────────────────────────────────────
   config.logFile = resolveOptionalStr('log-file', 'ARC1_LOG_FILE', 'logFile');
   const logLevel = resolveStr('log-level', 'ARC1_LOG_LEVEL', 'info', 'logLevel');
@@ -1021,6 +1169,22 @@ export function parseArgs(args: string[]): ServerConfig {
  * Fails fast at startup for invalid or dangerous config combinations.
  */
 export function validateConfig(config: ServerConfig): void {
+  if (config.ideSystemId && !SAP_SYSID_PATTERN.test(config.ideSystemId)) {
+    throw new Error('ARC1_IDE_SYSTEM_ID must be the real three-character SAP SID (uppercase, starting with a letter).');
+  }
+  if (config.multiTargetEndpoints && config.ideSystemId && !config.targetId) {
+    throw new Error('ARC1_IDE_SYSTEM_ID is single-target only; multi-target uses each destination sap-sysid.');
+  }
+  if (config.ideLinks === 'eclipse' && !config.multiTargetEndpoints && !config.ideSystemId) {
+    throw new Error('ARC1_IDE_LINKS=eclipse requires ARC1_IDE_SYSTEM_ID for a single-target connection.');
+  }
+
+  if (config.multiTargetAuthorization !== 'standard' && config.multiTargetAuthorization !== 'xsuaa-attribute') {
+    throw new Error('ARC1_MULTI_TARGET_AUTHORIZATION must be standard or xsuaa-attribute.');
+  }
+  if (config.multiTargetAuthorization === 'xsuaa-attribute' && !config.multiTargetEndpoints) {
+    throw new Error('ARC1_MULTI_TARGET_AUTHORIZATION=xsuaa-attribute requires ARC1_MULTI_TARGET_ENDPOINTS=true.');
+  }
   // SAP client (MANDT) is a canonical 3-digit value (CHAR 3, range 000-999). SAP
   // does NOT zero-pad the sap-client URL parameter, so a 1-2 digit value like '10'
   // authenticates against a different (or non-existent) client and surfaces as a
@@ -1123,8 +1287,44 @@ export function validateConfig(config: ServerConfig): void {
     );
   }
 
+  if (config.transport === 'http-streamable') assertClientIpAllowlistPlatform(config.allowedClientIps);
+
   const hasCookieAuth = !!(config.cookieFile || config.cookieString);
   const hasBtpServiceKey = !!(config.btpServiceKey || config.btpServiceKeyFile);
+
+  // Experimental local SAML bearer issuer. Fail closed on half-configured issuers; the feature is a
+  // single-target, OIDC-only per-user path and must not combine with BTP-discovered targets.
+  const samlIssuerFields = [config.samlIdpKeyFile, config.samlIdpCertFile, config.samlIdpIssuer, config.samlAudience];
+  if (samlIssuerFields.some(Boolean)) {
+    if (!samlIssuerFields.every(Boolean)) {
+      throw new Error(
+        'Local SAML bearer issuer needs all of SAP_PP_SAML_IDP_KEY_FILE, SAP_PP_SAML_IDP_CERT_FILE, SAP_PP_SAML_ISSUER and SAP_PP_SAML_AUDIENCE.',
+      );
+    }
+    if (!config.samlNameIdClaim) {
+      throw new Error('Local SAML bearer issuer requires SAP_PP_SAML_NAMEID_CLAIM to be set explicitly.');
+    }
+    if (!config.ppEnabled) {
+      throw new Error(
+        'SAP_PP_SAML_IDP_KEY_FILE requires SAP_PP_ENABLED=true — the assertion is only issued for principal propagation.',
+      );
+    }
+    if (!config.oidcIssuer) {
+      throw new Error(
+        'SAP_PP_SAML_IDP_KEY_FILE requires SAP_OIDC_ISSUER/SAP_OIDC_AUDIENCE — the NameID is taken from a verified OIDC token.',
+      );
+    }
+    if (config.multiTargetEndpoints || config.xsuaaAuth) {
+      throw new Error(
+        'SAP_PP_SAML_IDP_KEY_FILE is a single-target OIDC path; it cannot combine with multi-target mode or XSUAA.',
+      );
+    }
+    if (!config.url) {
+      throw new Error(
+        'SAP_PP_SAML_IDP_KEY_FILE requires SAP_URL — the local issuer connects to the SAP system directly.',
+      );
+    }
+  }
 
   if (config.ppEnabled && hasCookieAuth && !config.ppAllowSharedCookies) {
     throw new Error(

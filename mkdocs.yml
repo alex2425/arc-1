@@ -50,6 +50,9 @@ nav:
   - Home: index.md
   - Newsletter: newsletter.md
   - Quickstart: quickstart.md
+  - Security:
+      - Security Review: security.md
+      - Hardening Guide: security-guide.md
   - Agent Plugin: agent-plugin.md
   - Install in Claude: install-in-claude.md
   - Deployment:
@@ -58,6 +61,7 @@ nav:
       - BTP Cloud Foundry: btp-cloud-foundry-deployment.md
       - Docker: docker.md
       - Multi-System Setup (Multi-Target): multi-target-setup.md
+      - Pinned PP Writes: multi-target-writes.md
       - Other SAP Environments:
           - BTP ABAP Environment: btp-abap-environment.md
           - BTP ABAP Prerequisites (SAP side): btp-abap-prerequisites.md
@@ -70,16 +74,20 @@ nav:
   - Auth & Permissions:
       - Overview: enterprise-auth.md
       - Authorization & Roles: authorization.md
+      - Restrict System and Client Access: multi-target-authorization.md
       - XSUAA Setup: xsuaa-setup.md
       - Principal Propagation: principal-propagation-setup.md
       - BTP Destination Setup: btp-destination-setup.md
       - Other Authentication Methods:
           - API Key: api-key-setup.md
           - OAuth / JWT: oauth-jwt-setup.md
+          - Experimental Local SSO (SAML bearer, no BTP): local-sso-experimental.md
   - Using ARC-1:
       - Tools Reference: tools.md
       - Extensions (Custom Tools): extensions.md
       - MCP Usage Guide: mcp-usage.md
+      - Open Objects in Your Editor: ide-integration.md
+      - SQL Notebook Authoring: sql-notebook-authoring.md
       - Skills: skills.md
       - More:
           - Blog Series: blog-series.md
@@ -90,7 +98,6 @@ nav:
       - Configuration Precedence: configuration-precedence.md
       - SAP API Policy & Architecture: sap-api-policy-and-architecture.md
       - vs SAP ABAP MCP Server: arc-1-vs-sap-abap-mcp-server.md
-      - Security: security-guide.md
       - Operations:
           - Overview: operations.md
           - Log Analysis: log-analysis.md
@@ -103,6 +110,8 @@ nav:
       - Architecture: architecture.md
       - More:
           - CLI Guide: cli-guide.md
+          - Transport reviews: review-workflows.md
+          - Local Files in Codex: codex-file-source.md
           - SAP Trial Setup: sap-trial-setup.md
           - Authentication Test Process: auth-test-process.md
 

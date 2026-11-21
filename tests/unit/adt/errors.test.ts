@@ -658,6 +658,24 @@ describe('AdtApiError', () => {
       expect(classification?.category).toBe('authorization');
     });
 
+    it('recognizes Gateway service resolution by code regardless of message language', () => {
+      const body = JSON.stringify({ error: { code: '/IWFND/MED/170', message: { value: 'Kein Service gefunden' } } });
+      const classification = classifySapDomainError(403, body, '/sap/opu/odata/sap/APL_LOG_MANAGEMENT_SRV/');
+      expect(classification?.category).toBe('gateway-service-not-found');
+      expect(classification?.transaction).toBe('/IWFND/MAINT_SERVICE');
+    });
+
+    it.each([
+      [401, '{"error":{"code":"/IWFND/MED/170"}}', '/sap/opu/odata/sap/TEST/'],
+      [403, '{"error":{"code":"/IWFND/MED/170"}}', '/sap/bc/adt/core/discovery'],
+      [403, '{"error":{"code":"/IWFND/MED/171","message":"No service found"}}', '/sap/opu/odata/sap/TEST/'],
+      [403, '{"error":{"code":"/IWFND/MED/170"}', '/sap/opu/odata/sap/TEST/'],
+      [403, 'No service found /IWFND/MED/170', '/sap/opu/odata/sap/TEST/'],
+      [403, 'null', '/sap/opu/odata/sap/TEST/'],
+    ] as const)('does not infer Gateway service resolution from a near match (%s %s %s)', (status, body, path) => {
+      expect(classifySapDomainError(status, body, path)?.category).not.toBe('gateway-service-not-found');
+    });
+
     it('classifies an un-activated ICF node (403 "Service cannot be reached" HTML) as icf-service-inactive', () => {
       const html =
         '<html><head><title>Service cannot be reached</title></head><body>' +
@@ -735,14 +753,31 @@ describe('AdtApiError', () => {
       expect(classification?.transaction).toBe('SICF');
     });
 
-    it('classifies the CCAU "does not have any inactive version" 500 as include-not-initialized', () => {
+    it.each([
+      '/sap/bc/adt/oo/classes/ZCL_X/includes/testclasses',
+      '/sap/bc/adt/oo/classes/%2FACME%2FCL_X/includes/testclasses?lockHandle=TEST',
+    ])('classifies an uninitialized CCAU save at %s', (path) => {
       const xml =
         '<exc:exception xmlns:exc="http://www.sap.com/abapxml/types/communicationframework"><type id="ExceptionResourceSaveFailure"/><message lang="EN">ZCL_X==============CCAU does not have any inactive version</message></exc:exception>';
-      const classification = classifySapDomainError(500, xml);
+      const classification = classifySapDomainError(500, xml, path);
       expect(classification?.category).toBe('include-not-initialized');
       expect(classification?.hint).toMatch(/testclasses|auto-creates/i);
       // Must NOT be mis-classified as activation-dependency (that branch also matches /inactive/).
       expect(classification?.category).not.toBe('activation-dependency');
+    });
+
+    it.each([
+      [404, '/sap/bc/adt/programs/programs/ZNONEXIST/source/main?version=active', 'ExceptionResourceNotFound'],
+      [500, '/sap/bc/adt/programs/programs/ZNONEXIST/source/main', 'ExceptionResourceSaveFailure'],
+      [500, '/sap/bc/adt/oo/classes/ZCL_X/source/main', 'ExceptionResourceSaveFailure'],
+      [500, '/sap/bc/adt/oo/classes/ZCL_X/includes/definitions', 'ExceptionResourceSaveFailure'],
+      [500, '/sap/bc/adt/oo/classes/ZCL_X/includes/testclasses/versions', 'ExceptionResourceSaveFailure'],
+      [404, '/sap/bc/adt/oo/classes/ZCL_X/includes/testclasses', 'ExceptionResourceNotFound'],
+      [500, '/sap/bc/adt/oo/classes/ZCL_X/includes/testclasses', 'ExceptionInternalError'],
+      [500, undefined, 'ExceptionResourceSaveFailure'],
+    ])('does not give CCAU creation advice for %s %s (%s)', (status, path, type) => {
+      const xml = `<exc:exception><type id="${type}"/><message>ZNONEXIST does not have any inactive version</message></exc:exception>`;
+      expect(classifySapDomainError(status, xml, path)?.category).not.toBe('include-not-initialized');
     });
 
     it('does NOT classify an unrelated 500 as include-not-initialized', () => {

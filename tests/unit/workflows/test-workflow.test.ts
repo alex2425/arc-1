@@ -141,6 +141,8 @@ describe('test workflow gate behavior', () => {
     for (const step of steps.slice(1)) {
       // auth_ok can only be set by the preflight, which itself requires the new freshness check.
       if (step.id === 'sap_auth') expect(step.if).toBe(current);
+      else if (job === 'integration' && ['where_used_diagnostic', 'where_used_summary'].includes(step.id ?? ''))
+        expect(step.if).toBe('$' + "{{ !cancelled() && steps.sap_auth.outputs.auth_ok == 'true' }}");
       else expect([current, `always() && ${current}`, "steps.sap_auth.outputs.auth_ok == 'true'"]).toContain(step.if);
       if (
         step.name?.startsWith('Upload ') ||
@@ -186,5 +188,13 @@ describe('test workflow gate behavior', () => {
   it('does not claim e2e runs on push to main', () => {
     expect(WORKFLOW).not.toContain('Run on push (main)');
     expect(WORKFLOW).toContain('Run on internal PRs and manual dispatch');
+  });
+
+  it.each(['test', 'release'])('%s.yml never runs dependency install hooks', (name) => {
+    const text = readFileSync(join(import.meta.dirname, `../../../.github/workflows/${name}.yml`), 'utf8');
+    const workflow = parse(text) as { env?: Record<string, unknown> };
+    expect(workflow.env?.NPM_CONFIG_IGNORE_SCRIPTS).toBe('true');
+    // npm publish skips prepublishOnly under this setting, so the build must stay explicit.
+    if (name === 'release') expect(text.indexOf('run: npm run build')).toBeLessThan(text.indexOf('run: npm publish'));
   });
 });

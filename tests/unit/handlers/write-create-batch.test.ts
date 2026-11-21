@@ -6,12 +6,12 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest';
 import { unrestrictedSafetyConfig } from '../../../src/adt/safety.js';
 import { DEFAULT_CONFIG } from '../../../src/server/types.js';
-import { mockResponse } from '../../helpers/mock-fetch.js';
+import { DISCOVERY_WITHOUT_SERVER_DRIVEN, isDiscoveryRequest, mockResponse } from '../../helpers/mock-fetch.js';
 import { AdtClient, createClient, mockFetch } from './setup-undici-mock.js';
 
 const { handleToolCall } = await import('../../../src/handlers/dispatch.js');
 const { resetCachedFeatures } = await import('../../../src/handlers/feature-cache.js');
-const { buildCreateXml } = await import('../../../src/handlers/write-helpers.js');
+const { buildCreateXml, runPreWriteLint } = await import('../../../src/handlers/write-helpers.js');
 
 function respondToFunctionModuleMetadataLifecycle(
   metadataByPath: Map<string, string>,
@@ -218,7 +218,7 @@ describe('SAPWrite handler — create / batch_create', () => {
         package: '$TMP',
         objects: [{ type: 'DSFD', name: 'ZARC1_SF', description: 'x' }],
       });
-      expect(result.content[0]?.text).toContain('does not support server-driven object type DSFD');
+      expect(result.content[0]?.text).toContain('does not support object type DSFD');
       expect(callMatching('POST', '/sap/bc/adt/programs/programs')).toBeUndefined();
     });
 
@@ -258,6 +258,11 @@ describe('SAPWrite handler — create / batch_create', () => {
       (client.http as unknown as { hasDiscoveryData(): boolean }).hasDiscoveryData = () => true;
       (client.http as unknown as { discoveryAcceptFor(p: string): string | undefined }).discoveryAcceptFor = () =>
         undefined;
+      mockFetch.mockImplementation(async (url: unknown) =>
+        isDiscoveryRequest(url)
+          ? mockResponse(200, DISCOVERY_WITHOUT_SERVER_DRIVEN)
+          : mockResponse(200, '', { 'x-csrf-token': 'T' }),
+      );
       const result = await handleToolCall(client, DEFAULT_CONFIG, 'SAPWrite', {
         action: 'create',
         type: 'DESD',
@@ -468,36 +473,48 @@ describe('SAPWrite handler — create / batch_create', () => {
 
     // ─── Subtree (`X/**`) rules — handler-level security regression suite ────
     describe('subtree rules (`X/**`) on SAPWrite', () => {
-      /** Build a fetch mock that serves a fixed DEVCLASS hierarchy via the nodestructure endpoint. */
+      /** `GET /sap/bc/adt/packages/{name}` body with the given super-package ('' = top-level). */
+      function packageXml(name: string, superPackage: string): string {
+        return (
+          `<pak:package xmlns:pak="http://www.sap.com/adt/packages" xmlns:adtcore="http://www.sap.com/adt/core" ` +
+          `adtcore:name="${name}"><pak:superPackage adtcore:name="${superPackage}"/></pak:package>`
+        );
+      }
+
+      /** Super-package of every package in a children graph; packages without a parent are top-level. */
+      function parentsOf(graph: Record<string, string[]>): Record<string, string> {
+        const parents: Record<string, string> = {};
+        for (const [parent, children] of Object.entries(graph)) {
+          parents[parent] ??= '';
+          for (const child of children) parents[child] = parent;
+        }
+        return parents;
+      }
+
+      /** Serve `GET /sap/bc/adt/packages/{name}` for the packages of the graph; 404 for unknown ones. */
+      function packageResponse(u: string, parents: Record<string, string>): Response | undefined {
+        const m = new URL(u).pathname.match(/^\/sap\/bc\/adt\/packages\/([^/]+)$/);
+        if (!m) return undefined;
+        const name = decodeURIComponent(m[1]!).toUpperCase();
+        return name in parents
+          ? mockResponse(200, packageXml(name, parents[name]!), { 'x-csrf-token': 'T' })
+          : mockResponse(404, 'not found');
+      }
+
+      /** Build a fetch mock that serves a fixed DEVCLASS hierarchy through the package metadata endpoint. */
       function mockHierarchy(
         graph: Record<string, string[]>,
         extras?: (url: string, method: string) => Response | undefined,
       ) {
+        const parents = parentsOf(graph);
         mockFetch.mockReset();
         mockFetch.mockImplementation((url: string | URL, opts?: { method?: string }) => {
           const u = String(url);
           const method = opts?.method ?? 'GET';
           const ex = extras?.(u, method);
           if (ex !== undefined) return Promise.resolve(ex);
-          // Nodestructure call from getSubpackages — match parent_name=<X> and serve the graph.
-          if (u.includes('/sap/bc/adt/repository/nodestructure') && u.includes('parent_type=DEVC%2FK')) {
-            const m = u.match(/parent_name=([^&]+)/);
-            const parent = m ? decodeURIComponent(m[1]).toUpperCase() : '';
-            const children = graph[parent] ?? [];
-            const nodes = children
-              .map(
-                (c) =>
-                  `<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>${c}</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>`,
-              )
-              .join('');
-            return Promise.resolve(
-              mockResponse(
-                200,
-                `<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>${nodes}</TREE_CONTENT></DATA></asx:values></asx:abap>`,
-                { 'x-csrf-token': 'T' },
-              ),
-            );
-          }
+          const pkg = packageResponse(u, parents);
+          if (pkg) return Promise.resolve(pkg);
           return Promise.resolve(mockResponse(200, 'OK', { 'x-csrf-token': 'T' }));
         });
       }
@@ -545,7 +562,7 @@ describe('SAPWrite handler — create / batch_create', () => {
         mockFetch.mockReset();
         mockFetch.mockImplementation((url: string | URL) => {
           const u = String(url);
-          if (u.includes('objectType=DEVC%2FK')) {
+          if (new URL(u).pathname.startsWith('/sap/bc/adt/packages/')) {
             return Promise.resolve(mockResponse(500, '<error>SAP down</error>'));
           }
           return Promise.resolve(mockResponse(200, 'OK', { 'x-csrf-token': 'T' }));
@@ -559,8 +576,7 @@ describe('SAPWrite handler — create / batch_create', () => {
           source: 'CLASS zcl_x DEFINITION PUBLIC. ENDCLASS. CLASS zcl_x IMPLEMENTATION. ENDCLASS.',
         });
         expect(result.isError).toBe(true);
-        // Either the resolver fail-closed message OR the raw block message — both qualify as denied.
-        expect(result.content[0]?.text).toMatch(/hierarchy resolution failed|blocked/);
+        expect(result.content[0]?.text).toContain('hierarchy resolution failed');
       });
 
       it('update is BLOCKED when the resolved object package is outside the subtree', async () => {
@@ -634,30 +650,15 @@ describe('SAPWrite handler — create / batch_create', () => {
         expect(result.content[0]?.text).toContain('blocked');
       });
 
-      it('caches the subtree across multiple writes — only one BFS per root', async () => {
-        let subpkgCalls = 0;
+      it('caches the chain across writes on one client — one request per level', async () => {
+        const parents = parentsOf({ ZFOO: ['ZFOO_SUB'], ZFOO_SUB: [] });
+        let chainCalls = 0;
         mockFetch.mockReset();
         mockFetch.mockImplementation((url: string | URL) => {
-          const u = String(url);
-          if (u.includes('/sap/bc/adt/repository/nodestructure') && u.includes('parent_type=DEVC%2FK')) {
-            subpkgCalls++;
-            const m = u.match(/parent_name=([^&]+)/);
-            const parent = m ? decodeURIComponent(m[1]).toUpperCase() : '';
-            const graph: Record<string, string[]> = { ZFOO: ['ZFOO_SUB'], ZFOO_SUB: [] };
-            const children = graph[parent] ?? [];
-            const nodes = children
-              .map(
-                (c) =>
-                  `<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>${c}</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>`,
-              )
-              .join('');
-            return Promise.resolve(
-              mockResponse(
-                200,
-                `<asx:abap xmlns:asx="http://www.sap.com/abapxml" version="1.0"><asx:values><DATA><TREE_CONTENT>${nodes}</TREE_CONTENT></DATA></asx:values></asx:abap>`,
-                { 'x-csrf-token': 'T' },
-              ),
-            );
+          const pkg = packageResponse(String(url), parents);
+          if (pkg) {
+            chainCalls++;
+            return Promise.resolve(pkg);
           }
           return Promise.resolve(mockResponse(200, 'OK', { 'x-csrf-token': 'T' }));
         });
@@ -671,8 +672,8 @@ describe('SAPWrite handler — create / batch_create', () => {
             source: 'CLASS zcl_child DEFINITION PUBLIC. ENDCLASS. CLASS zcl_child IMPLEMENTATION. ENDCLASS.',
           });
         }
-        // BFS visits ZFOO once and ZFOO_SUB once → 2 subtree GETs total, regardless of write count.
-        expect(subpkgCalls).toBe(2);
+        // ZFOO_SUB -> ZFOO -> (top): two package reads in total, regardless of write count.
+        expect(chainCalls).toBe(2);
       });
     });
 
@@ -1099,8 +1100,8 @@ describe('SAPWrite handler — create / batch_create', () => {
         processingType: 'rfc',
       });
       expect(result.isError).toBe(true);
-      expect(result.content[0]?.text).toContain('post-create processing update failed');
-      expect(result.content[0]?.text).toContain('normal function-module shell');
+      expect(result.content[0]?.text).toContain('processing metadata step failed');
+      expect(result.content[0]?.text).toContain('Saved state is unconfirmed');
       expect(calls.some((call) => call.method === 'POST' && call.url.includes('_action=UNLOCK'))).toBe(true);
     });
 
@@ -1223,6 +1224,13 @@ describe('SAPWrite handler — create / batch_create', () => {
 
     it('FUGR delete: DELETEs to FUGR URL with lockHandle', async () => {
       const calls = captureFetch();
+      const sap = mockFetch.getMockImplementation()!;
+      mockFetch.mockImplementation((url: string, opts: any) =>
+        String(url).includes('/textelements/functiongroups/ZFG?version=inactive')
+          ? Promise.resolve(mockResponse(200, '<textElement name="ZFG" type="FUGR/PX" version="active"/>'))
+          : sap(url, opts),
+      );
+
       const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPWrite', {
         action: 'delete',
         type: 'FUGR',
@@ -1592,6 +1600,32 @@ lv = CONV string( 1 ).`,
       }
     });
 
+    const commentHeader = '/********************************\n* Pricing view\n********************************/\n';
+
+    it.each([
+      [
+        'a block-comment header',
+        `${commentHeader}@AccessControl.authorizationCheck: #NOT_REQUIRED\n@EndUserText.label: 'Prices'\ndefine view entity ZI_PRICE as select from ztable { key field1 }`,
+      ],
+      [
+        'a line-comment header',
+        "// Pricing view\n@EndUserText.label: 'Prices'\ndefine view entity ZI_PRICE as select from ztable { key field1 }",
+      ],
+      ['an annotation-free custom entity', 'define custom entity ZI_PRICE { key field1 : abap.char(10); }'],
+      ['an annotation-free abstract entity', 'define abstract entity ZI_PRICE { field1 : abap.char(10); }'],
+    ])('lints DDLS with %s as CDS, not as an ABAP class', (_label, source) => {
+      const lint = runPreWriteLint(source, 'DDLS', 'ZI_PRICE', { ...DEFAULT_CONFIG, lintBeforeWrite: true });
+      expect(lint.blocked).toBe(false);
+    });
+
+    it('still reports CDS syntax errors in DDLS with a block-comment header', () => {
+      const source = `${commentHeader}define view entity ZI_PRICE as select from ztable {\n  key field1\n  field2\n}`;
+      const lint = runPreWriteLint(source, 'DDLS', 'ZI_PRICE', { ...DEFAULT_CONFIG, lintBeforeWrite: true });
+      expect(lint.blocked).toBe(true);
+      expect(lint.result?.content[0]?.text).toContain('cds_parser_error');
+      expect(lint.result?.content[0]?.text).not.toContain('CLASSDEFINITION');
+    });
+
     it('adds CDS downstream impact guidance after DDLS update', async () => {
       mockFetch.mockReset();
       const whereUsedXml = `<?xml version="1.0" encoding="utf-8"?>
@@ -1650,22 +1684,9 @@ lv = CONV string( 1 ).`,
       );
     });
 
-    it('supplements DDLS update guidance with scoped where-used results when unfiltered results are partial', async () => {
+    it('uses one native where-used result for DDLS and BDEF update guidance', async () => {
       mockFetch.mockReset();
-      const scopeXml = `<?xml version="1.0" encoding="UTF-8"?>
-<usageReferences:scopeResponse xmlns:usageReferences="http://www.sap.com/adt/ris/usageReferences">
-  <usageReferences:objectType type="DDLS/DF" description="DDL Source" count="3"/>
-  <usageReferences:objectType type="BDEF/BO" description="Behavior Definition" count="1"/>
-</usageReferences:scopeResponse>`;
-      const unfilteredWhereUsedXml = `<?xml version="1.0" encoding="utf-8"?>
-<usageReferences:usageReferenceResult xmlns:usageReferences="http://www.sap.com/adt/ris/usageReferences">
-  <usageReferences:referencedObjects>
-    <usageReferences:referencedObject uri="/sap/bc/adt/ddic/ddl/sources/ZI_CHILD_ONE" isResult="true" canHaveChildren="false" usageInformation="gradeDirect,includeProductive">
-      <usageReferences:adtObject adtcore:name="ZI_CHILD_ONE" adtcore:type="DDLS/DF" xmlns:adtcore="http://www.sap.com/adt/core"/>
-    </usageReferences:referencedObject>
-  </usageReferences:referencedObjects>
-</usageReferences:usageReferenceResult>`;
-      const scopedDdlsWhereUsedXml = `<?xml version="1.0" encoding="utf-8"?>
+      const whereUsedXml = `<?xml version="1.0" encoding="utf-8"?>
 <usageReferences:usageReferenceResult xmlns:usageReferences="http://www.sap.com/adt/ris/usageReferences">
   <usageReferences:referencedObjects>
     <usageReferences:referencedObject uri="/sap/bc/adt/ddic/ddl/sources/zi_child_one" isResult="true" canHaveChildren="false" usageInformation="gradeDirect,includeProductive">
@@ -1677,21 +1698,17 @@ lv = CONV string( 1 ).`,
     <usageReferences:referencedObject uri="/sap/bc/adt/ddic/ddl/sources/zi_child_three" isResult="true" canHaveChildren="false" usageInformation="gradeDirect,includeProductive">
       <usageReferences:adtObject adtcore:name="ZI_CHILD_THREE" adtcore:type="DDLS/DF" xmlns:adtcore="http://www.sap.com/adt/core"/>
     </usageReferences:referencedObject>
-  </usageReferences:referencedObjects>
-</usageReferences:usageReferenceResult>`;
-      const scopedBdefWhereUsedXml = `<?xml version="1.0" encoding="utf-8"?>
-<usageReferences:usageReferenceResult xmlns:usageReferences="http://www.sap.com/adt/ris/usageReferences">
-  <usageReferences:referencedObjects>
     <usageReferences:referencedObject uri="/sap/bc/adt/bo/behaviordefinitions/ZI_ROOT" isResult="true" canHaveChildren="false" usageInformation="gradeDirect,includeProductive">
       <usageReferences:adtObject adtcore:name="ZI_ROOT" adtcore:type="BDEF/BO" xmlns:adtcore="http://www.sap.com/adt/core"/>
     </usageReferences:referencedObject>
+      <usageReferences:referencedObject uri="/sap/bc/adt/ddic/ddl/sources/ZI_CHILD_ONE" isResult="true" canHaveChildren="false" usageInformation="gradeDirect,includeProductive">
+      <usageReferences:adtObject adtcore:name="ZI_CHILD_ONE" adtcore:type="DDLS/DF" xmlns:adtcore="http://www.sap.com/adt/core"/>
+    </usageReferences:referencedObject>
   </usageReferences:referencedObjects>
 </usageReferences:usageReferenceResult>`;
-
       mockFetch.mockImplementation((url: string | URL, opts?: { method?: string; body?: string }) => {
         const method = (opts?.method ?? 'GET').toUpperCase();
         const urlStr = String(url);
-        const body = String(opts?.body ?? '');
         if (method === 'POST' && urlStr.includes('_action=LOCK')) {
           return Promise.resolve(
             mockResponse(200, '<asx:values><LOCK_HANDLE>LH_DDLS</LOCK_HANDLE><CORRNR></CORRNR></asx:values>', {
@@ -1699,17 +1716,8 @@ lv = CONV string( 1 ).`,
             }),
           );
         }
-        if (method === 'POST' && urlStr.includes('/usageReferences/scope')) {
-          return Promise.resolve(mockResponse(200, scopeXml, { 'x-csrf-token': 'T' }));
-        }
         if (method === 'POST' && urlStr.includes('/sap/bc/adt/repository/informationsystem/usageReferences?uri=')) {
-          if (body.includes('objectTypeFilter value="DDLS/DF"')) {
-            return Promise.resolve(mockResponse(200, scopedDdlsWhereUsedXml, { 'x-csrf-token': 'T' }));
-          }
-          if (body.includes('objectTypeFilter value="BDEF/BO"')) {
-            return Promise.resolve(mockResponse(200, scopedBdefWhereUsedXml, { 'x-csrf-token': 'T' }));
-          }
-          return Promise.resolve(mockResponse(200, unfilteredWhereUsedXml, { 'x-csrf-token': 'T' }));
+          return Promise.resolve(mockResponse(200, whereUsedXml, { 'x-csrf-token': 'T' }));
         }
         return Promise.resolve(mockResponse(200, '<ok/>', { 'x-csrf-token': 'T' }));
       });
@@ -1733,8 +1741,9 @@ lv = CONV string( 1 ).`,
       const usageBodies = mockFetch.mock.calls
         .map((call) => String((call[1] as { body?: string } | undefined)?.body ?? ''))
         .filter((body) => body.includes('usageReferenceRequest'));
-      expect(usageBodies.some((body) => body.includes('objectTypeFilter value="DDLS/DF"'))).toBe(true);
-      expect(usageBodies.some((body) => body.includes('objectTypeFilter value="BDEF/BO"'))).toBe(true);
+      expect(usageBodies).toHaveLength(1);
+      expect(usageBodies[0]).not.toContain('objectTypeFilter');
+      expect(mockFetch.mock.calls.some(([url]) => String(url).includes('/usageReferences/scope'))).toBe(false);
     });
 
     it('still skips BDEF for pre-write lint', async () => {

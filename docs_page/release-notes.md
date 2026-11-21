@@ -22,6 +22,149 @@ important `0.7.0` authorization migration retained below.
      release-please rebuilds that branch from main with `force: true`, so a commit added there is
      lost the next time a feat:/fix: merges. See .claude/commands/release-notes.md. -->
 
+## 1.10.1 — more reliable SAP reads and edits (2026-11-07)
+
+No new configuration is required. This patch improves existing SAP reads and edits.
+
+| Change | Impact | Action |
+|---|---|---|
+| Sessions and bounded reads ([#1187](https://github.com/arc-mcp/arc-1/pull/1187), [#1195](https://github.com/arc-mcp/arc-1/pull/1195)) | Rotated cookie files are picked up before CSRF bootstrap outside a live stateful operation. Reads with response limits can still obtain a token from SAP’s older discovery endpoint. | Use `SAP_COOKIE_FILE` for refreshed cookies; inline cookie strings still require a restart. |
+| Class enhancements ([#1197](https://github.com/arc-mcp/arc-1/pull/1197), [#1204](https://github.com/arc-mcp/arc-1/pull/1204)) | `SAPRead CLAS` extension summaries get five seconds instead of two. On SAP 758, `SAPRead CLAS extensions="sources"` uses active generated revisions instead of the failing generic enhancement serializer. Technology and runtime switch applicability remain unknown. | If sources report `class_source_release_unknown`, run `SAPManage(action="probe")` and retry, or set `SAP_ABAP_RELEASE` on a single-target deployment. |
+| Direct enhancement reads ([#1208](https://github.com/arc-mcp/arc-1/pull/1208)) | `SAPRead ENHO` avoids metadata requests that can dump on SAP 758, using active generated source where needed. | On 758, allow repository search as well as read access, including for BAdIs. If ENHO reads report an unknown SAP release, run `SAPManage(action="probe")` and retry, or set `SAP_ABAP_RELEASE` on a single-target deployment. |
+| Include search ([#1205](https://github.com/arc-mcp/arc-1/pull/1205)) | `INCL` and `FUGR/I` searches find function-group includes missed by SAP's type filter. | Narrow the query if the 1000-candidate warning appears; use `PROG/I` for broad standalone-include scans. |
+| ABAP edits ([#1203](https://github.com/arc-mcp/arc-1/pull/1203), [#1201](https://github.com/arc-mcp/arc-1/pull/1201)) | Pre-write lint accepts valid `GET PERMISSIONS`. `add_unit` now accepts full-line comment wrappers around one FORM/MODULE block and writes them verbatim. | For `edit_unit`, keep markers inside the block. |
+| Legacy deletion ([#1192](https://github.com/arc-mcp/arc-1/pull/1192)) | Program/function-group deletion verifies whether SAP exposes text-pool support before choosing its legacy path. | Where that API is absent, check inactive text drafts in SAP GUI; ARC-1 cannot inspect them. |
+
+CI now separates fresh-activation where-used diagnostics from required checks; this does not repair
+SAP's indexing behavior ([#1188](https://github.com/arc-mcp/arc-1/pull/1188)).
+
+## 1.10.0 — security fixes and SAP compatibility (2026-11-03)
+
+Replace standalone executables, review the [HTTP upgrade guidance](updating.md#v1100-http-request-validation),
+and refresh your MCP client's tool list.
+
+| Change | Impact | Action |
+|---|---|---|
+| HTTP validation ([#1184](https://github.com/arc-mcp/arc-1/pull/1184), [#1185](https://github.com/arc-mcp/arc-1/pull/1185)) | MCP POSTs require parsed JSON. Compressed JSON/form requests return 415, including OAuth. | Send uncompressed bodies; use `Content-Type: application/json` for MCP. |
+| Extension discovery ([#1143](https://github.com/arc-mcp/arc-1/pull/1143), [#1158](https://github.com/arc-mcp/arc-1/pull/1158), [#1146](https://github.com/arc-mcp/arc-1/pull/1146), [#1145](https://github.com/arc-mcp/arc-1/pull/1145)) | Source reads add bounded extension context; missing results do not prove absence. | Use `extensions="none"` for source alone. See [coverage](tools.md#extension-discovery). |
+| Focused reads ([#1144](https://github.com/arc-mcp/arc-1/pull/1144), [#1124](https://github.com/arc-mcp/arc-1/pull/1124)) | New `methodView="signature"` returns one declaration from the class’s own main source; enhancement fallback reports provenance and gaps. | Do not combine `method` with `format="structured"`; read inherited signatures from their interface/superclass. |
+| Metadata and context ([#1141](https://github.com/arc-mcp/arc-1/pull/1141), [#1100](https://github.com/arc-mcp/arc-1/pull/1100), [#1157](https://github.com/arc-mcp/arc-1/pull/1157), [#1078](https://github.com/arc-mcp/arc-1/pull/1078)) | Partial on-prem SHLP reads, preserved key includes, fewer false dependencies, and wider classic-text compatibility. | SHLP coverage remains partial. |
+| Data filters ([#1150](https://github.com/arc-mcp/arc-1/pull/1150)) | Read types reject filters they ignore. | Use TABLE_QUERY `where`/`columns` for portable filtering. |
+| ATC ([#1118](https://github.com/arc-mcp/arc-1/pull/1118), [#1137](https://github.com/arc-mcp/arc-1/pull/1137), [#1171](https://github.com/arc-mcp/arc-1/pull/1171), [#1140](https://github.com/arc-mcp/arc-1/pull/1140)) | Single-object `atc` requires type/name; `url` is refused. Known on-prem targets reject `atc_ci`; unstarted runs return incomplete evidence. | Use `atc` with DEVC on-prem; inspect incomplete runs before retrying. |
+| Function modules ([#1162](https://github.com/arc-mcp/arc-1/pull/1162), [#1164](https://github.com/arc-mcp/arc-1/pull/1164), [#1165](https://github.com/arc-mcp/arc-1/pull/1165), [#1168](https://github.com/arc-mcp/arc-1/pull/1168)) | Preserved parameter typing, group-aware syntax checks, and clearer partial-create recovery. | Read existing objects before repair; do not repeat create. |
+| Includes and locks ([#1166](https://github.com/arc-mcp/arc-1/pull/1166), [#1151](https://github.com/arc-mcp/arc-1/pull/1151)) | Clearer group guidance; unverified lock holders remain unknown. | Supply `group`; check CTS when uncertain. |
+| Dumps and variants ([#1103](https://github.com/arc-mcp/arc-1/pull/1103), [#1120](https://github.com/arc-mcp/arc-1/pull/1120), [#1172](https://github.com/arc-mcp/arc-1/pull/1172)) | 7.50 dump details use feed summaries; clearer list-window and unavailable-variant errors. | Use ST22 for older dumps or missing variable values. |
+| Feature probes ([#1181](https://github.com/arc-mcp/arc-1/pull/1181), [#1126](https://github.com/arc-mcp/arc-1/pull/1126)) | Gateway failures stay unknown; MIME negotiation stays resource-specific. | Single-target startup outage: `SAPManage(action="probe")` or restart. Restart to refresh completed partial probes. |
+| Pre-write lint ([#1119](https://github.com/arc-mcp/arc-1/pull/1119), [#1169](https://github.com/arc-mcp/arc-1/pull/1169)) | Better type context and parser-limit guidance. | Verify SAP-accepted code before rewriting for parser limitations. |
+| Dependencies and executables ([#1102](https://github.com/arc-mcp/arc-1/pull/1102), [#1129](https://github.com/arc-mcp/arc-1/pull/1129), [#1155](https://github.com/arc-mcp/arc-1/pull/1155), [#1114](https://github.com/arc-mcp/arc-1/pull/1114), [#1183](https://github.com/arc-mcp/arc-1/pull/1183)) | Patched dependencies, retired Forge exception, and verified embedded Node. | [Replace executables](local-development.md#single-file-executable-no-nodejs-no-node_modules); updating host Node does not patch them. For npm/CF/Docker/MCPB, verify Node **22.23.4+**, **24.22.1+** or **26.12.1+** on those major lines. [Restage CF](btp-administration.md#change-and-restart-matrix) with an updated buildpack or pull/rebuild Docker. |
+
+## 1.9.0 — OAuth registration policy and clearer approval
+
+This release requires `@arc-mcp/xsuaa-auth` 1.2.0 or later. Upgrade every instance before
+enabling the optional policy below, then configure the same value on every instance.
+
+| Change | Impact | Action |
+|---|---|---|
+| DCR return-address allowlist ([#1091](https://github.com/arc-mcp/arc-1/pull/1091)) | `ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS` / `--oauth-dcr-redirect-uri-patterns` restricts new registrations and return addresses in existing client IDs. Unset retains the default admission rules; an explicitly empty value denies all DCR callbacks. | Follow the [configuration reference](configuration-reference.md#a4-xsuaa-oauth-btp): allow every callback the intended client registers, use exact client-owned BAS callbacks, and avoid empty deployment-template values. |
+| Clearer approval page and guidance ([#1091](https://github.com/arc-mcp/arc-1/pull/1091), [#1092](https://github.com/arc-mcp/arc-1/pull/1092)) | Shorter copy, readable destination details, keyboard focus and responsive styling. Approval remains required for every new authorization flow; token refresh does not repeat it. There are no consent exemptions. | Read [client approval](xsuaa-setup.md#client-approval). Only approve connections you started in a trusted client; application names are self-declared. |
+| Registration errors and audit ([#1091](https://github.com/arc-mcp/arc-1/pull/1091)) | Disallowed callbacks now return `400 invalid_client_metadata` instead of a server error. Callback URLs with credentials or fragments are rejected even when the new policy is unset. Rejections emit `oauth_client_registration_rejected`. | Correct incompatible client callbacks. Collect stderr/file audit logs for OAuth lifecycle events; the BTP Audit Log sink does not forward them. |
+| Dependency maintenance ([#1089](https://github.com/arc-mcp/arc-1/pull/1089)) | Updates the locked `ip-address` dependency to 10.7.4. | None. |
+| Consistent include-read denials ([#1094](https://github.com/arc-mcp/arc-1/pull/1094)) | `SAPRead.INCL` is accepted as a deny rule and also blocks FUGR include expansion, including expansion implied by `grep`. Plain FUGR metadata reads remain available. | Operators using this deny rule should expect expanded FUGR reads to be refused. |
+
+**Policy limits:** The manual XSUAA client uses a separate callback policy. Tightening the DCR
+allowlist does not revoke access or refresh tokens. Widening it can restore previously filtered
+callbacks; rolling back to an older ARC-1 version removes this restriction. After upgrading,
+check normal browser approval and MCP reconnect before applying a narrower policy.
+
+The separate [node-forge risk exception](security-guide.md) remains limited to
+28 October 2026, 00:00 Europe/Berlin; this release does not remediate that dependency issue.
+
+## 1.8.0 — OAuth consent and scoped SAP workflows (2026-10-23)
+
+XSUAA operators: upgrade every instance before resuming sign-ins and restart sign-ins already in
+progress. Refresh your MCP client's tool list after upgrading.
+
+| Change | Impact | Action |
+|---|---|---|
+| OAuth client approval ([#1088](https://github.com/arc-mcp/arc-1/pull/1088)) | Every new browser authorization flow requires explicit client approval, including existing SSO sessions and manual clients. Token refreshes do not repeat it. Existing registered client IDs remain usable. | Read [client approval](xsuaa-setup.md#client-approval), configure the canonical public HTTPS `ARC1_PUBLIC_URL`, including any path prefix, and review [proxy and rate-limit requirements](xsuaa-setup.md#stateless-dcr). |
+| Scoped multi-target writes ([#1080](https://github.com/arc-mcp/arc-1/pull/1080)) | Pinned strict-PP routes support separately enabled CLAS/INTF writes. Aggregate and shared-Basic routes remain mutation-free. | Follow [write setup](multi-target-writes.md): global write switch, destination restrictions and exact write grants are all required. |
+| IDE navigation ([#1025](https://github.com/arc-mcp/arc-1/pull/1025)) | Adds SAP ADT MCP navigation and optional Eclipse links without changing source/JSON results. | Follow [IDE integration](ide-integration.md); Eclipse links require explicit configuration. |
+| Direct package browsing ([#1081](https://github.com/arc-mcp/arc-1/pull/1081)) | Explicit `packageScope="direct"` lists bounded direct contents and immediate subpackages without recursion. Completeness remains unknown. | Use [direct mode](tools.md#sapread) where indexed package search is unavailable; narrow by advertised `objectType` when needed. |
+| Table settings and previews ([#1087](https://github.com/arc-mcp/arc-1/pull/1087), [#1074](https://github.com/arc-mcp/arc-1/pull/1074)) | `TABL/DTT` can update native `loggingEnabled`; TABLE_CONTENTS enforces the requested row cap even when SAP returns a lookahead row. | Activate logging changes and check SAP's `rec/client` setting; see [technical settings](tools.md#technical-table-settings). |
+| Diagnostics ([#1084](https://github.com/arc-mcp/arc-1/pull/1084), [#1076](https://github.com/arc-mcp/arc-1/pull/1076)) | Gateway HTML whitespace parsing is more efficient; package preflight failures retain uncertainty about missing metadata APIs. | Treat an unverified package as unverified, not as proof it does not exist. |
+| Cloud Foundry and PP sessions ([#1082](https://github.com/arc-mcp/arc-1/pull/1082), [#1086](https://github.com/arc-mcp/arc-1/pull/1086)) | CF uploads retain required compiled public modules; single-target Cloud Connector PP reuses bounded, per-user sessions to reduce repeated logins. | Review [session and incident limits](security-guide.md); multi-target routes retain request-local transport. |
+
+**OAuth upgrade notes:** `ARC1_OAUTH_DCR_ENABLED=false` disables new registrations only.
+This upgrade does **not** invalidate existing access or refresh tokens; independently verify any
+incident-response invalidation. The separate [node-forge risk exception](security-guide.md) remains
+limited to 28 October 2026, 00:00 Europe/Berlin.
+
+## 1.7.0 — application data, diagnostics and safer authoring (2026-10-22)
+
+Refresh your MCP client's tool list. Existing data-preview permissions also enable the new data actions below; review the opt-outs before upgrading.
+
+| Change | Impact | Action |
+|---|---|---|
+| Saved texts and logs ([#1012](https://github.com/arc-mcp/arc-1/pull/1012), [#1024](https://github.com/arc-mcp/arc-1/pull/1024)) | `SAPQuery.long_text` reads saved classic SAPscript texts; `application_log` reads SLG1 messages by log number. Both require data-preview permission and data scope; BTP ABAP is unsupported. | To exclude either, add `SAPQuery.long_text` or `SAPQuery.application_log` to `SAP_DENY_ACTIONS`. See [data actions](tools.md#sapquery). |
+| Diagnostics ([#1020](https://github.com/arc-mcp/arc-1/pull/1020), [#1029](https://github.com/arc-mcp/arc-1/pull/1029), [#1019](https://github.com/arc-mcp/arc-1/pull/1019)) | Filter dumps using advertised conditions; syntax-check up to 20 stored objects. Missing reports remain unchecked. | Inspect incomplete results; see [syntax batches](tools.md#check-several-objects-for-syntax-errors). |
+| References and transport reviews ([#1026](https://github.com/arc-mcp/arc-1/pull/1026), [#1022](https://github.com/arc-mcp/arc-1/pull/1022), [#1008](https://github.com/arc-mcp/arc-1/pull/1008)) | Package-filter references and request positions/snippets; append lookup avoids an invalid preflight. Transport diffs retain missing-history and non-source gaps. | Follow [bounded reviews](review-workflows.md); empty results do not prove absence. |
+| Source and metadata reads ([#1037](https://github.com/arc-mcp/arc-1/pull/1037), [#1017](https://github.com/arc-mcp/arc-1/pull/1017)) | Program/include reads support bounded nested expansion; cached SRVB metadata remains valid JSON. | Request `expand_includes`; inspect omitted sources. |
+| ABAP documentation ([#1049](https://github.com/arc-mcp/arc-1/pull/1049), [#1051](https://github.com/arc-mcp/arc-1/pull/1051), [#1055](https://github.com/arc-mcp/arc-1/pull/1055), [#1015](https://github.com/arc-mcp/arc-1/pull/1015)) | Class/method edits replace supplied documentation and move it with visibility changes. FUNC parameters accept short descriptions; KTD parent descriptions become optional. | Write function texts in the original language; activate before checking native synchronization. |
+| Activation and connectivity ([#1050](https://github.com/arc-mcp/arc-1/pull/1050), [#1046](https://github.com/arc-mcp/arc-1/pull/1046), [#1043](https://github.com/arc-mcp/arc-1/pull/1043)) | Activation allows five minutes. Stateful CSRF discovery gains a compatibility retry; cold-client startup reduces unused SAP sessions. | After timeout/cancellation, inspect inactive objects and refresh source before retrying: completion is uncertain. |
+| Standalone downloads ([#1027](https://github.com/arc-mcp/arc-1/pull/1027)) | Optional executables bundle Node.js for Windows, Linux and macOS. | Verify checksums; review [unsigned-binary, SQLite and extension limits](local-development.md). |
+| Dependencies and installation ([#1054](https://github.com/arc-mcp/arc-1/pull/1054), [#1059](https://github.com/arc-mcp/arc-1/pull/1059), [#1060](https://github.com/arc-mcp/arc-1/pull/1060), [#1052](https://github.com/arc-mcp/arc-1/pull/1052)) | Updates follow-redirects, Hono and its Node adapter; documents the Windows native-build workaround. The node-forge advisory remains unresolved. | Review the [exception expiring 28 October](security-guide.md) and [Windows instructions](local-development.md). |
+| Test evidence ([#1013](https://github.com/arc-mcp/arc-1/pull/1013), [#1016](https://github.com/arc-mcp/arc-1/pull/1016), [#1058](https://github.com/arc-mcp/arc-1/pull/1058)) | Improves release prerequisites, denial regressions and sanitized where-used diagnostics. | `none` |
+
+## 1.6.0 — optional target access and safer authoring (2026-10-17)
+
+No new mandatory settings; refresh your MCP client's tool list after upgrading.
+
+| Change | Impact | Action |
+|---|---|---|
+| Per-user target access ([#677](https://github.com/arc-mcp/arc-1/pull/677)) | In BTP multi-system mode, opt-in `ARC1_MULTI_TARGET_AUTHORIZATION=xsuaa-attribute` restricts reader discovery and calls to IAM-assigned targets, not automatically discovered SAP accounts. Default `standard` keeps access unchanged. | Start with [static XSUAA roles](multi-target-authorization.md); IAS is optional. |
+| BAdI implementations ([#939](https://github.com/arc-mcp/arc-1/pull/939)) | Create, update and delete `ENHO/XHB`, including filters. ABAP Cloud requires a released BAdI. | Follow [BAdI write limits](tools.md#badi-implementation-writes-enho). |
+| Table types ([#963](https://github.com/arc-mcp/arc-1/pull/963), [#966](https://github.com/arc-mcp/arc-1/pull/966)) | Author table types on ABAP Cloud and set built-in row length/decimals. | Read back after activation; [key restrictions](tools.md#table-type-updates) remain. |
+| Table administration ([#979](https://github.com/arc-mcp/arc-1/pull/979), [#980](https://github.com/arc-mcp/arc-1/pull/980)) | Update technical settings and manage classic secondary indexes where SAP exposes them. | Review [settings](tools.md#technical-table-settings) and [index activation limits](tools.md#classic-secondary-indexes). |
+| API visibility ([#967](https://github.com/arc-mcp/arc-1/pull/967)) | `apiVisibility` explicitly selects cloud-development/key-user visibility; omission keeps SAP's defaults. | `none` |
+| Text pools ([#965](https://github.com/arc-mcp/arc-1/pull/965), [#976](https://github.com/arc-mcp/arc-1/pull/976), [#977](https://github.com/arc-mcp/arc-1/pull/977), [#978](https://github.com/arc-mcp/arc-1/pull/978)) | Class symbols work on ABAP Cloud. Writes report removed texts, avoid unsafe retries/empty-save drafts and verify pool activation. | Read [text-pool recovery guidance](tools.md#text-elements) before retrying an unverified save. |
+| Source and metadata reads ([#585](https://github.com/arc-mcp/arc-1/pull/585), [#971](https://github.com/arc-mcp/arc-1/pull/971), [#973](https://github.com/arc-mcp/arc-1/pull/973), [#994](https://github.com/arc-mcp/arc-1/pull/994)) | Read inclusive source windows, SMBC configuration and v1-only service-binding metadata; exact lookup recognizes decorated names. | Supply both `lineStart` and `lineEnd` for a window. |
+| Quick fixes ([#995](https://github.com/arc-mcp/arc-1/pull/995)) | Preserves proposal URLs/replacement whitespace and rejects missing classes/interfaces before evaluation. | [Review and syntax-check deltas](tools.md#quickfix-workflow); use `SAPWrite` to save. |
+| Revision sources ([#998](https://github.com/arc-mcp/arc-1/pull/998)) | Revision feeds return usable source URLs on older SAP systems. | `none` |
+| Missing-program errors ([#1002](https://github.com/arc-mcp/arc-1/pull/1002)) | Missing programs on NetWeaver 7.50 retain search guidance instead of unrelated class-include write advice. | `none` |
+| Source-search capabilities ([#1006](https://github.com/arc-mcp/arc-1/pull/1006)) | Retains confirmed support per target despite unrelated user authorization failures; disabled search returns object-search guidance. | After Basis enables source search, restart ARC-1; single-target instances can also use `SAPManage action="probe"`. |
+| Legacy ADT responses ([#1007](https://github.com/arc-mcp/arc-1/pull/1007)) | Rejects empty HTML as data/write success; preserves legacy media-type fallback after CSRF refresh and returns URI-confirmed search names. | Read back attempted changes before retrying an invalid response. Native 7.40 SP04 confirmation remains pending. |
+| Package listings ([#999](https://github.com/arc-mcp/arc-1/pull/999)) | Refuse systems without advertised package-filtered search, avoiding unrelated objects in package results. | On affected systems, use name/type search or SAP's native package browser. |
+| Query results ([#983](https://github.com/arc-mcp/arc-1/pull/983), [#984](https://github.com/arc-mcp/arc-1/pull/984)) | Data-preview cells retain native whitespace; SQL uses CRLF framing. The reporter [verified the CRLF fix on 7.40 SP22](https://github.com/arc-mcp/arc-1/issues/955#issuecomment-6143358475). | Trim cells explicitly if your consumer needs trimmed values. |
+| Local source files ([#981](https://github.com/arc-mcp/arc-1/pull/981)) | Codex can send local source through its existing ARC-1 connection without model transcription. | Use the [file workflow](codex-file-source.md). |
+| Larger HTTP writes ([#972](https://github.com/arc-mcp/arc-1/pull/972)) | `ARC1_MAX_HTTP_REQUEST_BYTES` permits an optional increase from 100 KiB, up to 16 MiB. | Check [admission and memory limits](configuration-reference.md#http-request-bodies) before increasing it. |
+| Documentation and tests ([#997](https://github.com/arc-mcp/arc-1/pull/997)) | Clarifies configuration and security guidance; strengthens live workflow checks and cleanup. | `none` |
+| Transport ownership ([#1003](https://github.com/arc-mcp/arc-1/pull/1003)) | Reassignment supplies the owner to both legacy and newer CTS handlers, fixing the empty-user error on NetWeaver 7.50. | `none` |
+| BTP test fixtures ([#1001](https://github.com/arc-mcp/arc-1/pull/1001)) | Keeps parent-owned table indexes out of standalone create fixtures; documents the BTP preview row-limit caveat. | `none` |
+
+Known dependency risk: the SAP SDK chain still includes `node-forge` affected by
+[GHSA-86w9-cpqp-85rv](https://github.com/advisories/GHSA-86w9-cpqp-85rv). Recheck the advisory before deployment.
+
+## 1.5.2 — safer text pools and SAP compatibility fixes (2026-10-10)
+
+Fixes for text pools, source edits, navigation and system detection. No new mandatory settings;
+refresh your MCP client's tool list after upgrading.
+
+| Change | Impact | Action |
+|---|---|---|
+| Text-pool deletion safeguards ([#952](https://github.com/arc-mcp/arc-1/pull/952), [#959](https://github.com/arc-mcp/arc-1/pull/959), [#969](https://github.com/arc-mcp/arc-1/pull/969)) | PROG/FUGR deletion refuses inactive text pools where the service is available. This supersedes automatic draft activation during deletion. | Review with the author and explicitly activate before retrying; see [text-pool guidance](tools.md#text-elements). |
+| Text writes and activation ([#946](https://github.com/arc-mcp/arc-1/pull/946), [#949](https://github.com/arc-mcp/arc-1/pull/949)) | Writes request whole-pool activation after unlocking, including pending edits to other text parts. `SAPActivate` accepts `REPT`/`PROG/PX` and reports `requested`. | Newly created programs need their first owner activation. |
+| Completion and references ([#929](https://github.com/arc-mcp/arc-1/pull/929), [#930](https://github.com/arc-mcp/arc-1/pull/930)) | Completion returns `{proposals: [{text}], complete, hint?}`. Positioned references report SAP's actual search scope. | Adapt completion consumers; inspect `complete`, `searchedFor` and warnings. |
+| HANA detection ([#937](https://github.com/arc-mcp/arc-1/pull/937), [#964](https://github.com/arc-mcp/arc-1/pull/964)) | NHI discovery alone no longer implies HANA; verified ABAP Environment components do. | `none` — unconfirmed does not mean non-HANA. |
+| ADT discovery ([#953](https://github.com/arc-mcp/arc-1/pull/953)) | Collections without advertised media types remain discoverable. | `none` |
+| Pre-write validation ([#945](https://github.com/arc-mcp/arc-1/pull/945), [#947](https://github.com/arc-mcp/arc-1/pull/947), [#958](https://github.com/arc-mcp/arc-1/pull/958)) | Lint rejection precedes object creation. Literal-spacing findings are advisory; valid DDLX header/search annotations pass preflight. | `none` |
+| Domain fixed values ([#944](https://github.com/arc-mcp/arc-1/pull/944)) | Oversized values are refused before SAP can truncate them. | Limit low/high to 10 characters and descriptions to 60. |
+| Method edits ([#961](https://github.com/arc-mcp/arc-1/pull/961)) | Body edits preserve method headers/comments; removal includes attached ABAP Doc and cleans boundary spacing. | `none` |
+| Syntax checks ([#951](https://github.com/arc-mcp/arc-1/pull/951), [#960](https://github.com/arc-mcp/arc-1/pull/960)) | Structures resolve correctly; proposed-source checks against absent objects report `checked:false`. | Verify object identity before interpreting findings. |
+| API release state ([#931](https://github.com/arc-mcp/arc-1/pull/931)) | Function modules resolve their parent group; namespaced object URIs are encoded correctly. | `none` |
+| Business-configuration documentation ([#934](https://github.com/arc-mcp/arc-1/pull/934)) | KTD creation resolves `SMBC/TYP` parents. | Supply a nonempty `refObjectDescription`. |
+| Grouped SQL diagnostics ([#962](https://github.com/arc-mcp/arc-1/pull/962)) | Explains native count-only GROUP BY generation failures. | Include grouping columns alongside `COUNT(*)`. |
+| Guarded table-entity reads ([#968](https://github.com/arc-mcp/arc-1/pull/968)) | Active DDLS proof permits recognized table-entity lineage; unknown shapes remain refused. | `none` — existing [blocklist limits](authorization.md) apply. |
+
 ## 1.5.1 — authentication safeguards and SAP compatibility (2026-10-04)
 
 Stricter authentication and cache isolation, safer deployment archives, and compatibility fixes.

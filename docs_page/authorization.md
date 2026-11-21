@@ -57,16 +57,22 @@ Important details:
 
 ## SAP API Policy: data preview and free SQL are gated for a reason
 
-These two gates exist partly because SAP's API Policy restricts large-scale extraction and ungoverned autonomous AI call patterns — see **[SAP API Policy & Architecture Alignment](sap-api-policy-and-architecture.md)** for what the policy says and how ARC-1 is positioned against it. Operators should validate productive use against SAP documentation, their SAP agreement, and internal governance.
+SAP's API Policy FAQ Q33 places business-data reads and backend SQL outside ADT's intended
+development-tooling scope. The API Policy also conditions agent-driven API sequences and large-scale
+extraction on documented, endorsed pathways. See **[SAP API Policy & Architecture Alignment](sap-api-policy-and-architecture.md)**
+for the custom-MCP architecture path and the separate ADT-channel question.
 
 ARC-1's defaults keep the highest-risk data paths disabled. Two server flags map directly onto capabilities that can expose business data or run ad-hoc SQL, and both default to off:
 
 | Flag | Default | What it enables | Governance note |
 | ---- | ------- | --------------- | ----------------- |
-| `SAP_ALLOW_DATA_PREVIEW=true` | `false` (off) | `SAPRead(type=TABLE_CONTENTS)` — named table content preview | Can expose application-table data; keep off unless approved. |
-| `SAP_ALLOW_FREE_SQL=true` | `false` (off) | `SAPQuery` — freestyle ABAP SQL | Executes ad-hoc ABAP SQL; keep off unless approved. |
+| `SAP_ALLOW_DATA_PREVIEW=true` | `false` (off) | `SAPRead` table previews and `SAPQuery` actions `long_text` / `application_log` | Reads application data; requires `data` scope. |
+| `SAP_ALLOW_FREE_SQL=true` | `false` (off) | `SAPQuery(action=sql)` — freestyle ABAP SQL | Executes ad-hoc ABAP SQL; requires `sql` scope. |
 
-With both flags at their defaults, the data/sql rows in the capability matrix below are unreachable. Turning either flag on is a valid operational choice for approved scenarios, but it should be deliberate: check the current SAP API Policy, the customer's SAP agreement, SAP authorizations, and internal data-protection rules before enabling it on a productive system.
+With both flags at their defaults, the data/sql rows in the capability matrix below are unreachable.
+Keep the flags off unless the specific use has a documented allowance or SAP authorization under
+the applicable agreements. Internal approval, SAP technical authorizations and ARC-1 flags alone
+do not establish that allowance, including in dev/test. Apply internal data-protection rules as well.
 
 The `data` and `sql` user scopes (and the `viewer-data`, `viewer-sql`, `developer-data`, `developer-sql` API-key profiles) only become useful after the matching server flag is on. Granting `data` / `sql` to a user does **not** widen the server ceiling.
 
@@ -132,6 +138,13 @@ Classic CDS views, CDS view entities (including root entities), and transactiona
 share the same lineage checks. Their graph must identify the requested source and expand to proven
 terminal tables. A childless view, or one SAP reports without a database object (such as a transient
 analytical query), is denied. SAP's SQL restrictions still apply after the policy permits a query.
+On 816 and ABAP Environment, direct CDS table entities and view dependencies with
+unnamed `FROM`/`INNER_JOIN` leaves additionally require fresh active DDLS metadata
+proving the exact table-entity name and kind. Entity/DDLS aliases, unavailable
+metadata and other untyped graph shapes remain refused. This proof is bounded to
+64 additional identities per graph and is never cached. It does not bypass native
+SAP authorization or permit CDS association paths.
+
 CDS view-entity **replacement objects** remain a separate, unsupported catalog-mapping case.
 
 ### Failure codes
@@ -179,6 +192,8 @@ the feature that needs it:
 | `SEOMETAREL` | Interface-implementer where-used augmentation | Returns native results **with an explicit incompleteness warning** |
 | `TSTC` | `SAPRead(type="TRAN")` program name | Returns metadata **with a warning**, without the program name |
 | `SWOTLV` | `SAPRead(type="SOBJ")` | Denied; no alternative in ARC-1 |
+| `STXH`, `STXL`, `TTXOB`, `TTXID`, or `T002` | `SAPQuery(action="long_text")` | Required text storage/configuration; denied when an accessed source is blocked |
+| Any configured blocklist | `SAPQuery(action="application_log")` | Hidden and refused: native service exits prevent proving complete table lineage |
 | `SUAUTHVALTRC` + `TOBJ` | `SAPDiagnose(authorization_trace)` | Denied — both are required; positional values without decoded field names would be misleading |
 
 Optional enrichment always warns rather than silently returning less.
@@ -263,9 +278,11 @@ Use this table to answer: "what must be true before this action can run?" For HT
 | Read transport info | `read` | Nothing | `SAPTransport.list`, `get`, `diff`, `check`, `history` |
 | Read Git info | `read` | Nothing | `SAPGit.list_repos`, `history`, `objects`, etc. when Git feature exists |
 | Preview named table contents | `data` | `SAP_ALLOW_DATA_PREVIEW=true` | `sql` implies `data` |
+| Read saved SAPscript long texts | `data` | `SAP_ALLOW_DATA_PREVIEW=true` | `SAPQuery(action=long_text)`; free SQL is not required |
+| Read saved SLG1 messages | `data` | `SAP_ALLOW_DATA_PREVIEW=true` | `SAPQuery(action=application_log)`; native SAP authorization applies; unavailable with any table blocklist |
 | Authorization trace (`SUAUTHVALTRC`) | `data` | `SAP_ALLOW_DATA_PREVIEW=true` | `SAPDiagnose action=authorization_trace`; on-prem STUSERTRACE read only |
 | Run freestyle SQL | `sql` | `SAP_ALLOW_FREE_SQL=true` | High risk on productive systems |
-| Apply exact source blocklist (experimental) | Existing `data`/`sql` scope | `SAP_BLOCKED_DATA_SOURCES=...` | Further restricts all three data paths; cannot enable access, and unresolved lineage is denied |
+| Apply exact source blocklist (experimental) | Existing `data`/`sql` scope | `SAP_BLOCKED_DATA_SOURCES=...` | Further restricts guarded data reads; cannot enable access, and unresolved lineage is denied |
 | Create / update / delete objects | `write` | `SAP_ALLOW_WRITES=true` | `SAP_ALLOWED_PACKAGES` applies; supports exact (`ZFOO`), prefix (`Z*`), and DEVCLASS subtree (`ZFOO/**`) patterns. Subtree resolution is fail-closed on SAP errors. |
 | Activate objects | `write` | `SAP_ALLOW_WRITES=true` | Activation is a mutation |
 | Package / FLP mutations | `write` | `SAP_ALLOW_WRITES=true` | FLP list actions are reads; FLP create/delete actions are writes |
@@ -317,7 +334,7 @@ Seven scopes exist:
 | ----- | ------- | ------- |
 | `read` | Read source, search, navigate, lint, diagnose | - |
 | `write` | Object/package/activation/FLP mutations | `read` |
-| `data` | Named table preview | - |
+| `data` | Named table preview, saved SAPscript texts and SLG1 messages | - |
 | `sql` | Freestyle SQL | `data` |
 | `transports` | CTS transport mutations | - |
 | `git` | Gated abapGit mutations, SAP-side Git egress, and the reserved authorization boundary for currently quarantined gCTS mutations | - |
@@ -360,6 +377,43 @@ Want a developer who can write code but cannot transport or use Git? Create a cu
 To grant SQL to one BTP user, assign a role collection that includes `MCPSqlUser` (for example `ARC-1 Viewer + SQL` for read-only SQL or `ARC-1 Developer + SQL` for full developer access) to that user. Do **not** change server env vars for one user. The ARC-1 instance must already have `SAP_ALLOW_FREE_SQL=true`; there is no `SAP_ALLOW_SQL` flag.
 
 See [XSUAA Setup](xsuaa-setup.md) for BTP Cockpit assignment steps.
+
+### Opt-in multi-target grants
+
+[Scoped pinned PP writes](multi-target-writes.md) additionally require `MCPTargetDeveloper` with
+exact `arc1_write_targets`, raw write scope and destination/server consent. Admin is not a bypass.
+
+**Opt-in target authorization** adds a separate target boundary
+only when the deployment owner selects `ARC1_MULTI_TARGET_AUTHORIZATION=xsuaa-attribute`.
+Unset/`standard` means **standard access**, a supported choice where all readers may see/try the
+configured inventory and SAP still checks their access. Filtering is optional, particularly useful
+for larger landscapes with different team assignments. It follows IAM grants, not automatic
+discovery of which SAP accounts exist. The
+[canonical setup and readiness](multi-target-authorization.md)
+cover availability, activation and acceptance; check them before assigning restricted users.
+
+The additive `MCPTargetReadAccess` role template supplies `read` plus required `arc1_targets`
+values with **no default grant**. One static cohort can contain multiple exact public IDs, such as
+`A4H/001` and `A4H/100`; no IAS change is required. The separate `MCPAllTargetReadAccess` template
+supplies `read` and literal `*` through the unassigned `ARC-1 All Targets (<space>)` collection.
+That intentionally includes future targets. Existing functional templates/collections are unchanged.
+
+```text
+eligible operation = global functional scopes × union of granted targets
+                   ∩ instance ceiling ∩ selected destination policy ∩ SAP authorization
+```
+
+XSUAA does not preserve a capability/target pair from each role. SQL capability with target A,
+combined with another role granting B, makes SQL eligible on both A and B where downstream policies
+permit it. The same is true for data and Admin. Use separate applications with distinct XSUAA
+identities if one user needs SQL on A but only source reads on B; disabling B's destination SQL
+switch restricts everyone, not just that user.
+
+Admin grants full safe catalog diagnostics, **not execution on an ungranted target**. Choose exact
+operator grants or deliberately add All Targets. Missing/malformed grants never disable enforcement;
+partial wildcards and XSUAA Unrestricted are unsupported. Only supported verified XSUAA user tokens
+enter enforced routes; a machine token, API key or generic OIDC token is not an alternative.
+Target grants do not create SAP users, prove PP access, or enable multi-target writes.
 
 ---
 
@@ -433,6 +487,13 @@ On Windows, a drive-letter absolute path accepts either separator (`C:\arc1\deny
 or `C:/arc1/deny-actions.json`). For relative paths, use `./deny-actions.json`, not a bare filename.
 
 ARC-1 fails fast if a deny entry references an unknown tool/action, has invalid grammar, or points to an unreadable file. That is intentional: typoed security config should not silently start.
+
+Use intent-level deny rules (for example `SAPRead.INCL`) when a denial must cover both standard
+and hyperfocused calls. A rule such as `SAP.read` applies only to the hyperfocused wrapper;
+direct intent calls are checked against the intent tool's rules.
+
+Denying `SAPRead.INCL` also denies include expansion for PROG, INCL and FUGR reads, including
+FUGR `grep` (which implies expansion); plain FUGR metadata reads remain allowed.
 
 ---
 
@@ -575,6 +636,8 @@ collection's roles and the signed-in IdP origin below. `invalid_scope` can also 
 malformed requested scope; use the [XSUAA diagnosis table](xsuaa-setup.md#insufficient-scope-invalid_scope)
 before changing roles or browser state.
 
+<a id="role-assigned-but-login-still-fails"></a>
+
 ### "I changed the user's role but the new scopes don't appear"
 
 Changing role collections does not rewrite already issued JWTs. Their claims remain unchanged
@@ -584,13 +647,14 @@ and token lifetime rather than assuming a reconnect refreshes either.
 After a verified role change:
 
 1. Verify the required role collection contains current application roles and is assigned under the IdP used for login. An unknown scope name needs configuration repair, not another role.
-2. On ARC-1's failure page, select **Role assigned? Refresh access**. ARC-1 sends the browser through XSUAA's logout endpoint with its bound client ID and a fixed, allowlisted return URL.
-3. After **Access refreshed** appears, use the MCP client's re-authentication flow and refresh its tool catalog. Reconnecting alone may reuse a token. A new identity-provider login may be required.
-4. If the deployment predates this recovery action, retry in a private browser window or clear the XSUAA-domain cookies manually. See [XSUAA Setup → invalid_scope](xsuaa-setup.md#insufficient-scope-invalid_scope).
+2. If the eligible `invalid_scope` failure page offers **Role assigned? Refresh access**, select it. ARC-1 sends the browser through XSUAA logout with its bound client ID and a fixed, allowlisted return URL.
+3. After **Access refreshed**, use the MCP client's sign-out/new-sign-in flow and reload its catalog. Reconnect or token refresh alone can retain old grants; a new identity-provider login may be required.
+4. If there is no action (including successful login with stale grants), use a fresh private browser window or the owner-provided application logout link. Follow [XSUAA session recovery](xsuaa-setup.md#refresh-access-after-a-verified-assignment), not an invented logout endpoint or blanket cookie deletion.
 
-A fresh token should reflect the current grant. If claim inspection is needed, inspect it locally;
-do not paste bearer tokens into websites, tickets or chat. Decoding claims alone does not validate
-the token or prove SAP access.
+Verify the resulting grant and actual allowed/denied calls; a new token expiry does not prove the
+permissions changed. For target filtering, follow the [revocation procedure](multi-target-administration.md#role-changes-and-revocation).
+Inspect claims only locally; do not paste bearer tokens into websites, tickets or chat. Decoding
+claims alone does not validate the token or prove SAP access.
 
 The recovery action does not revoke access tokens already issued to other sessions. Do not construct a logout URL from request parameters or use an arbitrary redirect: XSUAA application logout requires an allowlisted redirect to prevent open redirects.
 

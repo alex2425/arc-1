@@ -8,7 +8,9 @@
  * 4. Defaults (all `allow*` flags false — restrictive by default)
  */
 
+import type { MultiTargetWritePolicy } from '../adt/safety.js';
 import { DEFAULT_USER_AGENT } from '../adt/user-agent.js';
+import type { MultiTargetAuthorizationMode } from './multi-target-authorization.js';
 
 /** MCP transport type */
 export type TransportType = 'stdio' | 'http-streamable';
@@ -45,6 +47,8 @@ export interface ServerConfig {
   // --- MCP Transport ---
   transport: TransportType;
   httpAddr: string;
+  /** Maximum uncompressed JSON request bytes on MCP HTTP routes. */
+  maxHttpRequestBytes: number;
   serverName: string;
   /** Human-readable single-target label prepended to model-facing MCP instructions. */
   systemLabel: string;
@@ -58,6 +62,7 @@ export interface ServerConfig {
   uiOpen: boolean;
 
   // --- Safety (positive opt-ins; defaults restrictive) ---
+  multiTargetWrite?: MultiTargetWritePolicy;
   allowWrites: boolean;
   allowDataPreview: boolean;
   allowFreeSQL: boolean;
@@ -74,7 +79,6 @@ export interface ServerConfig {
   featureAbapGit: FeatureToggle;
   featureGcts: FeatureToggle;
   featureRap: FeatureToggle;
-  featureAmdp: FeatureToggle;
   featureUi5: FeatureToggle;
   featureTransport: FeatureToggle;
   featureHana: FeatureToggle;
@@ -114,6 +118,13 @@ export interface ServerConfig {
    * Positive values opt into expiry, clamped to `[60s, 90d]`. Only consulted
    * when XSUAA OAuth proxy mode is active. */
   oauthDcrTtlSeconds: number;
+  /** Allow new dynamic OAuth client registrations. Existing clients still require consent. */
+  oauthDcrEnabled: boolean;
+  /**
+   * Optional allowlist (redirect-URI globs) for dynamic client registration. Registration rejects
+   * other return addresses, and existing client_ids lose them. Unset keeps the library default.
+   */
+  oauthDcrRedirectUriPatterns?: string[];
 
   /**
    * Optional dedicated secret for HMAC-signing DCR `client_id`s. When set,
@@ -135,6 +146,8 @@ export interface ServerConfig {
   // --- Experimental destination-discovered multi-target mode ---
   /** Enable startup discovery plus pinned and aggregate multi-target endpoints. Default false. */
   multiTargetEndpoints: boolean;
+  /** Explicit target-grant enforcement; standard preserves existing deployments by default. */
+  multiTargetAuthorization: MultiTargetAuthorizationMode;
   /** Allow explicitly marked OnPremise BasicAuthentication targets in multi-target mode. Default false. */
   multiTargetAllowBasicAuth: boolean;
   /** Runtime-only: internal Destination Service name for a discovered target. */
@@ -150,6 +163,24 @@ export interface ServerConfig {
   /** Opt-in: allow shared cookie auth to coexist with PP (shared client only) */
   ppAllowSharedCookies: boolean;
 
+  // --- Experimental local SAML 2.0 bearer-assertion issuer ---
+  /** PEM private key used to sign assertions; setting it enables the local issuer. */
+  samlIdpKeyFile?: string;
+  /** PEM certificate matching the key; uploaded to the ABAP system as trusted provider. */
+  samlIdpCertFile?: string;
+  /** SAML Issuer / entity ID trusted by the ABAP system. */
+  samlIdpIssuer?: string;
+  /** Audience expected by the ABAP system (its local SAML2 provider name). */
+  samlAudience?: string;
+  /** SubjectConfirmationData Recipient; defaults to the SAP URL. */
+  samlRecipient?: string;
+  /** Explicit JWT claim carrying the SAP-side identity. */
+  samlNameIdClaim?: string;
+  samlNameIdFormat: 'email' | 'unspecified';
+  samlAuthnContextClassRef: string;
+  /** Assertion validity in seconds (default 300, clamped 30-3600). */
+  samlAssertionTtlSeconds: number;
+
   // --- SAML Behavior ---
   /** Opt-in: disable SAML redirect for ADT requests (X-SAP-SAML2 + saml2=disabled) */
   disableSaml2: boolean;
@@ -160,6 +191,11 @@ export interface ServerConfig {
   logFormat: 'text' | 'json';
   /** Hide SAP response details from client-facing tool errors while retaining server-side correlation data. */
   minimalErrors: boolean;
+
+  // --- IDE navigation (HTTP requires explicit per-request editor preferences) ---
+  ideLinks: 'off' | 'eclipse';
+  /** Configured real SAP SID for Eclipse navigation; multi-target runtimes use the selected target's SID. */
+  ideSystemId: string;
 
   // --- Tool Mode ---
   /** Tool mode: 'standard' (12 intent tools, SAPGit feature-gated) or 'hyperfocused' (1 universal SAP tool, ~200 tokens) */
@@ -251,6 +287,9 @@ export interface ServerConfig {
    *  use native HTTP, not the browser fetch API, and never trigger CORS. */
   allowedOrigins: string[];
 
+  /** Inbound `x-cf-true-client-ip` allowlist (addresses/CIDR). Empty = off. SAP BTP CF only. */
+  allowedClientIps: string[];
+
   // --- Misc ---
   verbose: boolean;
 }
@@ -267,6 +306,7 @@ export const DEFAULT_CONFIG: ServerConfig = {
   gzipDataPreviewBody: false,
   transport: 'stdio',
   httpAddr: '0.0.0.0:8080',
+  maxHttpRequestBytes: 100 * 1024,
   serverName: 'arc-1',
   systemLabel: '',
   uiMode: 'off',
@@ -284,7 +324,6 @@ export const DEFAULT_CONFIG: ServerConfig = {
   featureAbapGit: 'auto',
   featureGcts: 'auto',
   featureRap: 'auto',
-  featureAmdp: 'auto',
   featureUi5: 'auto',
   featureTransport: 'auto',
   featureHana: 'auto',
@@ -294,15 +333,22 @@ export const DEFAULT_CONFIG: ServerConfig = {
   xsuaaAuth: false,
   allowHttpNoAuth: false,
   oidcDiscovery: true,
+  oauthDcrEnabled: true,
   oauthDcrTtlSeconds: 0, // 0 = never expire; positive opts into expiry (clamped 60s..90d) — see field JSDoc
   btpOAuthCallbackPort: 0,
   multiTargetEndpoints: false,
+  multiTargetAuthorization: 'standard',
   multiTargetAllowBasicAuth: false,
   ppEnabled: false,
   ppStrict: false,
   ppStrictExplicit: false,
   ppAllowSharedCookies: false,
+  samlNameIdFormat: 'email',
+  samlAuthnContextClassRef: 'urn:oasis:names:tc:SAML:2.0:ac:classes:PreviousSession',
+  samlAssertionTtlSeconds: 300,
   disableSaml2: false,
+  ideLinks: 'off',
+  ideSystemId: '',
   toolMode: 'standard',
   schemaNullableOptionals: 'auto',
   plugins: [],
@@ -319,8 +365,12 @@ export const DEFAULT_CONFIG: ServerConfig = {
   mcpHttpRateLimit: undefined,
   rateLimit: 0, // Layer 2 disabled by default — operators opt in (see ADR-0004)
   allowedOrigins: [],
+  allowedClientIps: [],
   logLevel: 'info',
   logFormat: 'text',
   minimalErrors: false,
   verbose: false,
 };
+
+/** Hard ceiling for an operator-configured MCP request body. */
+export const MAX_HTTP_REQUEST_BYTES = 16 * 1024 * 1024;

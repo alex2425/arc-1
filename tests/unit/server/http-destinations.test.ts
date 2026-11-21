@@ -8,6 +8,7 @@ import {
   multiTargetHealthStatus,
   resolveMcpHttpRateLimit,
 } from '../../../src/server/http.js';
+import { logger } from '../../../src/server/logger.js';
 import { DEFAULT_CONFIG } from '../../../src/server/types.js';
 
 function registry() {
@@ -69,6 +70,20 @@ function mockRes() {
 }
 
 describe('multi-target HTTP helpers', () => {
+  it.each([undefined, '', 'unknown', null])('both factories reject invalid mode %s before use', (mode) => {
+    const routing = {
+      registry: registry(),
+      authorizationMode: mode,
+      aggregateFactory: vi.fn(),
+      createPinnedServer: vi.fn(),
+    };
+    for (const factory of [createPinnedTargetMcpHandler, createAggregateMcpHandler]) {
+      expect(() => factory(routing as never)).toThrow('requires an explicit authorization mode');
+    }
+    expect(routing.aggregateFactory).not.toHaveBeenCalled();
+    expect(routing.createPinnedServer).not.toHaveBeenCalled();
+  });
+
   it('advertises only the scopes usable on read-only multi-target routes', () => {
     expect(MULTI_TARGET_SCOPES_SUPPORTED).toEqual(['read', 'data', 'sql', 'admin']);
     expect(MULTI_TARGET_SCOPES_SUPPORTED).not.toContain('write');
@@ -111,6 +126,7 @@ describe('multi-target HTTP helpers', () => {
     const createPinnedServer = vi.fn();
     const handler = createPinnedTargetMcpHandler({
       registry: registry(),
+      authorizationMode: 'standard',
       aggregateFactory: vi.fn() as never,
       createPinnedServer,
     });
@@ -130,6 +146,7 @@ describe('multi-target HTTP helpers', () => {
     const createPinnedServer = vi.fn(() => serverFactory() as never);
     const handler = createPinnedTargetMcpHandler({
       registry: registry(),
+      authorizationMode: 'standard',
       aggregateFactory: vi.fn() as never,
       createPinnedServer,
     });
@@ -150,6 +167,7 @@ describe('multi-target HTTP helpers', () => {
     );
     const handler = createPinnedTargetMcpHandler({
       registry: registry(),
+      authorizationMode: 'standard',
       aggregateFactory: vi.fn() as never,
       createPinnedServer,
     });
@@ -173,6 +191,7 @@ describe('multi-target HTTP helpers', () => {
     }));
     const multi = {
       registry: unavailable,
+      authorizationMode: 'standard' as const,
       aggregateFactory: aggregateFactory as never,
       createPinnedServer: vi.fn() as never,
     };
@@ -191,5 +210,33 @@ describe('multi-target HTTP helpers', () => {
     );
     expect(aggregateFactory).toHaveBeenCalledOnce();
     expect(aggregateRes.statusCode).toBe(500);
+  });
+
+  it('audits the handler-level read-scope refusal for both route kinds', async () => {
+    const audit = vi.spyOn(logger, 'emitAudit');
+    try {
+      const multi = {
+        registry: registry(),
+        authorizationMode: 'xsuaa-attribute' as const,
+        aggregateFactory: vi.fn() as never,
+        createPinnedServer: vi.fn() as never,
+      };
+      const auth = { token: 'secret-token', clientId: 'cid', scopes: ['data'], extra: { userName: 'U1' } };
+      for (const [factory, path] of [
+        [createPinnedTargetMcpHandler, '/A4H/100/mcp'],
+        [createAggregateMcpHandler, '/multi/mcp'],
+      ] as const) {
+        const res = { ...mockRes(), setHeader: vi.fn(), set: vi.fn() };
+        await factory(multi)({ path, method: 'POST', body: {}, headers: {}, auth } as never, res as never);
+        expect(res.statusCode).toBe(403);
+      }
+      const denials = audit.mock.calls.map(([event]) => event).filter((event) => event.event === 'mcp_route_denied');
+      expect(denials.map((event) => (event as { route: string }).route)).toEqual(['pinned-mcp', 'aggregate-mcp']);
+      expect(denials[0]).toMatchObject({ user: 'U1', clientId: 'cid', reason: 'missing_scope' });
+      expect(JSON.stringify(denials)).not.toContain('secret-token');
+      expect(JSON.stringify(denials)).not.toContain('A4H');
+    } finally {
+      audit.mockRestore();
+    }
   });
 });

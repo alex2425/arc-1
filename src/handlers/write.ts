@@ -20,6 +20,7 @@ import {
   isTablesEndpointAvailable,
   isTableTypesEndpointAvailable,
 } from './feature-cache.js';
+import { resolveIncludeGroupForMutation } from './include-group.js';
 import {
   canonicalTablType,
   functionGroupIncludeObjectUrl,
@@ -30,6 +31,7 @@ import {
   sourceUrlForType,
 } from './object-types.js';
 import { errorResult, type ToolResult } from './shared.js';
+import { writeApiCatalogObject } from './write/api-catalog.js';
 import {
   writeActionAddMethod,
   writeActionChangeMethodVisibility,
@@ -41,6 +43,7 @@ import {
 import type { SapWriteContext } from './write/context.js';
 import { writeActionBatchCreate, writeActionCreate } from './write/create.js';
 import { writeActionGenerateBehaviorImplementation, writeActionScaffoldRapHandlers } from './write/rap.js';
+import { writeTableSettings } from './write/table-settings.js';
 import { writeUiad } from './write/uiad.js';
 import { writeActionUnit } from './write/unit-surgery.js';
 import { writeActionDelete, writeActionEditTextSymbols, writeActionUpdate } from './write/update-delete.js';
@@ -80,16 +83,9 @@ export async function handleSAPWrite(
     return errorResult('"type" and "name" are required for this action.');
   }
 
-  // SAP TADIR stores object names uppercase. Mixed-case names cause silent corruption
-  // on create (e.g. DDLS "Zc_MyView" registers as "ZC_MYVIEW" in TADIR but the source body
-  // still contains "Zc_MyView", confusing every downstream tool) and broken URL lookups on
-  // mutate/delete — the lock is held against the canonical uppercase name while the request
-  // URL carries the mixed-case one, which surfaces on ECC as 423 "... is not locked" (issue
-  // #293, original report used name "Z_HELLO_world"). Reject pre-flight for every name-bearing
-  // single-object action — universal SAP convention, not a 7.50 quirk. (batch_create validates
-  // each item separately below.)
-  // Note: source code INSIDE the object can use mixed case (e.g. for DDLS: name="ZC_MYVIEW"
-  // but `define view entity Zc_MyView` is fine inside the source body).
+  // TADIR uppercases names, but mixed-case URLs can miss the canonical lock (#293, ECC 423).
+  // Reject mixed-case object names before mutation; batch_create validates each item separately.
+  // Source identifiers may still use mixed case, e.g. name="ZC_MYVIEW" with `define view entity Zc_MyView`.
   if (NAME_CASE_GUARD_ACTIONS.has(action) && name && name !== name.toUpperCase()) {
     return errorResult(
       `Object name "${name}" contains lowercase characters. SAP object names must be uppercase (e.g. "${name.toUpperCase()}").\n\n` +
@@ -100,6 +96,10 @@ export async function handleSAPWrite(
 
   const preconditionError = sourcePreconditionError(type, action, args.expectedSourceHash);
   if (preconditionError) return errorResult(preconditionError);
+
+  if (type === 'TABL/DTT') return writeTableSettings(client, action, name, args, cachingLayer, cacheSecurity);
+  if (type === 'SOD1' || type === 'SOD2')
+    return writeApiCatalogObject(client, action, type, name, args, config, cachingLayer, cacheSecurity);
 
   // Types in SDO_REGISTRY use the shared engine (POST metadata → PUT source → activate).
   if (isServerDrivenObjectType(type)) {
@@ -124,6 +124,9 @@ export async function handleSAPWrite(
   // `buildCreateXml('FUNC', …, properties)` finds it.
   let objectUrl: string;
   let srcUrl: string;
+  if (type === 'INCL' && ['update', 'edit_unit', 'add_unit', 'edit_content'].includes(action)) {
+    args.group = await resolveIncludeGroupForMutation(client, name, args.group);
+  }
   if (
     (type === 'TABL' || type === 'TABL/DT' || type === 'TABL/DS') &&
     action !== 'create' &&
@@ -196,7 +199,7 @@ export async function handleSAPWrite(
   } else {
     // Discovery gate: refuse transparent-table creates upfront on systems that
     // don't expose /ddic/tables/ (NW 7.50/7.51). TABL/DS skips this — /structures/
-    // is always available. See issue #285.
+    // has separate backend support (verified on 750/758). See issue #285.
     if ((type === 'TABL' || type === 'TABL/DT') && (action === 'create' || action === 'batch_create')) {
       if (isTablesEndpointAvailable() === false) {
         return errorResult(TABL_DT_WRITE_UNAVAILABLE_HINT);
@@ -227,7 +230,9 @@ export async function handleSAPWrite(
   // Fail-closed: if the package cannot be determined from ADT metadata, refuse the write
   // rather than silently passing through the allowlist gate.
   async function enforcePackageForExistingObject(): Promise<string | undefined> {
-    return enforceAllowedPackageForObjectUrl(client, objectUrl, `Operations on ${type} '${name}'`);
+    return enforceAllowedPackageForObjectUrl(client, objectUrl, `Operations on ${type} '${name}'`, undefined, {
+      includeGroupHint: true,
+    });
   }
 
   const ctx: SapWriteContext = {
@@ -261,6 +266,7 @@ export async function handleSAPWrite(
       return writeActionEditMethod(ctx);
     case 'add_unit':
     case 'edit_unit':
+    case 'edit_content':
       return writeActionUnit(ctx);
 
     // Class-section surgery actions (issue #303) — see write/class-surgery.ts.
@@ -293,7 +299,7 @@ export async function handleSAPWrite(
       return writeActionEditTextSymbols(ctx);
     default:
       return errorResult(
-        `Unknown SAPWrite action: ${action}. Supported: create, update, delete, edit_method, edit_unit, add_unit, batch_create, scaffold_rap_handlers, generate_behavior_implementation`,
+        `Unknown SAPWrite action: ${action}. Supported: create, update, delete, edit_method, edit_unit, add_unit, edit_content, batch_create, scaffold_rap_handlers, generate_behavior_implementation`,
       );
   }
 }

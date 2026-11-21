@@ -376,6 +376,8 @@ ENDCLASS.`,
       expect(text).toContain('implementations');
       // Auto-routed hint should be present for callers who used the lhc_ prefix
       expect(text).toContain('auto-routed');
+      expect(text).toContain('Use SAPRead with method="*"');
+      expect(text).toContain('SAPRead grep');
     });
 
     it('reads inactive CCIMP when an inactive draft exists (PR-D review fix)', async () => {
@@ -1331,6 +1333,45 @@ ENDCLASS.
   </abapsource:objectStructureElement>
 </abapsource:objectStructureElement>`;
 
+    it.each(['edit_class_definition', 'edit_method_signature'])(
+      '%s replaces attached ABAP Doc in the saved source (#1041)',
+      async (action) => {
+        const oldClassDoc = '"! Old class documentation';
+        const oldMethodDoc = '    "! @parameter name | Old parameter documentation';
+        const documentedMain = `${oldClassDoc}\n${PROBE_MAIN.replace('    METHODS hello', `${oldMethodDoc}\n    METHODS hello`)}`;
+        // Added one class-doc row and one method-doc row, outside SAP's ranges.
+        const shiftedRow = (row: string) => Number(row) + 1 + (Number(row) >= 3 ? 1 : 0);
+        const structureXml = PROBE_STRUCTURE.replace(
+          /start=(\d+),(\d+);end=(\d+),(\d+)/g,
+          (_, sr, sc, er, ec) => `start=${shiftedRow(sr)},${sc};end=${shiftedRow(er)},${ec}`,
+        );
+        const calls = mockClassSurgeryFlow({ className: 'ZCL_PROBE', mainSource: documentedMain, structureXml });
+        const oldDoc = action === 'edit_class_definition' ? oldClassDoc : oldMethodDoc;
+        const newDoc = oldDoc.replace('Old', 'New');
+        const expected = documentedMain.replace(oldDoc, newDoc);
+        const source =
+          action === 'edit_class_definition'
+            ? expected.slice(0, expected.indexOf('ENDCLASS.') + 'ENDCLASS.'.length)
+            : `${newDoc}\n    METHODS hello\n      IMPORTING name TYPE string\n      RETURNING VALUE(result) TYPE string.`;
+        const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPWrite', {
+          action,
+          type: 'CLAS',
+          name: 'ZCL_PROBE',
+          method: 'hello',
+          source,
+        });
+        expect(result.isError, result.content[0]?.text).toBeUndefined();
+        const puts = calls.filter((call) => call.method === 'PUT');
+        expect(puts).toHaveLength(1);
+        expect(puts[0]?.body).toBe(expected);
+        expect(
+          calls
+            .filter((call) => call.url.includes('_action='))
+            .map((call) => new URL(call.url).searchParams.get('_action')),
+        ).toEqual(['LOCK', 'UNLOCK']);
+      },
+    );
+
     // ── edit_class_definition ────────────────────────────────────────
 
     it('edit_class_definition happy path: no method-set change (drop FINAL)', async () => {
@@ -2056,6 +2097,39 @@ ENDCLASS.`.replace(/\n/g, '\r\n');
       expect(calls.some((c) => c.url.includes('_action=UNLOCK'))).toBe(true);
     });
 
+    it('change_method_visibility moves attached ABAP Doc with the declaration (#1048)', async () => {
+      const docs = '    "! @parameter name | Greeting recipient';
+      const signature =
+        '    METHODS hello\n      IMPORTING name TYPE string\n      RETURNING VALUE(result) TYPE string.';
+      const block = `${docs}\n${signature}`;
+      const mainSource = PROBE_MAIN.replace(signature, block);
+      const shiftedRow = (row: string) => Number(row) + (Number(row) >= 3 ? 1 : 0);
+      const structureXml = PROBE_STRUCTURE.replace(
+        /start=(\d+),(\d+);end=(\d+),(\d+)/g,
+        (_, sr, sc, er, ec) => `start=${shiftedRow(sr)},${sc};end=${shiftedRow(er)},${ec}`,
+      );
+      const calls = mockClassSurgeryFlow({ className: 'ZCL_PROBE', mainSource, structureXml });
+      const result = await handleToolCall(createClient(), DEFAULT_CONFIG, 'SAPWrite', {
+        action: 'change_method_visibility',
+        type: 'CLAS',
+        name: 'ZCL_PROBE',
+        method: 'hello',
+        visibility: 'private',
+      });
+      expect(result.isError, result.content[0]?.text).toBeUndefined();
+      const expected = mainSource
+        .replace(`${block}\n`, '')
+        .replace('  PRIVATE SECTION.\n', `  PRIVATE SECTION.\n${block}\n`);
+      const puts = calls.filter((call) => call.method === 'PUT');
+      expect(puts).toHaveLength(1);
+      expect(puts[0]?.body).toBe(expected);
+      expect(
+        calls
+          .filter((call) => call.url.includes('_action='))
+          .map((call) => new URL(call.url).searchParams.get('_action')),
+      ).toEqual(['LOCK', 'UNLOCK']);
+    });
+
     it('edit_class_definition repairs a redefinition in the wrong section without changing its body', async () => {
       const broken = PROBE_MAIN.replace('FINAL CREATE PUBLIC', 'INHERITING FROM zcl_parent CREATE PUBLIC')
         .replace('PUBLIC SECTION.', 'PROTECTED SECTION.')
@@ -2524,13 +2598,23 @@ ENDCLASS.`.replace(/\n/g, '\r\n');
         const m = (init?.method ?? 'GET').toUpperCase();
         if (u.includes('_action=LOCK')) return Promise.resolve(mockResponse(200, LOCK_BODY, { 'x-csrf-token': 'T' }));
         if (u.includes('_action=UNLOCK')) return Promise.resolve(mockResponse(200, '', { 'x-csrf-token': 'T' }));
+        if (u.includes('?version=inactive')) {
+          const name = new URL(u).pathname.split('/').at(-1);
+          const type = u.includes('/classes/') ? 'CLAS/OCX' : 'PROG/PX';
+          return Promise.resolve(
+            mockResponse(
+              200,
+              `<rept:textElement xmlns:rept="http://www.sap.com/adt/textelements" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="${name}" adtcore:type="${type}" adtcore:version="active"/>`,
+            ),
+          );
+        }
         if (m === 'PUT') return Promise.resolve(mockResponse(200, '@MaxLength:10\r\n001=Hi', { 'x-csrf-token': 'T' }));
         return Promise.resolve(mockResponse(200, '', { 'x-csrf-token': 'T' }));
       });
     }
 
     // createClient() has allowedPackages=[] (unrestricted) → the package gate short-circuits without a
-    // metadata fetch, so the flow is just CSRF → lock → PUT → unlock.
+    // package metadata fetch. The pool flow also reads back the part and verifies activation state.
     const putCall = () =>
       mockFetch.mock.calls.find(([, i]) => ((i as { method?: string })?.method ?? 'GET').toUpperCase() === 'PUT');
 

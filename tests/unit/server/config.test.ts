@@ -71,10 +71,43 @@ describe('parseArgs', () => {
     expect(() => parseArgs([flag])).toThrow(/Removed ARC-1 configuration/);
   });
 
+  it.each(['env', 'flag', 'both'])('accepts ignored legacy AMDP configuration from %s with one warning', (source) => {
+    if (source !== 'flag') process.env.SAP_FEATURE_AMDP = 'on';
+    const warning = vi.spyOn(console, 'error').mockImplementation(() => {});
+    try {
+      const config = parseArgs(source === 'env' ? [] : ['--feature-amdp=on']);
+      expect(config).not.toHaveProperty('featureAmdp');
+      expect(warning.mock.calls.filter(([text]) => String(text).includes('AMDP'))).toHaveLength(1);
+      expect(warning).toHaveBeenCalledWith(expect.stringContaining('ignored'));
+    } finally {
+      warning.mockRestore();
+    }
+  });
+
   it('rejects the unreleased SAP_BTP_DESTINATIONS prototype variable with a migration hint', () => {
     process.env.SAP_BTP_DESTINATIONS = 'S4D,S4Q';
     expect(() => parseArgs([])).toThrow(/ARC1_MULTI_TARGET_ENDPOINTS/);
   });
+
+  it('requires an explicit Eclipse SID and preserves CLI precedence', () => {
+    expect(parseArgs([]).ideLinks).toBe('off');
+    process.env.ARC1_IDE_LINKS = 'eclipse';
+    expect(() => parseArgs([])).toThrow(/requires ARC1_IDE_SYSTEM_ID/);
+    process.env.ARC1_IDE_SYSTEM_ID = 'A4H';
+    expect(parseArgs([])).toMatchObject({ ideLinks: 'eclipse', ideSystemId: 'A4H' });
+    expect(parseArgs(['--ide-system-id', 'DEV']).ideSystemId).toBe('DEV');
+    expect(parseArgs(['--ide-links', 'off']).ideLinks).toBe('off');
+    expect(() => parseArgs(['--ide-system-id', 'A4H-2025'])).toThrow(/three-character SAP SID/);
+    expect(parseArgs(['--transport', 'http-streamable', '--api-keys', 'test-key:viewer']).ideLinks).toBe('eclipse');
+  });
+
+  it.each(['vscode', 'on', 'auto'])(
+    'rejects removed or unsupported IDE mode %s with native resolver guidance',
+    (mode) => {
+      process.env.ARC1_IDE_LINKS = mode;
+      expect(() => parseArgs([])).toThrow(/must be off or eclipse.*SAP ADT MCP resolver/);
+    },
+  );
 
   it('parses CLI flags (--flag value)', () => {
     const config = parseArgs(['--url', 'http://sap:8000', '--user', 'admin', '--password', 'secret']);
@@ -144,6 +177,71 @@ describe('parseArgs', () => {
     const fromCli = resolveConfig(['--gzip-datapreview-body', 'false']);
     expect(fromCli.config.gzipDataPreviewBody).toBe(false);
     expect(fromCli.sources.gzipDataPreviewBody).toEqual({ flag: '--gzip-datapreview-body' });
+  });
+
+  describe('ARC1_ALLOWED_CLIENT_IPS', () => {
+    const http = ['--transport', 'http-streamable', '--api-keys', 'test-key:viewer'];
+    const vcap = JSON.stringify({ application_uris: ['arc1.cfapps.example.test'] });
+
+    it('defaults to off', () => {
+      const { config, sources } = resolveConfig(http);
+      expect(config.allowedClientIps).toEqual([]);
+      expect(sources.allowedClientIps).toBe('default');
+    });
+
+    it('parses env and lets the flag win, with source attribution', () => {
+      process.env.VCAP_APPLICATION = vcap;
+      process.env.ARC1_ALLOWED_CLIENT_IPS = ' 10.0.0.0/8, 2001:db8::/32 ';
+      const fromEnv = resolveConfig(http);
+      expect(fromEnv.config.allowedClientIps).toEqual(['10.0.0.0/8', '2001:db8::/32']);
+      expect(fromEnv.sources.allowedClientIps).toEqual({ env: 'ARC1_ALLOWED_CLIENT_IPS' });
+
+      const fromCli = resolveConfig([...http, '--allowed-client-ips', '192.0.2.7']);
+      expect(fromCli.config.allowedClientIps).toEqual(['192.0.2.7']);
+      expect(fromCli.sources.allowedClientIps).toEqual({ flag: '--allowed-client-ips' });
+    });
+
+    it('treats blank as off, even outside Cloud Foundry', () => {
+      delete process.env.VCAP_APPLICATION;
+      process.env.ARC1_ALLOWED_CLIENT_IPS = '  ';
+      const { config, sources } = resolveConfig(http);
+      expect(config.allowedClientIps).toEqual([]);
+      expect(sources.allowedClientIps).toEqual({ env: 'ARC1_ALLOWED_CLIENT_IPS' });
+    });
+
+    it('fails startup on an invalid or empty entry, naming it', () => {
+      process.env.VCAP_APPLICATION = vcap;
+      process.env.ARC1_ALLOWED_CLIENT_IPS = '10.0.0.0/8,example.com';
+      expect(() => resolveConfig(http)).toThrow("ARC1_ALLOWED_CLIENT_IPS: invalid entry 'example.com'");
+      process.env.ARC1_ALLOWED_CLIENT_IPS = '10.0.0.0/8,';
+      expect(() => resolveConfig(http)).toThrow('ARC1_ALLOWED_CLIENT_IPS entry #2 of 2 is empty');
+      expect(() => resolveConfig([...http, '--allowed-client-ips', '10.0.0.0/99'])).toThrow(
+        "--allowed-client-ips: invalid entry '10.0.0.0/99'",
+      );
+    });
+
+    it('refuses HTTP mode outside Cloud Foundry', () => {
+      delete process.env.VCAP_APPLICATION;
+      process.env.ARC1_ALLOWED_CLIENT_IPS = '10.0.0.0/8';
+      expect(() => resolveConfig(http)).toThrow(/ARC1_ALLOWED_CLIENT_IPS requires SAP BTP Cloud Foundry/);
+      const handBuilt = {
+        ...DEFAULT_CONFIG,
+        transport: 'http-streamable' as const,
+        allowHttpNoAuth: true,
+        allowedClientIps: ['10.0.0.0/8'],
+      };
+      expect(() => validateConfig(handBuilt)).toThrow(/client-controlled/);
+      process.env.VCAP_APPLICATION = vcap;
+      expect(() => validateConfig(handBuilt)).not.toThrow();
+    });
+
+    it('does not require Cloud Foundry in stdio mode but still validates the list', () => {
+      delete process.env.VCAP_APPLICATION;
+      process.env.ARC1_ALLOWED_CLIENT_IPS = '10.0.0.0/8';
+      expect(resolveConfig([]).config.transport).toBe('stdio');
+      process.env.ARC1_ALLOWED_CLIENT_IPS = 'bad';
+      expect(() => resolveConfig([])).toThrow("ARC1_ALLOWED_CLIENT_IPS: invalid entry 'bad'");
+    });
   });
 
   it('normalizes, deduplicates, and source-attributes the experimental data-source blocklist', () => {
@@ -1030,6 +1128,46 @@ describe('parseArgs', () => {
     process.env.ARC1_AUTH_RATE_LIMIT = '99';
     const config = parseArgs(['--auth-rate-limit', '7']);
     expect(config.authRateLimit).toBe(7);
+  });
+
+  it('allows disabling new OAuth registrations with CLI precedence over environment', () => {
+    expect(parseArgs([]).oauthDcrEnabled).toBe(true);
+    vi.stubEnv('ARC1_OAUTH_DCR_ENABLED', 'false');
+    expect(parseArgs([]).oauthDcrEnabled).toBe(false);
+    expect(parseArgs(['--oauth-dcr-enabled', 'true']).oauthDcrEnabled).toBe(true);
+    expect(parseArgs(['--oauth-dcr-enabled', 'false']).oauthDcrEnabled).toBe(false);
+  });
+
+  it('parses the OAuth redirect allowlist and records its source', () => {
+    expect(parseArgs([]).oauthDcrRedirectUriPatterns).toBeUndefined();
+    vi.stubEnv(
+      'ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS',
+      'https://vscode.dev/redirect, http://127.0.0.1:*/**\nhttps://workspace.example/callback',
+    );
+    const { config, sources } = resolveConfig([]);
+    expect(config.oauthDcrRedirectUriPatterns).toEqual([
+      'https://vscode.dev/redirect',
+      'http://127.0.0.1:*/**',
+      'https://workspace.example/callback',
+    ]);
+    expect(sources.oauthDcrRedirectUriPatterns).toEqual({ env: 'ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS' });
+    const override = resolveConfig(['--oauth-dcr-redirect-uri-patterns=https://client.example/cb']);
+    expect(override.config.oauthDcrRedirectUriPatterns).toEqual(['https://client.example/cb']);
+    expect(override.sources.oauthDcrRedirectUriPatterns).toEqual({ flag: '--oauth-dcr-redirect-uri-patterns' });
+  });
+
+  it.each(['', '  ', ', ,'])('treats an explicitly empty DCR policy as deny-all: %j', (value) => {
+    vi.stubEnv('ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS', value);
+    expect(parseArgs([]).oauthDcrRedirectUriPatterns).toEqual([]);
+    vi.stubEnv('ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS', 'https://client.example/cb');
+    expect(parseArgs(['--oauth-dcr-redirect-uri-patterns', value]).oauthDcrRedirectUriPatterns).toEqual([]);
+  });
+
+  it('keeps an empty equals-style DCR flag authoritative over the environment', () => {
+    vi.stubEnv('ARC1_OAUTH_DCR_REDIRECT_URI_PATTERNS', 'https://client.example/cb');
+    const { config, sources } = resolveConfig(['--oauth-dcr-redirect-uri-patterns=']);
+    expect(config.oauthDcrRedirectUriPatterns).toEqual([]);
+    expect(sources.oauthDcrRedirectUriPatterns).toEqual({ flag: '--oauth-dcr-redirect-uri-patterns' });
   });
 
   // --- oauthDcrTtlSeconds ---

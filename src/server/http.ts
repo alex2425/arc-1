@@ -33,15 +33,21 @@ import type { Request, Response } from 'express';
 import express from 'express';
 import helmet from 'helmet';
 import { expandScopes, hasRequiredScope } from '../authz/policy.js';
+import { assertClientIpAllowlistPlatform, createClientIpAllowlist } from './client-ip-allowlist.js';
 import { API_KEY_PROFILES } from './config.js';
 import { generateRequestId, requestContext } from './context.js';
 import type { DestinationRegistry, TargetDescriptor } from './destination-registry.js';
+import { createHttpJsonParser, handleHttpBodyParseError } from './http-request-body.js';
 import { authLibLogger, logger } from './logger.js';
+import { isTargetGranted, type MultiTargetAuthorizationMode } from './multi-target-authorization.js';
+import { auditMcpRouteDenial, auditTargetGrantDenial } from './multi-target-authorization-audit.js';
+import { requireXsuaaUserBearerAuth } from './multi-target-bearer-auth.js';
 import {
   PINNED_MCP_PATH_PATTERN,
   PINNED_RESOURCE_METADATA_PATH_PATTERN,
   targetFromPinnedMcpPath,
 } from './multi-target-identity.js';
+import { type MultiTargetRequestProjection, projectMultiTargetRequest } from './multi-target-request-projection.js';
 import { ARC1_MANUAL_CLIENT_REDIRECT_URI_PATTERNS } from './oauth-redirect-policy.js';
 import {
   buildXsuaaSessionRefreshUrl,
@@ -49,6 +55,7 @@ import {
   OAUTH_LOGGED_OUT_PATH,
   withInvalidScopeSessionRecovery,
 } from './oauth-session-recovery.js';
+import { protectPrivateMcpResponse } from './private-mcp-response.js';
 import { VERSION } from './server.js';
 import { sanitizeClientAgent, validateTraceparent, validateTracestate } from './trace-context.js';
 import type { ServerConfig } from './types.js';
@@ -100,9 +107,16 @@ function toApiKeyEntries(config: ServerConfig): ApiKeyEntry[] {
  * silently dropped by the browser and surfaced server-side as `cors_rejected`
  * audit events.
  *
+ * The optional client-IP allowlist runs after helmet (its 403 carries the headers) and before CORS,
+ * body parsing, rate limiting and authentication — see client-ip-allowlist.ts.
+ *
  * Exported for unit tests; also called from `startHttpServer` below.
  */
-export function applySecurityMiddleware(app: express.Application, allowedOrigins: string[]): void {
+export function applySecurityMiddleware(
+  app: express.Application,
+  allowedOrigins: string[],
+  allowedClientIps: string[],
+): void {
   const hasCorsOrigins = allowedOrigins.length > 0;
   app.use(
     helmet({
@@ -124,6 +138,11 @@ export function applySecurityMiddleware(app: express.Application, allowedOrigins
         : undefined,
     }),
   );
+
+  if (allowedClientIps.length > 0) {
+    app.use(createClientIpAllowlist(allowedClientIps));
+    logger.info('Client IP allowlist enabled', { entries: allowedClientIps.length });
+  }
 
   if (hasCorsOrigins) {
     const allowed = new Set(allowedOrigins);
@@ -182,6 +201,16 @@ export function applySecurityMiddleware(app: express.Application, allowedOrigins
  * StreamableHTTPServerTransport.handleRequest().
  */
 async function serveMcpRequest(serverFactory: () => McpServer, req: Request, res: Response): Promise<void> {
+  // POST bodies must have passed ARC-1's parser and admission limits.
+  // An undefined body would let the SDK read the stream under its own limits.
+  if (req.method === 'POST' && req.body === undefined) {
+    res.status(415).json({
+      jsonrpc: '2.0',
+      error: { code: -32000, message: 'Unsupported Media Type: POST requires an application/json body' },
+      id: null,
+    });
+    return;
+  }
   try {
     const server = serverFactory();
     const transport = new StreamableHTTPServerTransport({
@@ -233,20 +262,38 @@ export function createMcpHandler(serverFactory: () => McpServer) {
 
 export interface MultiTargetRouting {
   registry: DestinationRegistry;
-  aggregateFactory: () => McpServer;
-  createPinnedServer: (target: TargetDescriptor) => McpServer;
+  authorizationMode: MultiTargetAuthorizationMode;
+  aggregateFactory: (projection?: MultiTargetRequestProjection) => McpServer;
+  createPinnedServer: (target: TargetDescriptor, projection?: MultiTargetRequestProjection) => McpServer;
 }
 
 export function createPinnedTargetMcpHandler(multi: MultiTargetRouting) {
+  assertRoutingAuthorizationMode(multi);
   return async (req: Request, res: Response) => {
+    const enforced = multi.authorizationMode === 'xsuaa-attribute';
+    const projection = enforced ? projectMultiTargetRequest(multi.registry, req.auth) : undefined;
+    const targetId = targetFromPinnedMcpPath(req.path);
+    if (enforced) {
+      protectPrivateMcpResponse(res);
+      if (!projection?.read) {
+        auditMcpRouteDenial(req.auth, 'pinned-mcp');
+        res.status(403).json({ error: 'forbidden' });
+        return;
+      }
+      // Membership and registry state are deliberately inspected only after the caller's grant.
+      if (!targetId || !isTargetGranted(projection.grant, targetId)) {
+        auditTargetGrantDenial(projection.grant, req.auth, generateRequestId(), 'pinned-mcp', targetId);
+        res.status(404).json({ error: 'Target not available' });
+        return;
+      }
+    }
     if (!multi.registry.available) {
       res.status(503).json({ error: 'Multi-target registry unavailable' });
       return;
     }
-    const targetId = targetFromPinnedMcpPath(req.path);
     const target = targetId ? multi.registry.get(targetId) : undefined;
     if (!target) {
-      res.status(404).json({ error: 'Not found' });
+      res.status(404).json({ error: enforced ? 'Target not available' : 'Not found' });
       return;
     }
     logger.debug('MCP handler invoked (pinned target)', {
@@ -255,17 +302,47 @@ export function createPinnedTargetMcpHandler(multi: MultiTargetRouting) {
       bodyMethod: req.body?.method,
       bodyId: req.body?.id,
     });
-    await serveMcpRequest(() => multi.createPinnedServer(target), req, res);
+    await serveMcpRequest(
+      () => (projection ? multi.createPinnedServer(target, projection) : multi.createPinnedServer(target)),
+      req,
+      res,
+    );
   };
 }
 
 export function createAggregateMcpHandler(multi: MultiTargetRouting) {
+  assertRoutingAuthorizationMode(multi);
   return async (req: Request, res: Response) => {
     // Keep the aggregate MCP transport reachable when discovery fails so an
     // administrator can call SAPTargets and inspect secret-safe diagnostics.
     // Other tool calls return a structured registry-unavailable result.
-    await serveMcpRequest(multi.aggregateFactory, req, res);
+    const projection =
+      multi.authorizationMode === 'xsuaa-attribute' ? projectMultiTargetRequest(multi.registry, req.auth) : undefined;
+    if (projection) {
+      protectPrivateMcpResponse(res);
+      if (!projection.read) {
+        auditMcpRouteDenial(req.auth, 'aggregate-mcp');
+        res.status(403).json({ error: 'forbidden' });
+        return;
+      }
+      // Zero-grant readers have no tool with which to trigger a targeted denial.
+      // Diagnose their own grant during discovery without exposing claims or inventory.
+      if (
+        projection.grant.mode === 'none' &&
+        req.method === 'POST' &&
+        (req.body?.method === 'initialize' || req.body?.method === 'tools/list')
+      ) {
+        auditTargetGrantDenial(projection.grant, req.auth, generateRequestId(), 'aggregate-mcp');
+      }
+    }
+    await serveMcpRequest(() => (projection ? multi.aggregateFactory(projection) : multi.aggregateFactory()), req, res);
   };
+}
+
+function assertRoutingAuthorizationMode(multi: MultiTargetRouting): void {
+  if (multi.authorizationMode !== 'standard' && multi.authorizationMode !== 'xsuaa-attribute') {
+    throw new Error('Multi-target routing requires an explicit authorization mode');
+  }
 }
 
 export function resolveMcpHttpRateLimit(config: Pick<ServerConfig, 'authRateLimit' | 'mcpHttpRateLimit'>): number {
@@ -294,6 +371,13 @@ export async function startHttpServer(
   uiDeps?: UiServerDeps,
   multiTargets?: MultiTargetRouting,
 ): Promise<import('node:http').Server> {
+  assertClientIpAllowlistPlatform(config.allowedClientIps);
+  if (multiTargets) {
+    assertRoutingAuthorizationMode(multiTargets);
+    if (multiTargets.authorizationMode !== config.multiTargetAuthorization) {
+      throw new Error('Multi-target routing authorization mode must match server configuration');
+    }
+  }
   // Defense in depth: without credentials the XSUAA branch below is skipped and /mcp would be open.
   if (config.xsuaaAuth && !xsuaaCredentials) {
     throw new Error('SAP_XSUAA_AUTH=true requires XSUAA credentials; refusing to start an unauthenticated /mcp.');
@@ -307,7 +391,7 @@ export async function startHttpServer(
   // and correct client IP detection behind CF's reverse proxy.
   app.set('trust proxy', 1);
 
-  applySecurityMiddleware(app, config.allowedOrigins);
+  applySecurityMiddleware(app, config.allowedOrigins, config.allowedClientIps);
 
   // ─── Layer 1: HTTP-edge rate limiter helper ──────────────────────────
   // `ARC1_AUTH_RATE_LIMIT` (default 20/min/IP) controls OAuth endpoints uniformly.
@@ -334,8 +418,9 @@ export async function startHttpServer(
     disabled: !authRateLimitEnabled && !mcpRateLimitEnabled,
   });
 
-  app.use(express.json());
-  app.use(express.urlencoded({ extended: false }));
+  app.use(createHttpJsonParser(config.maxHttpRequestBytes));
+  app.use(express.urlencoded({ extended: false, inflate: false }));
+  app.use(handleHttpBodyParseError);
   if (mcpRateLimitEnabled) {
     // One middleware instance means one MemoryStore and therefore one per-IP
     // bucket across single-target, pinned, aggregate, and Copilot routes.
@@ -403,6 +488,12 @@ export async function startHttpServer(
     // /arc1), endpoints must be advertised at that prefix even though the
     // Express routes live at the root (the proxy strips the prefix).
     const oauthParsedAppUrl = new URL(appUrl);
+    const oauthLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(oauthParsedAppUrl.hostname);
+    if (oauthParsedAppUrl.protocol !== 'https:' && !(oauthParsedAppUrl.protocol === 'http:' && oauthLoopback)) {
+      throw new Error(
+        'XSUAA OAuth requires a public HTTPS URL. Set ARC1_PUBLIC_URL to the canonical HTTPS URL including any proxy path prefix; HTTP is supported only for loopback development.',
+      );
+    }
     const oauthBasePath = oauthParsedAppUrl.pathname.replace(/\/$/, ''); // '' for root, '/arc1' otherwise
     const oauthFullBase = `${oauthParsedAppUrl.origin}${oauthBasePath}`;
     // ARC-1's own OAuth callback (issue #214 callback proxy). Public, prefix-aware
@@ -424,6 +515,8 @@ export async function startHttpServer(
       clientIdPrefix: 'arc1-',
       dcrKdfLabel: 'arc1-dcr/v1',
       stateKdfLabel: 'arc1-oauth-state/v1',
+      dcrEnabled: config.oauthDcrEnabled,
+      dcrRedirectUriPatterns: config.oauthDcrRedirectUriPatterns,
       dcrTtlSeconds: config.oauthDcrTtlSeconds,
       dcrSigningSecret: config.dcrSigningSecret,
       callbackUrl: oauthCallbackUrl,
@@ -433,6 +526,27 @@ export async function startHttpServer(
     // Inject ARC-1's scope-expansion policy + logger so the verifier emits the
     // same expanded AuthInfo.scopes ARC-1 produced before the extraction.
     const xsuaaVerifier = createXsuaaTokenVerifier(xsuaaCredentials, { expandScopes, logger: authLibLogger });
+    const enforcedTargets = config.multiTargetAuthorization === 'xsuaa-attribute';
+    const rawMultiXsuaaVerifier = enforcedTargets
+      ? createXsuaaTokenVerifier(xsuaaCredentials, {
+          expandScopes: (scopes) => scopes,
+          logger: authLibLogger,
+          userAttributeNames: ['arc1_targets', 'arc1_write_targets'],
+          requireUserToken: true,
+        })
+      : xsuaaVerifier;
+    const multiXsuaaVerifier: typeof rawMultiXsuaaVerifier = async (token) => {
+      const verified = await rawMultiXsuaaVerifier(token);
+      if (!enforcedTargets) return verified;
+      return {
+        ...verified,
+        scopes: expandScopes(verified.scopes),
+        extra: {
+          ...verified.extra,
+          arc1VerifiedRawScopes: Object.freeze([...verified.scopes]),
+        },
+      };
+    };
     // OIDC verifier comes from the package (hardened: pinned `algorithms`
     // allowlist, no `sub` in debug logs). `buildPackageOidcVerifier` threads
     // ARC-1's historical contract (accepted scopes, `expandScopes`, the
@@ -463,13 +577,12 @@ export async function startHttpServer(
             // originalUrl preserves the public route, so the Copilot alias can
             // advertise the aggregate PRM instead of a non-existent root PRM.
             const originalPath = req.originalUrl?.split('?', 1)[0] || req.path;
-            const lowerPath = originalPath.toLowerCase();
+            const lowerPath = originalPath.replace(/\/+$/, '').toLowerCase();
             const resourcePath = lowerPath === '/authorize' ? '/multi/mcp' : originalPath;
             const multiResourceMetadataUrl = `${oauthFullBase}/.well-known/oauth-protected-resource${resourcePath}`;
-            const authenticate = requireBearerAuth({
-              verifier: { verifyAccessToken: xsuaaVerifier },
-              resourceMetadataUrl: multiResourceMetadataUrl,
-            });
+            const route = resourcePath.toLowerCase() === '/multi/mcp' ? 'aggregate-mcp' : 'pinned-mcp';
+            if (enforcedTargets) protectPrivateMcpResponse(res);
+            const authenticate = requireXsuaaUserBearerAuth(multiXsuaaVerifier, multiResourceMetadataUrl, route);
             authenticate(req, res, (error) => {
               if (error) {
                 next(error);
@@ -480,6 +593,7 @@ export async function startHttpServer(
               // request the four mutation-free scopes advertised by the route PRM;
               // XSUAA still grants only the subset assigned to the authenticated user.
               if (!req.auth || !hasRequiredScope(req.auth.scopes, 'read')) {
+                auditMcpRouteDenial(req.auth, route);
                 res
                   .set(
                     'WWW-Authenticate',
@@ -657,7 +771,7 @@ export async function startHttpServer(
         scopes_supported: scopesSupported,
         revocation_endpoint: `${fullBase}/revoke`,
         revocation_endpoint_auth_methods_supported: ['client_secret_post'],
-        registration_endpoint: `${fullBase}/register`,
+        ...(config.oauthDcrEnabled ? { registration_endpoint: `${fullBase}/register` } : {}),
       };
       const customResourceMetadata = {
         resource: `${fullBase}/mcp`,
@@ -701,7 +815,10 @@ export async function startHttpServer(
         res.json({
           resource: `${oauthFullBase}/${match?.[1]}/${match?.[2]}/mcp`,
           authorization_servers: [`${oauthFullBase}/`],
-          scopes_supported: MULTI_TARGET_SCOPES_SUPPORTED,
+          scopes_supported:
+            config.allowWrites && enforcedTargets
+              ? [...MULTI_TARGET_SCOPES_SUPPORTED, 'write']
+              : MULTI_TARGET_SCOPES_SUPPORTED,
           resource_name: 'ARC-1 SAP MCP Server (pinned target)',
         });
       });

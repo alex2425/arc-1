@@ -15,6 +15,7 @@ import { afterEach, expect, it, vi } from 'vitest';
 import { Semaphore } from '../../../src/adt/semaphore.js';
 import { DEFAULT_CONFIG, type ServerConfig } from '../../../src/server/types.js';
 import { mockResponse } from '../../helpers/mock-fetch.js';
+import { makeSamlMaterial } from '../../helpers/saml-material.js';
 import { featuresOff } from '../handlers/handler-test-config.js';
 import { mockFetch } from '../handlers/setup-undici-mock.js';
 
@@ -29,10 +30,15 @@ vi.mock('../../../src/server/shutdown.js', () => ({ registerShutdownHandlers: vi
 vi.mock('@arc-mcp/xsuaa-auth/btp', async (importOriginal) => ({
   ...(await importOriginal<typeof import('@arc-mcp/xsuaa-auth/btp')>()),
   lookupDestinationWithUserToken: vi.fn(),
+  resolveBTPDestination: vi.fn(),
+  parseVCAPServices: vi.fn(),
 }));
 
-const { lookupDestinationWithUserToken } = await import('@arc-mcp/xsuaa-auth/btp');
+const { lookupDestinationWithUserToken, parseVCAPServices, resolveBTPDestination } = await import(
+  '@arc-mcp/xsuaa-auth/btp'
+);
 const { AdtHttpClient } = await import('../../../src/adt/http.js');
+const { PerUserTransportPool } = await import('../../../src/server/per-user-transport.js');
 const { createAndStartServer, createServer, SHARED_TRANSPORT_MAX_AGE_MS } = await import(
   '../../../src/server/server.js'
 );
@@ -61,6 +67,59 @@ afterEach(() => {
   resetCachedFeatures();
 });
 
+it('loads the local SAML issuer once at startup for multiple HTTP request servers', async () => {
+  const material = makeSamlMaterial();
+  try {
+    vi.spyOn(adtFeatures, 'probeFeatures').mockResolvedValue(featuresOff());
+    mockFetch.mockResolvedValue(mockResponse(200, ''));
+    const config = {
+      ...DEFAULT_CONFIG,
+      url: 'http://sap:8000',
+      transport: 'http-streamable' as const,
+      cacheMode: 'none' as const,
+      insecure: true,
+      ppEnabled: true,
+      samlIdpKeyFile: material.keyFile,
+      samlIdpCertFile: material.certFile,
+      samlIdpIssuer: 'arc1-unit-test-saml-idp',
+      samlAudience: 'A4H_001',
+      samlNameIdClaim: 'email',
+    };
+    const startup = await createAndStartServer(config);
+    await startup.close();
+    rmSync(material.keyFile);
+    rmSync(material.certFile);
+    const first = runtime.factory!();
+    const second = runtime.factory!();
+    await first.close();
+    await second.close();
+  } finally {
+    material.cleanup();
+  }
+});
+
+it('refuses startup when local SAML key material is invalid', async () => {
+  const material = makeSamlMaterial();
+  try {
+    writeFileSync(material.keyFile, 'invalid key');
+    await expect(
+      createAndStartServer({
+        ...DEFAULT_CONFIG,
+        url: 'http://sap:8000',
+        transport: 'http-streamable',
+        cacheMode: 'none',
+        samlIdpKeyFile: material.keyFile,
+        samlIdpCertFile: material.certFile,
+        samlIdpIssuer: 'arc1-unit-test-saml-idp',
+        samlAudience: 'A4H_001',
+        samlNameIdClaim: 'email',
+      }),
+    ).rejects.toThrow(/SAP_PP_SAML_IDP_KEY_FILE does not contain a PEM private key/);
+  } finally {
+    material.cleanup();
+  }
+});
+
 /** Start the real HTTP factory against a mocked 7.50-like SAP; ZSWAP lives in `pkg` (a child of ZROOT). */
 async function startFactory(allowedPackages: string[], pkg: string) {
   vi.spyOn(adtFeatures, 'probeFeatures').mockResolvedValue({
@@ -86,15 +145,25 @@ async function startFactory(allowedPackages: string[], pkg: string) {
         login,
       );
     }
-    if (String(url).includes('/repository/nodestructure') && String(url).includes('parent_name=ZROOT')) {
+    // Package metadata for the allowedPackages chain walk: <pkg> sits under ZROOT while inAllowedTree.
+    if (new URL(String(url)).pathname.toUpperCase() === `/SAP/BC/ADT/PACKAGES/${pkg.toUpperCase()}`) {
       return mockResponse(
         200,
-        `<asx:abap xmlns:asx="http://www.sap.com/abapxml"><asx:values><DATA><TREE_CONTENT>${sap.inAllowedTree ? `<SEU_ADT_REPOSITORY_OBJ_NODE><OBJECT_TYPE>DEVC/K</OBJECT_TYPE><OBJECT_NAME>${pkg}</OBJECT_NAME></SEU_ADT_REPOSITORY_OBJ_NODE>` : ''}</TREE_CONTENT></DATA></asx:values></asx:abap>`,
+        `<pak:package xmlns:pak="http://www.sap.com/adt/packages" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="${pkg}"><pak:superPackage adtcore:name="${sap.inAllowedTree ? 'ZROOT' : 'ZELSEWHERE'}"/></pak:package>`,
         { 'x-csrf-token': 'T' },
         login,
       );
     }
-    if (String(url).includes('/repository/nodestructure')) return mockResponse(200, '', { 'x-csrf-token': 'T' });
+    const parent = sap.inAllowedTree ? 'ZROOT' : 'ZELSEWHERE';
+    if (new URL(String(url)).pathname === `/sap/bc/adt/packages/${parent}`) {
+      return mockResponse(
+        200,
+        `<pak:package xmlns:pak="http://www.sap.com/adt/packages" xmlns:adtcore="http://www.sap.com/adt/core" adtcore:name="${parent}"/>`,
+        {},
+        login,
+      );
+    }
+    if (String(url).includes('/sap/bc/adt/packages/')) return mockResponse(404, 'not found');
     if (String(url).includes('_action=LOCK')) {
       return mockResponse(200, '<asx:values><LOCK_HANDLE>LH7</LOCK_HANDLE><CORRNR></CORRNR></asx:values>', {}, login);
     }
@@ -146,7 +215,7 @@ it('shares the SAP login across HTTP requests but re-resolves TABL routes per re
 it('resolves the SAP_ALLOWED_PACKAGES subtree afresh for every HTTP request', async () => {
   // A package re-parented in SAP must affect the next request, not wait out a process-wide cache TTL.
   const { sap, callTable } = await startFactory(['ZROOT/**'], 'ZCHILD');
-  const hierarchyFetches = () => sap.calls.filter((c) => c.url.includes('/repository/nodestructure')).length;
+  const hierarchyFetches = () => sap.calls.filter((c) => c.url.includes('/sap/bc/adt/packages/')).length;
 
   expect((await callTable('update')).isError).not.toBe(true);
   expect(hierarchyFetches()).toBeGreaterThan(0);
@@ -173,6 +242,8 @@ it('keeps the shared SAP login out of PP requests and never falls back after an 
     cacheMode: 'none' as const,
   };
   const defaultHttp = new AdtHttpClient({ baseUrl: config.url, username: 'TECH', password: 'secret' });
+  // Only Cloud Connector credentials are pooled; this OAuth2UserTokenExchange route stays request-local.
+  const perUserTransports = new PerUserTransportPool(SHARED_TRANSPORT_MAX_AGE_MS);
   mockFetch.mockResolvedValue(
     mockResponse(200, 'REPORT ztest.', {}, [
       'SAP_SESSIONID_A4H_001=shared-session; path=/',
@@ -182,7 +253,7 @@ it('keeps the shared SAP login out of PP requests and never falls back after an 
   await defaultHttp.get('/sap/bc/adt/programs/programs/ZTEST/source/main');
   const callAs = (user: string) =>
     callTool(
-      createServer(config, { defaultHttp, btpConfig: {} as BTPConfig }),
+      createServer(config, { defaultHttp, perUserTransports, btpConfig: {} as BTPConfig }),
       'SAPRead',
       { type: 'PROG', name: 'ZTEST' },
       {
@@ -218,6 +289,7 @@ it('keeps the shared SAP login out of PP requests and never falls back after an 
       expect(options.headers.Cookie ?? '').not.toContain(user === 'ALICE' ? 'BOB' : 'ALICE');
     }
   }
+  expect(perUserTransports.size).toBe(0);
   vi.mocked(lookupDestinationWithUserToken).mockRejectedValue(new Error('exchange unavailable'));
   mockFetch.mockClear();
   const failed = await callAs('CAROL');
@@ -242,12 +314,16 @@ it('replaces an aged shared transport for new requests while previously created 
     ),
   );
   const f = await startRotationFactory();
-  /** Cookie header of the first SAP request a tool call sends ('' = logs on with the configured credentials). */
+  /** Inspect this tool's source request, excluding any still-finishing startup auth probe. */
   const firstCookie = async (server = runtime.factory!()) => {
     mockFetch.mockClear();
     const result = await callTool(server, 'SAPRead', { type: 'PROG', name: 'ZTEST' });
     expect(result.isError, result.content[0]?.text).not.toBe(true);
-    return String(mockFetch.mock.calls[0]?.[1].headers.Cookie ?? '');
+    const sourceCalls = mockFetch.mock.calls.filter(
+      ([url]) => new URL(String(url)).pathname === '/sap/bc/adt/programs/programs/ZTEST/source/main',
+    );
+    expect(sourceCalls).toHaveLength(1);
+    return String(sourceCalls[0]?.[1].headers.Cookie ?? '');
   };
 
   expect(await firstCookie()).toBe('');
@@ -260,6 +336,67 @@ it('replaces an aged shared transport for new requests while previously created 
   f.advance(1);
   expect(await firstCookie()).toBe('');
   expect(await firstCookie(running)).toBe(reused);
+});
+
+it('keeps a PP credential without a Cloud Connector route request-local', async () => {
+  vi.stubEnv('SAP_BTP_DESTINATION', 'SHARED');
+  vi.stubEnv('SAP_BTP_PP_DESTINATION', 'PER_USER');
+  vi.mocked(resolveBTPDestination).mockResolvedValue({
+    url: 'http://sap:8000',
+    username: 'TECH',
+    password: 'secret',
+    client: '001',
+    proxy: null,
+  } as Awaited<ReturnType<typeof resolveBTPDestination>>);
+  vi.mocked(parseVCAPServices).mockReturnValue({} as BTPConfig);
+  vi.mocked(lookupDestinationWithUserToken).mockImplementation(async (_btp, _name, userJwt) => ({
+    destination: {
+      Name: 'PER_USER',
+      URL: 'http://sap:8000',
+      Type: 'HTTP',
+      Authentication: 'PrincipalPropagation',
+      ProxyType: 'Internet',
+      User: '',
+      Password: '',
+    },
+    authTokens: { sapConnectivityAuth: `Bearer ${userJwt}` },
+  }));
+  let logins = 0;
+  mockFetch.mockImplementation(async (_url: string, options: { headers?: Record<string, string> }) =>
+    mockResponse(
+      200,
+      'REPORT ztest.',
+      {},
+      options.headers?.Cookie?.includes('SAP_SESSIONID') ? [] : [`SAP_SESSIONID_A4H_001=S${++logins}; path=/`],
+    ),
+  );
+  await startRotationFactory({ ppEnabled: true, ppStrict: false, ppStrictExplicit: true });
+  const jwt = (user: string, issued: number) =>
+    `header.${Buffer.from(JSON.stringify({ user_name: user, iat: issued, exp: Math.floor(Date.now() / 1000) + 3600 })).toString('base64url')}.signature`;
+  /** Cookie on this user's source request; the startup probe and other identities are excluded. */
+  const cookieAs = async (token: string) => {
+    mockFetch.mockClear();
+    const user = JSON.parse(Buffer.from(token.split('.')[1]!, 'base64url').toString()).user_name as string;
+    const result = await callTool(
+      runtime.factory!(),
+      'SAPRead',
+      { type: 'PROG', name: 'ZTEST' },
+      { token, clientId: user, scopes: ['read'], extra: { userName: user } },
+    );
+    expect(result.isError, result.content[0]?.text).not.toBe(true);
+    const sourceCalls = mockFetch.mock.calls.filter(
+      ([url, options]) =>
+        new URL(String(url)).pathname === '/sap/bc/adt/programs/programs/ZTEST/source/main' &&
+        options.headers['SAP-Connectivity-Authentication'] === `Bearer ${token}`,
+    );
+    expect(sourceCalls).toHaveLength(1);
+    expect(sourceCalls[0]?.[1].headers.Authorization).toBeUndefined();
+    return String(sourceCalls[0]?.[1].headers.Cookie ?? '');
+  };
+  const alice = jwt('ALICE', 1);
+
+  expect(await cookieAs(alice)).toBe('');
+  expect(await cookieAs(alice)).toBe('');
 });
 
 /** Factory with production dispatch; SAP responses are supplied by each regression below. */

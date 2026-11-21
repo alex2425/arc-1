@@ -28,7 +28,7 @@
  */
 
 import { ATC_BATCH_TYPES } from '../adt/atc-batch.js';
-import { SDO_TYPES } from '../adt/server-driven.js';
+import { isServerDrivenObjectType, SDO_TYPES } from '../adt/server-driven.js';
 import type { ResolvedFeatures } from '../adt/types.js';
 import type { ServerConfig } from '../server/types.js';
 
@@ -71,15 +71,20 @@ const SAPREAD_TYPE_TABLE = [
   { type: 'BDEF', btp: true },
   { type: 'SRVD', btp: true },
   { type: 'SRVB', btp: true },
+  // API package (SOD1) and API package assignment (SOD2, with ORD document and resource definitions). Discovery-gated.
+  { type: 'SOD1', btp: false },
+  { type: 'SOD2', btp: false },
   { type: 'SKTD', btp: true },
   // Friendly alias for Knowledge Transfer Documents; normalized to canonical SKTD at dispatch.
   { type: 'KTD', btp: true },
   { type: 'TABL', btp: true },
+  { type: 'TABL/DTT', btp: true },
   { type: 'VIEW', btp: false },
   { type: 'DOMA', btp: true },
   { type: 'DTEL', btp: true },
+  { type: 'SHLP', btp: false },
   { type: 'TRAN', btp: false },
-  { type: 'TTYP', btp: false },
+  { type: 'TTYP', btp: true },
   // DDIC lock objects: one XML metadata document, returned as JSON. Live-verified on-prem 8.16 + BTP trial.
   { type: 'ENQU', btp: true },
   { type: 'TABLE_CONTENTS', btp: true },
@@ -105,7 +110,7 @@ const SAPREAD_TYPE_TABLE = [
   // FEATURE_TOGGLE is the new canonical name; FTG2 stays as deprecated alias for one minor.
   { type: 'FEATURE_TOGGLE', btp: false },
   { type: 'FTG2', btp: false },
-  { type: 'ENHO', btp: false },
+  { type: 'ENHO', btp: true },
   // Enhancement spots (the definition side of ENHO) — classic on-prem enhancement framework.
   { type: 'ENHS', btp: false },
   { type: 'VERSIONS', btp: false },
@@ -147,14 +152,20 @@ const SAPWRITE_TYPE_TABLE = [
   // Friendly alias for Knowledge Transfer Documents; normalized to canonical SKTD at dispatch.
   { type: 'KTD', btp: true },
   { type: 'TABL', btp: true },
+  { type: 'TABL/DTT', btp: true },
   // Subtype routing for create — see docs/plans/completed/2026-05-27-fix-tabl-ds-create-routing.md.
   { type: 'TABL/DT', btp: true },
   { type: 'TABL/DS', btp: true },
   { type: 'DOMA', btp: true },
   { type: 'DTEL', btp: true },
   { type: 'MSAG', btp: true },
-  { type: 'TTYP', btp: false },
+  { type: 'TTYP', btp: true },
   { type: 'ENQU', btp: true },
+  // BAdI implementations (ENHO/XHB) only; on BTP only for BAdIs released for cloud development (C1).
+  { type: 'ENHO', btp: true },
+  // API packages and API package assignments: metadata JSON, saved active (src/adt/api-packages.ts).
+  { type: 'SOD1', btp: false },
+  { type: 'SOD2', btp: false },
   // Server-driven objects (8.16+) — write via the generic blue:blueSource + AFF JSON engine.
   // Rows derive from SDO_TYPES exactly like the SAPRead table above.
   ...SDO_TYPES.map((t) => ({ type: t, btp: true }) as const),
@@ -164,10 +175,16 @@ const sapWriteTypes = deriveTypeArrays(SAPWRITE_TYPE_TABLE);
 export const SAPWRITE_TYPES_ONPREM = sapWriteTypes.onprem;
 /** SAPWrite types available on BTP ABAP Environment (the `btp: true` rows). */
 export const SAPWRITE_TYPES_BTP = sapWriteTypes.btp;
+export const SAPWRITE_BATCH_TYPES = deriveTypeArrays(
+  SAPWRITE_TYPE_TABLE.filter(
+    ({ type }) => !['TABL/DTT', 'SOD1', 'SOD2'].includes(type) && !isServerDrivenObjectType(type),
+  ),
+);
 
 // ─── SAPContext ─────────────────────────────────────────────────────
 
 const SAPCONTEXT_TYPE_TABLE = [
+  { type: 'SHLP', btp: false },
   { type: 'CLAS', btp: true },
   { type: 'INTF', btp: true },
   { type: 'PROG', btp: false },
@@ -196,12 +213,12 @@ export const SAPCONTEXT_TYPES_BTP = sapContextTypes.btp;
  */
 export function isGitToolVisible(
   config: Pick<ServerConfig, 'featureAbapGit' | 'featureGcts'>,
-  resolvedFeatures: Pick<ResolvedFeatures, 'gcts' | 'abapGit'> | undefined,
+  resolvedFeatures: Partial<Pick<ResolvedFeatures, 'gcts' | 'abapGit'>> | undefined,
 ): boolean {
-  if (resolvedFeatures === undefined) {
-    return config.featureAbapGit !== 'off' || config.featureGcts !== 'off';
-  }
-  return !!(resolvedFeatures.gcts?.available || resolvedFeatures.abapGit?.available);
+  return (
+    (resolvedFeatures?.gcts?.available ?? config.featureGcts !== 'off') ||
+    (resolvedFeatures?.abapGit?.available ?? config.featureAbapGit !== 'off')
+  );
 }
 
 // ─── Derived union types ────────────────────────────────────────────

@@ -142,7 +142,7 @@ function classifyParserHint(err: AdtApiError, sql: string, chunkingAttempted: bo
   }
   if (rowLimit) {
     const rows = rowLimit.rows ? ` (for example, maxRows: ${rowLimit.rows})` : '';
-    return `${rowLimit.syntax} belongs to another SQL dialect. Remove it from the SQL and pass the SAPQuery maxRows parameter${rows}; ARC-1 applies the ABAP row limit.`;
+    return `${rowLimit.syntax} belongs to another SQL dialect. Remove it from the SQL and pass the SAPQuery maxRows parameter${rows}; ARC-1 caps returned rows.`;
   }
 
   if (/^\s*WITH\b/i.test(maskedSql)) {
@@ -204,6 +204,18 @@ function classifyParserHint(err: AdtApiError, sql: string, chunkingAttempted: bo
   const missingSourceAliasAs = findMissingSourceAliasAs(maskedSql);
   if (missingSourceAliasAs) {
     return `ABAP SQL requires AS for table aliases. Write ${missingSourceAliasAs.table} AS ${missingSourceAliasAs.alias}; qualify its fields as ${missingSourceAliasAs.alias}~field.`;
+  }
+
+  // Verified on 7.58/8.16 (#955): ADT treats a lone COUNT(*) as scalar even with GROUP BY.
+  // Its SELECT loop then lacks ENDSELECT, breaking nesting. Do not rewrite the projection.
+  if (
+    /^\s*SELECT\s+COUNT\s*\(\s*\*\s*\)\s*(?:AS\s+[A-Za-z_][A-Za-z0-9_]*\s+)?FROM\b/i.test(maskedSql) &&
+    /\bGROUP\s+BY\b/i.test(maskedSql) &&
+    [...maskedSql.matchAll(/\bSELECT\b/gi)].length === 1 &&
+    ((/\bTRY\b/i.test(err.message) && /\bCATCH\b/i.test(err.message)) ||
+      (/\bENDSELECT\b/i.test(err.message) && /\bENDMETHOD\b/i.test(err.message)))
+  ) {
+    return 'This ADT backend treats a lone COUNT(*) projection as a scalar result even with GROUP BY, producing a generated-program nesting error. Include the grouping columns in the SELECT list alongside COUNT(*); this adds result columns without changing the groups. Ignore those additional result columns if you only need the counts. ARC-1 has not rewritten or retried the SQL.';
   }
 
   if (/\bambiguous\b|\bzweideutig\b/i.test(combined)) {

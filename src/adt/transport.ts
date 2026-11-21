@@ -9,6 +9,7 @@ import { postCreate } from './create-request.js';
 import { AdtApiError, AdtNetworkError, AdtSafetyError } from './errors.js';
 import type { AdtHttpClient, AdtRequestOptions } from './http.js';
 import { checkOperation, checkTransport, OperationType, type SafetyConfig } from './safety.js';
+import { parseTransportLocks } from './transport-locks.js';
 import type {
   InactiveObject,
   TransportLayer,
@@ -169,11 +170,12 @@ export async function getTransport(
   http: AdtHttpClient,
   safety: SafetyConfig,
   transportId: string,
+  options?: AdtRequestOptions,
 ): Promise<TransportRequest | null> {
   checkTransport(safety, transportId, 'GetTransport', false);
 
   const url = `/sap/bc/adt/cts/transportrequests/${encodeURIComponent(transportId)}`;
-  const resp = await http.get(url, { Accept: CTS_CONTENT_TYPE_ORGANIZER });
+  const resp = await http.get(url, { Accept: CTS_CONTENT_TYPE_ORGANIZER }, options);
 
   const transports = parseTransportList(resp.body, url);
   // NW 7.50 returns HTTP 200 with the caller's full transport list when the
@@ -261,9 +263,8 @@ export async function createTransport(
 }
 
 /**
- * Create a transport request with an explicit transport target (Transportziel /
- * `TR_TARGET` / SAP GUI field `KO013-TARSYSTEM`) — a target system (`C11`),
- * system.client (`C11.021`), or target group (`/TRG/`).
+ * Create a Workbench or Customizing request. TR_TARGET accepts a system (`C11`),
+ * system.client (`C11.021`), target group (`/TRG/`), or an empty string for Customizing.
  *
  * Unlike `createTransport` (the `CreateCorrectionRequest` endpoint, which can only let
  * SAP infer a target from the package route and silently ignores any target field),
@@ -277,7 +278,7 @@ export async function createTransport(
  * endpoint was rejected on NW 7.50 (npl) — older releases may not support it.
  *
  * @param target  the transport target (`TR_TARGET`); e.g. `C11`, `C11.021`, `/TRG/`, `LOCAL`
- * @param owner   task owner; defaults to the connected user when omitted
+ * @param requestType Workbench (K) or Customizing (W). W accepts an empty target.
  */
 export async function createTransportWithTarget(
   http: AdtHttpClient,
@@ -285,13 +286,26 @@ export async function createTransportWithTarget(
   description: string,
   target: string,
   owner?: string,
+  requestType: 'K' | 'W' = 'K',
 ): Promise<string> {
   checkTransport(safety, '', 'CreateTransport', true);
 
+  if (!owner) {
+    checkOperation(safety, OperationType.Read, 'GetSystemInformation');
+    try {
+      const response = await http.get('/sap/bc/adt/core/http/systeminformation', {
+        Accept: 'application/vnd.sap.adt.core.http.systeminformation.v1+json',
+      });
+      const user = JSON.parse(response.body)?.userName;
+      if (typeof user === 'string') owner = user.trim();
+    } catch {
+      // Owner lookup is best effort. Report the tasks SAP actually creates on read-back.
+    }
+  }
   const ownerAttr = owner ? ` tm:owner="${escapeXmlAttr(owner)}"` : '';
   const body = `<?xml version="1.0" encoding="UTF-8"?>
 <tm:root xmlns:tm="${CTS_NAMESPACE_TM}" tm:useraction="newrequest">
-  <tm:request tm:desc="${escapeXmlAttr(description)}" tm:type="K" tm:target="${escapeXmlAttr(target)}" tm:cts_project="">
+  <tm:request tm:desc="${escapeXmlAttr(description)}" tm:type="${escapeXmlAttr(requestType)}" tm:target="${escapeXmlAttr(target)}" tm:cts_project="">
     <tm:task${ownerAttr}/>
   </tm:request>
 </tm:root>`;
@@ -1140,9 +1154,9 @@ async function reassignSingle(http: AdtHttpClient, transportId: string, newOwner
  tm:number="${escapeXmlAttr(transportId)}"
  tm:targetuser="${escapeXmlAttr(newOwner)}"
  tm:useraction="changeowner"/>`;
-
+  // NW 7.50 reads the owner from the query; newer CTS handlers read the XML body.
   await http.put(
-    `/sap/bc/adt/cts/transportrequests/${encodeURIComponent(transportId)}`,
+    `/sap/bc/adt/cts/transportrequests/${encodeURIComponent(transportId)}?targetuser=${encodeURIComponent(newOwner)}`,
     body,
     CTS_CONTENT_TYPE_ORGANIZER,
     { Accept: CTS_CONTENT_TYPE_ORGANIZER },
@@ -1179,6 +1193,8 @@ export interface TransportInfo {
   lockedTransportOwner?: string;
   /** Tasks below the parent request holding the object lock. */
   lockedTasks: string[];
+  /** Conflicting holders or task-only evidence cannot authorize a pinned mutation. */
+  lockedTransportAmbiguous?: true;
 }
 
 /**
@@ -1198,6 +1214,7 @@ export async function getTransportInfo(
   objectUrl: string,
   devclass: string,
   operation: 'I' | '' = 'I',
+  options?: AdtRequestOptions,
 ): Promise<TransportInfo> {
   // Transport info is a read operation — doesn't require allowTransportWrites.
   checkOperation(safety, OperationType.Read, 'TransportInfo');
@@ -1218,6 +1235,7 @@ export async function getTransportInfo(
     body,
     'application/vnd.sap.as+xml;charset=UTF-8;dataname=com.sap.adt.transport.service.checkData',
     { Accept: 'application/vnd.sap.as+xml' },
+    options,
   );
 
   const info = parseTransportInfo(resp.body);
@@ -1329,41 +1347,7 @@ function parseTransportInfo(xml: string): TransportInfo {
     number: String(message.MSGNR ?? ''),
   }));
 
-  // Live 7.50/7.58/8.16 shape:
-  // LOCKS/CTS_OBJECT_LOCK/LOCK_HOLDER/REQ_HEADER + TASK_HEADERS/CTS_TASK_HEADER.
-  // Keep LOCKS/HEADER below as a compatibility fallback for older recorded fixtures.
-  const lockContainer = findDeepNodes(parsed, 'LOCKS')[0];
-  let lockedTransport: string | undefined;
-  let lockedTransportOwner: string | undefined;
-  const lockedTasks: string[] = [];
-  if (lockContainer) {
-    const objectLocks = findDeepNodes(lockContainer, 'CTS_OBJECT_LOCK');
-    for (const objectLock of objectLocks) {
-      const holder = findDeepNodes(objectLock, 'LOCK_HOLDER')[0];
-      if (!holder) continue;
-      const header = findDeepNodes(holder, 'REQ_HEADER')[0];
-      const trkorr = String(header?.TRKORR ?? '').trim();
-      if (trkorr && !lockedTransport) {
-        lockedTransport = trkorr;
-        const owner = String(header?.AS4USER ?? '').trim();
-        if (owner) lockedTransportOwner = owner;
-      }
-      for (const task of findDeepNodes(holder, 'CTS_TASK_HEADER')) {
-        const taskId = String(task.TRKORR ?? '').trim();
-        if (taskId && !lockedTasks.includes(taskId)) lockedTasks.push(taskId);
-      }
-    }
-
-    if (!lockedTransport) {
-      const legacyHeader = findDeepNodes(lockContainer, 'HEADER')[0];
-      const trkorr = String(legacyHeader?.TRKORR ?? '').trim();
-      if (trkorr) {
-        lockedTransport = trkorr;
-        const owner = String(legacyHeader?.AS4USER ?? '').trim();
-        if (owner) lockedTransportOwner = owner;
-      }
-    }
-  }
+  const locks = parseTransportLocks(parsed);
 
   // Live shape: REQUESTS contains 0..N CTS_REQUEST nodes, each with its own REQ_HEADER.
   // Iterate CTS_REQUEST explicitly: findDeepNodes() deliberately returns the first matching
@@ -1407,9 +1391,7 @@ function parseTransportInfo(xml: string): TransportInfo {
     existingRequestOnly,
     messages,
     existingTransports,
-    lockedTasks,
-    ...(lockedTransport ? { lockedTransport } : {}),
-    ...(lockedTransportOwner ? { lockedTransportOwner } : {}),
+    ...locks,
   };
 }
 
@@ -1434,7 +1416,7 @@ function findDeepValue(obj: unknown, key: string): unknown {
 
 // ─── Parsers ────────────────────────────────────────────────────────
 
-function parseTransportList(xml: string, path: string): TransportRequest[] {
+export function parseTransportList(xml: string, path: string): TransportRequest[] {
   const parsed = parseXml(xml);
   if (!Object.hasOwn(parsed, 'root')) {
     const explanation =

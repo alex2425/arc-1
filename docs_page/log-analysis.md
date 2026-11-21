@@ -38,6 +38,11 @@ File audit output is independent of the stderr level; it records emitted audit e
 not ordinary log messages. E2E runs retain it as `mcp-audit.ndjson` beside `mcp-server.log`
 in the uploaded log directory. CSRF events describe
 each probe: a HEAD 400 followed by GET 200 with a usable token is a healthy fallback.
+If both stateful probes return 400, ARC-1 retries the discovery GET once without the
+session header (`adtMode: unspecified`). Lock and write requests remain stateful;
+this recovery does not repair a lost SAP security session or lock. If the headerless GET
+also returns 400 (`Service cannot be reached`), investigate [#1042](https://github.com/arc-mcp/arc-1/issues/1042)
+and the [SAP_BASIS 816 findings](https://github.com/arc-mcp/arc-1/blob/main/docs/research/2026-09-27-sap-816-session-failures.md).
 
 ## Event Types
 
@@ -48,10 +53,15 @@ include:
 | Group | Events |
 |-------|--------|
 | Tool and SAP HTTP lifecycle | `tool_call_start`, `tool_call_end`, `http_request`, `http_csrf_fetch` |
-| Authorization and safety | `auth_scope_denied`, `safety_blocked`, `data_response_limited`, `auth_rate_limited`, `mcp_rate_limited` |
+| Authorization and safety | `auth_scope_denied`, `mcp_route_denied`, `safety_blocked`, `data_response_limited`, `auth_rate_limited`, `mcp_rate_limited` |
 | Selected identity | `auth_pp_created`, `auth_shared_created` |
 | Multi-target failure stage | `target_resolution_failed`, `pp_exchange_failed`, `shared_auth_failed`, `cloud_connector_access_denied`, `sap_service_unavailable`, `sap_authentication_failed`, `sap_authorization_failed`, `target_policy_denied` |
 | Server/client protocol | `server_start`, OAuth/DCR, and CORS events |
+
+In the opt-in target-authorization mode, grant denials include `targetAccessMode`, `grantMode`,
+the stable `errorCode`, and `exactGrantCount` for exact grants. These are bounded operator
+diagnostics, not the raw grant list. `targetAccessMode` is deliberately distinct from an
+`Authorization` header; central credential redaction remains unchanged for every sink.
 
 Within a selected multi-target call, use `requestId` to correlate events and `target`, `destination`,
 and `identity` to identify the selected route and identity model. Failure-stage events also carry a
@@ -110,7 +120,7 @@ See [Authorization](authorization.md) and [Principal Propagation](principal-prop
 
 ### "Feature not available" is normal, not an error
 
-ARC-1 probes optional capabilities at startup (abapGit, AMDP, RAP/CDS, UI5, HANA info, source search,
+ARC-1 probes optional capabilities at startup (abapGit, RAP/CDS, UI5, HANA info, source search,
 …). Any capability your system doesn't have simply returns `404` (not installed / ICF service not
 active) or `400` — **this is expected and is recorded as data, not an error.** These probe misses are
 logged at `debug`, so they do **not** appear at the default `info` level. A clean startup has **no
@@ -120,11 +130,10 @@ If you run with `SAP_VERBOSE=true`, you'll see them — and they're still harmle
 
 ```
 DEBUG: [http_request] {"method":"GET","path":"/sap/bc/adt/abapgit/repos","statusCode":404,...}
-DEBUG: [http_request] {"method":"GET","path":"/sap/bc/adt/debugger/amdp","statusCode":404,...}
 DEBUG: [http_request] {"method":"GET","path":"/sap/bc/adt/ddic/ddl/sources","statusCode":400,...}
 ```
 
-These just mean abapGit/AMDP aren't installed and the RAP probe returned its expected `400` — ARC-1
+These just mean abapGit isn't installed and the RAP probe returned its expected `400` — ARC-1
 disables those features gracefully and serves the rest. The resolved feature set is what matters, not
 the individual probe responses.
 
@@ -266,7 +275,7 @@ View these in the BTP cockpit under **Instances and Subscriptions > Audit Log Vi
 programmatic verification or scheduled reviews, read the same records through the Audit Log Retrieval
 API; see [Audit Log delivery evidence](btp-administration.md#audit-log-delivery-evidence). Tool-call
 records carry `object.type = "MCP Tool Call"` and, on invocation, redacted arguments in `args` (first 500 characters plus `...`
-when truncated). Completion records carry the outcome.
+when truncated; source and content arguments appear only as a length and SHA-256 prefix). Completion records carry the outcome.
 
 ## Docker Volume Mount Example
 

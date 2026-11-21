@@ -22,6 +22,15 @@ import {
   type ServiceBindingCreateParams,
 } from '../adt/ddic-xml.js';
 import { syntaxCheck } from '../adt/devtools.js';
+import {
+  type BadiImplementationDefinition,
+  buildBadiImplementationXml,
+  ENHO_XHB_CONTENT_TYPE,
+  getBadiEnhancementImplementation,
+  mergeBadiImplementationDefinition,
+  parseBadiImplementationDefinition,
+  resolveBadiFilters,
+} from '../adt/enhancement-impl.js';
 import { AdtError, AdtSafetyError } from '../adt/errors.js';
 import {
   buildLockObjectXml,
@@ -31,23 +40,26 @@ import {
   mergeLockObjectDefinition,
   parseLockObjectDefinition,
 } from '../adt/lock-object.js';
+import { checkAgainstObjectSchema, getObjectSchema } from '../adt/object-schema.js';
 import { formatRapPreflightFindings, validateRapSource } from '../adt/rap-preflight.js';
 import { checkPackage } from '../adt/safety.js';
 import {
   createServerDrivenObject,
   deleteServerDrivenObject,
   ensureServerDrivenSupport,
-  serverDrivenMetadataContentType,
+  serverDrivenNewObjectUrl,
   serverDrivenObjectUrl,
+  serverDrivenSchemaCheck,
   serverDrivenSourceFormat,
   serverDrivenUnavailableMessage,
   updateServerDrivenObjectSource,
 } from '../adt/server-driven.js';
+import { tableIndexParentUrl } from '../adt/table-index.js';
 import type { ResolvedFeatures, SystemType } from '../adt/types.js';
 import { escapeXmlAttr } from '../adt/xml-parser.js';
 import type { CachingLayer } from '../cache/caching-layer.js';
 import type { LintConfigOptions, RuleOverrides } from '../lint/config-builder.js';
-import { detectFilename, validateBeforeWrite } from '../lint/lint.js';
+import { validateBeforeWrite } from '../lint/lint.js';
 import type { ServerConfig } from '../server/types.js';
 import { type CacheSecurityContext, invalidateInactiveList } from './cache-security.js';
 import { getCachedFeatures } from './feature-cache.js';
@@ -109,7 +121,15 @@ const FUNCTION_MODULE_CONTENT_TYPE = 'application/vnd.sap.adt.functions.fmodules
 const FUNCTION_INCLUDE_CONTENT_TYPE = 'application/vnd.sap.adt.functions.fincludes.v2+xml';
 
 export function isMetadataWriteType(type: string): boolean {
-  return type === 'DOMA' || type === 'DTEL' || type === 'MSAG' || type === 'SRVB' || type === 'TTYP' || type === 'ENQU';
+  return (
+    type === 'DOMA' ||
+    type === 'DTEL' ||
+    type === 'MSAG' ||
+    type === 'SRVB' ||
+    type === 'TTYP' ||
+    type === 'ENQU' ||
+    type === 'ENHO'
+  );
 }
 
 /** Types that require a specific vendor content type for creation (not application/*) */
@@ -122,6 +142,7 @@ function needsVendorContentType(type: string): boolean {
     type === 'SKTD' ||
     type === 'TTYP' ||
     type === 'ENQU' ||
+    type === 'ENHO' ||
     type === 'FUGR' ||
     type === 'FUNC'
   );
@@ -160,6 +181,8 @@ export function vendorContentTypeForType(type: string): string {
       return TABLETYPE_CONTENT_TYPE;
     case 'ENQU':
       return LOCKOBJECT_CONTENT_TYPE;
+    case 'ENHO':
+      return ENHO_XHB_CONTENT_TYPE;
     case 'FUGR':
       return FUNCTION_GROUP_CONTENT_TYPE;
     case 'FUNC':
@@ -198,6 +221,8 @@ export function getMetadataWriteProperties(input: Record<string, unknown>): Reco
     typeName: input.typeName,
     rowType: input.rowType,
     rowTypeKind: input.rowTypeKind,
+    rowTypeLength: input.rowTypeLength,
+    rowTypeDecimals: input.rowTypeDecimals,
     domainName: input.domainName,
     shortLabel: input.shortLabel,
     shortLength: input.shortLength,
@@ -214,6 +239,7 @@ export function getMetadataWriteProperties(input: Record<string, unknown>): Reco
     deactivateInputHistory: input.deactivateInputHistory,
     changeDocument: input.changeDocument,
     messages: input.messages,
+    deleteMessages: input.deleteMessages,
     serviceDefinition: input.serviceDefinition,
     bindingType: input.bindingType,
     category: input.category,
@@ -228,6 +254,8 @@ export function getMetadataWriteProperties(input: Record<string, unknown>): Reco
     updateTaskKind: input.updateTaskKind,
     // ENQU carries its definition as JSON in "source" (the same shape SAPRead returns).
     lockObjectSource: input.source,
+    // ENHO (BAdI implementation, XHB) likewise takes SAPRead's JSON in "source".
+    enhancementSource: input.source,
   };
 
   return props;
@@ -256,10 +284,23 @@ export async function mergeMetadataWriteProperties(
 ): Promise<Record<string, unknown>> {
   if (type === 'MSAG') {
     const existing = await client.getMessageClassInfo(name);
+    const deleted = new Set(provided.deleteMessages as string[] | undefined);
+    const changes = provided.messages as MessageClassCreateParams['messages'];
+    if (deleted.size) {
+      const overlap = changes?.find((message) => deleted.has(message.number.padStart(3, '0')));
+      if (overlap)
+        throw new Error(`Message ${overlap.number} occurs in both messages and deleteMessages; nothing was changed.`);
+      const stored = new Set(existing.messages.map((message) => message.number.padStart(3, '0')));
+      for (const number of deleted) {
+        if (!stored.has(number)) throw new Error(`Message ${number} does not exist in ${name}; nothing was changed.`);
+      }
+    }
     return {
       _description: existing.description,
       _package: existing.package,
-      messages: provided.messages ?? existing.messages,
+      // A deletion-only save sends no message elements: SAP keeps every message it is not told to change.
+      messages: changes ?? (deleted.size ? [] : existing.messages),
+      deleteMessages: provided.deleteMessages,
     };
   }
   if (type === 'DOMA') {
@@ -335,6 +376,24 @@ export async function mergeMetadataWriteProperties(
       lockObjectDefinition: mergeLockObjectDefinition(existing, definition),
     };
   }
+  if (type === 'ENHO') {
+    // Merge over the developer view so consecutive unactivated edits accumulate.
+    const existing = await getBadiEnhancementImplementation(client.http, client.safety, name);
+    const source = provided.enhancementSource;
+    const definition =
+      source === undefined || source === null || String(source).trim() === ''
+        ? {}
+        : parseBadiImplementationDefinition(String(source));
+    return {
+      _description: existing.description,
+      _package: existing.package,
+      enhancementDefinition: await resolveBadiFilters(
+        client.http,
+        client.safety,
+        mergeBadiImplementationDefinition(existing, definition),
+      ),
+    };
+  }
   if (type === 'SRVB') {
     const { source: existingRaw } = await client.getSrvb(name);
     const existing = JSON.parse(existingRaw) as Record<string, unknown>;
@@ -377,13 +436,15 @@ export async function mergeMetadataWriteProperties(
     }
     // The stored kind and built-in length describe the stored row type: keep them only while it is unchanged.
     const unchanged = !!storedKind && (!requested || requested.toUpperCase() === existing.rowType.toUpperCase());
+    const rowTypeKind = provided.rowTypeKind ?? (unchanged ? storedKind : undefined);
+    const keepDimensions = unchanged && rowTypeKind === 'builtin' && storedKind === 'builtin';
     return {
       _description: existing.description,
       _package: existing.package,
       rowType: requested || existing.rowType,
-      rowTypeKind: provided.rowTypeKind ?? (unchanged ? storedKind : undefined),
-      rowTypeLength: unchanged ? existing.rowTypeLength : undefined,
-      rowTypeDecimals: unchanged ? existing.rowTypeDecimals : undefined,
+      rowTypeKind,
+      rowTypeLength: provided.rowTypeLength ?? (keepDimensions ? existing.rowTypeLength : undefined),
+      rowTypeDecimals: provided.rowTypeDecimals ?? (keepDimensions ? existing.rowTypeDecimals : undefined),
     };
   }
   return provided;
@@ -449,8 +510,11 @@ function cloudifyCreateBody(xml: string, type: string): string {
     .replace(/\s*adtcore:masterSystem="H00"/, '')
     // Cloud assigns the owner from the JWT; an explicit responsible breaks the create ST.
     .replace(/\s*adtcore:responsible="[^"]*"/, '')
-    // Every cloud object is ABAP for Cloud Development.
-    .replace(/(adtcore:masterLanguage="[^"]*")/, '$1 adtcore:abapLanguageVersion="cloudDevelopment"');
+    // Every cloud object is ABAP for Cloud Development; an ENHO update already carries its stored version.
+    .replace(
+      /(adtcore:masterLanguage="[^"]*")(?![^>]*adtcore:abapLanguageVersion=)/,
+      '$1 adtcore:abapLanguageVersion="cloudDevelopment"',
+    );
   if (type === 'CLAS') {
     // Cloud CLAS create schema requires explicit class attributes (live: GET cl_abap_random).
     out = out.replace(
@@ -694,8 +758,8 @@ function buildCreateXmlBody(
         package: pkg,
         rowType,
         rowTypeKind,
-        rowTypeLength: properties?.rowTypeLength as string | undefined,
-        rowTypeDecimals: properties?.rowTypeDecimals as string | undefined,
+        rowTypeLength: properties?.rowTypeLength as string | number | undefined,
+        rowTypeDecimals: properties?.rowTypeDecimals as string | number | undefined,
         language: masterLanguage,
         responsible: responsibleUser,
       });
@@ -706,6 +770,20 @@ function buildCreateXmlBody(
         (properties?.lockObjectDefinition as LockObjectDefinition | undefined) ??
         parseLockObjectDefinition(String(properties?.lockObjectSource ?? '{}'));
       return buildLockObjectXml({ name, description, package: pkg, definition, masterLanguage, responsibleAttr });
+    }
+    case 'ENHO': {
+      // Update passes the merged definition; create parses the caller's JSON source.
+      const definition =
+        (properties?.enhancementDefinition as BadiImplementationDefinition | undefined) ??
+        parseBadiImplementationDefinition(String(properties?.enhancementSource ?? '{}'));
+      return buildBadiImplementationXml({
+        name,
+        description,
+        package: pkg,
+        definition,
+        masterLanguage,
+        responsibleAttr,
+      });
     }
     case 'DTEL': {
       const typeKindRaw = String(properties?.typeKind ?? '');
@@ -755,6 +833,7 @@ function buildCreateXmlBody(
         description,
         package: pkg,
         messages: messages.length > 0 ? messages : undefined,
+        deleteMessages: properties?.deleteMessages as string[] | undefined,
         // Thread the configured language into the body (same spirit as #343).
         // Live-verified on a4h 7.58: the MSAG handler keys T100.SPRSL by the
         // BODY adtcore:language — without it the messages are stored under a
@@ -853,6 +932,7 @@ export const NAME_CASE_GUARD_ACTIONS = new Set([
   'edit_method',
   'edit_unit',
   'add_unit',
+  'edit_content',
   'delete',
   'edit_text_symbols',
 ]);
@@ -874,13 +954,19 @@ export async function enforceAllowedPackageForObjectUrl(
   objectUrl: string,
   label: string,
   accept?: string,
+  options?: import('../adt/http.js').AdtRequestOptions & { includeGroupHint?: boolean },
 ): Promise<string | undefined> {
-  if (client.safety.allowedPackages.length === 0) return undefined;
-  const pkg = await client.resolveObjectPackage(objectUrl, accept);
+  if (client.safety.allowedPackages.length === 0 && !client.safety.multiTargetWrite) return undefined;
+  const { includeGroupHint, ...requestOptions } = options ?? {};
+  const pkg = await client.resolveObjectPackage(objectUrl, accept, options ? requestOptions : undefined);
   if (!pkg) {
+    const hint =
+      includeGroupHint && objectUrl.startsWith('/sap/bc/adt/programs/includes/')
+        ? ' For a function-group include, pass group=<FUGR> to SAPWrite or SAPActivate.'
+        : '';
     throw new AdtSafetyError(
       `${label} blocked: ARC-1 could not determine the object's package from ADT metadata ` +
-        `(no adtcore:packageRef/containerRef). Fail-closed because allowedPackages is restricted.`,
+        `(no adtcore:packageRef/containerRef). Fail-closed: cannot authorize this operation without a verified package.${hint}`,
     );
   }
   await checkPackage(client.safety, pkg, client.getPackageHierarchyResolver());
@@ -907,13 +993,14 @@ export async function handleServerDrivenObjectWrite(
   cacheSecurity: CacheSecurityContext,
 ): Promise<ToolResult> {
   // Discovery gate — mirror handleSAPRead's server-driven branch.
-  if (!(await ensureServerDrivenSupport(client.http, client.safety, type))) {
+  const support = await ensureServerDrivenSupport(client.http, client.safety, type);
+  if (!support) {
     return errorResult(serverDrivenUnavailableMessage('SAPWrite', type));
   }
 
   const transport = args.transport as string | undefined;
   const objUrl = serverDrivenObjectUrl(type, name);
-  const metadataAccept = serverDrivenMetadataContentType(type);
+  const { metadataContentType } = support;
   const activationHint =
     type === 'APLO'
       ? 'APLO changes are active immediately; no activation is required.'
@@ -924,31 +1011,48 @@ export async function handleServerDrivenObjectWrite(
     invalidateInactiveList(cachingLayer, client, cacheSecurity);
   };
 
-  // Only parse-validate entries whose sourceFormat is 'json'. Validating DDL text as JSON
-  // would reject every valid source.
-  const validateSource = (): { ok: true; source: string } | { ok: false; result: ToolResult } => {
-    const src = String(args.source ?? '');
-    if (serverDrivenSourceFormat(type) === 'json') {
-      try {
-        JSON.parse(src);
-      } catch {
-        return {
-          ok: false,
-          result: errorResult(
-            `SAPWrite ${action} for ${type} ${name}: "source" must be valid AFF JSON ` +
-              '(e.g. {"formatVersion":"1","header":{"description":"…","originalLanguage":"en"}}).',
-          ),
-        };
-      }
+  const source = String(args.source ?? '');
+  const hasSourceArg = typeof args.source === 'string' && source.trim() !== '';
+  const parseSource = (): { json: unknown } | { error: ToolResult } => {
+    if (serverDrivenSourceFormat(type) !== 'json') return { json: undefined };
+    try {
+      return { json: JSON.parse(source) };
+    } catch {
+      return {
+        error: errorResult(
+          `SAPWrite ${action} for ${type} ${name}: "source" must be valid AFF JSON ` +
+            '(e.g. {"formatVersion":"1","header":{"description":"…","originalLanguage":"en"}}).',
+        ),
+      };
     }
-    return { ok: true, source: src };
   };
 
-  const hasSourceArg = typeof args.source === 'string' && args.source.trim() !== '';
+  // A string is a note to include after a successful write. A tool error stops the write.
+  const checkSchema = async (schemaBaseUrl: string, json: unknown): Promise<string | ToolResult> => {
+    if (!serverDrivenSchemaCheck(type)) return '';
+    const schema = await getObjectSchema(client.http, client.safety, schemaBaseUrl);
+    if (schema === undefined) {
+      return `\nSAP's schema for ${type} could not be read; values SAP does not accept may have been dropped. Read the source back to compare.`;
+    }
+    const problems = checkAgainstObjectSchema(schema, json);
+    if (!problems.length) return '';
+    return errorResult(
+      `SAPWrite ${action} for ${type} ${name}: the source does not match SAP's schema for this object. Nothing was written.\n- ${problems.join('\n- ')}`,
+    );
+  };
 
   switch (action) {
     case 'create': {
-      const pkg = String(args.package ?? '$TMP');
+      let pkg = String(args.package ?? '$TMP');
+      if (type === 'TABL/DTI') {
+        const parentPackage = await client.resolveObjectPackage(tableIndexParentUrl(name));
+        if (!parentPackage) return errorResult('Cannot determine the parent table package. No index was created.');
+        if (args.package !== undefined && args.package !== parentPackage)
+          return errorResult(
+            `Index package must match its parent table (${parentPackage}). Omit package to inherit it.`,
+          );
+        pkg = parentPackage;
+      }
       await checkPackage(client.safety, pkg, client.getPackageHierarchyResolver());
       if (type === 'APLO' && name.length > 20) {
         return errorResult('APLO names must be at most 20 characters. Nothing was created.');
@@ -956,13 +1060,16 @@ export async function handleServerDrivenObjectWrite(
       const description = String(args.description ?? name);
       // Validate BEFORE the create POST — validating after would leave an inactive orphan on SAP
       // that the caller never asked for and has to clean up by hand.
-      const validated = hasSourceArg ? validateSource() : undefined;
-      if (validated && !validated.ok) return validated.result;
+      const parsed = hasSourceArg ? parseSource() : undefined;
+      if (parsed && 'error' in parsed) return parsed.error;
+      const schemaNote = parsed ? await checkSchema(serverDrivenNewObjectUrl(type), parsed.json) : '';
+      if (typeof schemaNote !== 'string') return schemaNote;
       // The job creation wizard requires this reference before the source PUT (notably on 758).
       let creationProperties: Record<string, string> | undefined;
       if (type === 'SAJC' || type === 'SAJT') {
         const field = type === 'SAJC' ? 'className' : 'catalogName';
-        const reference = validated?.ok ? JSON.parse(validated.source)?.generalInformation?.[field] : undefined;
+        const job = parsed?.json as { generalInformation?: Record<string, unknown> } | null | undefined;
+        const reference = job?.generalInformation?.[field];
         if (typeof reference !== 'string' || !reference.trim()) {
           return errorResult(`Creating ${type} requires source.generalInformation.${field} in the AFF JSON source.`);
         }
@@ -972,16 +1079,18 @@ export async function handleServerDrivenObjectWrite(
         package: pkg,
         description,
         transport,
+        metadataContentType,
         creationProperties,
       });
       try {
-        if (validated?.ok) {
-          await updateServerDrivenObjectSource(client.http, client.safety, type, name, validated.source, { transport });
+        if (hasSourceArg) {
+          await updateServerDrivenObjectSource(client.http, client.safety, type, name, source, { transport });
         }
       } catch (cause) {
         // The POST succeeded; both HTTP and network failures can leave the object with a partial source.
         const err =
           cause instanceof AdtError ? cause : new AdtError(cause instanceof Error ? cause.message : String(cause));
+        err.creationOutcome = 'confirmed';
         err.extraHint = `${type} ${name} was created in package ${pkg}${type === 'APLO' ? ' and is active' : ''}, but the follow-up source step failed. Check it with SAPRead before using SAPWrite(action="update") — do not repeat create.`;
         throw err;
       } finally {
@@ -992,7 +1101,7 @@ export async function handleServerDrivenObjectWrite(
         }
       }
       return textResult(
-        `Created ${type} ${name} in package ${pkg}${validated?.ok ? ' and wrote source' : ''}.\n${activationHint}`,
+        `Created ${type} ${name} in package ${pkg}${hasSourceArg ? ' and wrote source' : ''}.${schemaNote}\n${activationHint}`,
       );
     }
     case 'update': {
@@ -1001,17 +1110,22 @@ export async function handleServerDrivenObjectWrite(
           `SAPWrite update for ${type} ${name} requires "source" (AFF JSON or DDL text, per the object type).`,
         );
       }
-      const v = validateSource();
-      if (!v.ok) return v.result;
-      await enforceAllowedPackageForObjectUrl(client, objUrl, `Operations on ${type} '${name}'`, metadataAccept);
-      await updateServerDrivenObjectSource(client.http, client.safety, type, name, v.source, { transport });
+      const parsed = parseSource();
+      if ('error' in parsed) return parsed.error;
+      await enforceAllowedPackageForObjectUrl(client, objUrl, `Operations on ${type} '${name}'`, metadataContentType);
+      const schemaNote = await checkSchema(objUrl, parsed.json);
+      if (typeof schemaNote !== 'string') return schemaNote;
+      await updateServerDrivenObjectSource(client.http, client.safety, type, name, source, { transport });
       invalidate();
-      return textResult(`Updated source of ${type} ${name}.\n${activationHint}`);
+      return textResult(
+        `Updated source of ${type} ${name}.${schemaNote}\n${activationHint}` +
+          (type === 'TABL/DTI' ? ' The complete index definition replaces any pending definition.' : ''),
+      );
     }
     case 'delete': {
-      await enforceAllowedPackageForObjectUrl(client, objUrl, `Operations on ${type} '${name}'`, metadataAccept);
+      await enforceAllowedPackageForObjectUrl(client, objUrl, `Operations on ${type} '${name}'`, metadataContentType);
       try {
-        await deleteServerDrivenObject(client.http, client.safety, type, name, { transport });
+        await deleteServerDrivenObject(client.http, client.safety, type, name, { transport, ...support });
       } finally {
         try {
           invalidate();
@@ -1061,7 +1175,7 @@ export function runRapPreflightValidation(
   source: string,
   type: string,
   name: string,
-  features: ResolvedFeatures | undefined,
+  features: Pick<ResolvedFeatures, 'systemType' | 'abapRelease'> | undefined,
   configSystemType: ServerConfig['systemType'],
   perCallOverride?: boolean,
 ): PreWriteRapPreflightResult {
@@ -1133,8 +1247,9 @@ export function runPreWriteLint(
 
   // abaplint supports ABAP source (PROG/CLAS/INTF/INCL) and CDS views (DDLS) via
   // its CDS parser. DDLS lint catches syntax errors (cds_parser_error) like missing commas,
-  // wrong keywords, and invalid DDL constructs. BDEF/SRVD/SRVB/DDLX are silently ignored
-  // by abaplint (no parser for those types — garbage passes without errors). TABL (define
+  // wrong keywords, and invalid DDL constructs. BDEF has a parser as of abaplint 2.120.84,
+  // but remains outside this automatic gate; its semantic checks need related objects.
+  // SRVD/SRVB/DDLX have no parser. TABL (define
   // table syntax) is not supported by the CDS parser and produces false cds_parser_error.
   // For unsupported types, SAP server-side compilation handles validation.
   //
@@ -1146,18 +1261,22 @@ export function runPreWriteLint(
   // signature-less FUNCTION/ENDFUNCTION stubs passed). Validation falls back to
   // SAP's server-side syntax check (opt-in via `SAP_CHECK_BEFORE_WRITE`) and the
   // activate step.
-  const LINTABLE_TYPES = new Set(['PROG', 'CLAS', 'INTF', 'INCL', 'DDLS']);
-  if (!LINTABLE_TYPES.has(type)) {
+  const lintExtensions = new Map([
+    ['PROG', 'prog.abap'],
+    ['CLAS', 'clas.abap'],
+    ['INTF', 'intf.abap'],
+    ['INCL', 'prog.abap'],
+    ['DDLS', 'ddls.asddls'],
+  ]);
+  const extension = lintExtensions.get(type);
+  if (!extension) {
     return { blocked: false };
   }
 
   try {
-    let filename = detectFilename(source, name);
-    if (type === 'INCL' && filename.endsWith('.clas.abap')) {
-      // ABAP includes are often source fragments (FORM/MODULE/DATA...) without a REPORT/CLASS header.
-      // Lint them as program-style source; treating the fallback as a class rejects valid include fragments.
-      filename = `${name.toLowerCase()}.prog.abap`;
-    }
+    // The known object type selects the parser, even for comment headers, INCLUDE-led programs,
+    // and source fragments. Content detection is only needed by callers without an object type.
+    const filename = `${name.toLowerCase()}.${extension}`;
     // Reuse the single systemType/abapRelease/configFile resolution (avoids drift with SAPLint's
     // own config — a release-ceiling fix applied to one copy only would split lint behavior).
     const configOptions = buildLintConfigOptions(config);
@@ -1165,14 +1284,30 @@ export function runPreWriteLint(
 
     if (!result.pass) {
       const errorLines = result.errors.map((e) => `  Line ${e.line}: [${e.rule}] ${e.message}`).join('\n');
+      const parserRules = ['parser_error', 'cds_parser_error', 'structure'];
+      const hasParserFindings = result.errors.some((e) => parserRules.includes(e.rule));
+      const hasOtherFindings = result.errors.some((e) => !parserRules.includes(e.rule));
+      const parserAdvice = hasParserFindings
+        ? 'Parser findings can mean invalid source, a mismatched lint syntax (see SAPLint action="list_rules"), ' +
+          'or grammar abaplint does not support. For an existing object, check the proposed source with ' +
+          `SAPRead(type="SYNTAX", objectType=${JSON.stringify(type)}, name=${JSON.stringify(name)}, source=<full source>). ` +
+          'Correct what SAP rejects; do not rewrite statements SAP accepts just to satisfy abaplint. '
+        : 'Correct genuine errors; check the target SAP release and lint configuration if a finding looks wrong. ';
+      const fixAdvice = hasOtherFindings
+        ? `Use SAPLint action="lint_and_fix" for fixable ${hasParserFindings ? 'non-parser ' : ''}findings. `
+        : '';
+      const overrideAdvice = config.multiTargetWrite
+        ? 'ask the administrator to review the configured lint policy.'
+        : 'use lintBeforeWrite=false to skip this check for this call.';
       return {
         blocked: true,
         result: errorResult(
           `Pre-write lint check failed for ${type} ${name} (abaplint syntax ${JSON.stringify(result.syntaxVersion)}). ` +
-            `Fix these errors before writing:\n${errorLines}\n\n` +
-            'For parser/version findings, check SAPLint action="list_rules" and the target SAP release before ' +
-            'changing valid source. Use SAPLint action="lint_and_fix" for fixable findings, or ' +
-            'lintBeforeWrite=false to skip this check for this call.',
+            `Review these findings before writing:\n${errorLines}\n\n` +
+            parserAdvice +
+            fixAdvice +
+            (hasParserFindings ? 'If SAP confirms the proposed source is valid, ' : 'For a verified false positive, ') +
+            overrideAdvice,
         ),
       };
     }
@@ -1222,13 +1357,20 @@ export async function runPreWriteSyntaxCheck(
   objectUrl: string,
   config: ServerConfig,
   perCallOverride?: boolean,
+  requestOptions?: import('../adt/http.js').AdtRequestOptions,
 ): Promise<string> {
   const enabled = perCallOverride ?? config.checkBeforeWrite;
   if (!enabled || !source) return '';
   if (!SYNTAX_CHECKABLE_TYPES.has(type.toUpperCase())) return '';
 
   try {
-    const result = await syntaxCheck(client.http, client.safety, objectUrl, { content: source, version: 'active' });
+    const result = await syntaxCheck(
+      client.http,
+      client.safety,
+      objectUrl,
+      { content: source, version: 'active' },
+      requestOptions,
+    );
     // Object not created yet → SAP checked nothing. Silent: pre-write on a create is the normal case.
     if (!result.checked || result.messages.length === 0) return '';
 
@@ -1299,6 +1441,21 @@ export const ENQU_WRITE_UNAVAILABLE_HINT =
   'Lock object (ENQU) writes are not available on this system ' +
   '(/sap/bc/adt/ddic/lockobjects/sources is not exposed by ADT discovery). ' +
   'Use SE11 in SAPGUI, or connect ARC-1 to a system that exposes the lock-object endpoint.';
+
+/** ENHO create: parse the JSON source, check it against the spot and build new filter trees (before any write). */
+export async function prepareEnhoCreateProperties(
+  client: AdtClient,
+  properties: Record<string, unknown>,
+  name: string,
+): Promise<void> {
+  const definition = parseBadiImplementationDefinition(String(properties.enhancementSource ?? '{}'));
+  properties.enhancementDefinition = await resolveBadiFilters(client.http, client.safety, definition, name);
+}
+
+export const ENHO_WRITE_UNAVAILABLE_HINT =
+  'BAdI implementation (ENHO) writes are not available on this system ' +
+  '(/sap/bc/adt/enhancements/enhoxhb is not exposed by ADT discovery). ' +
+  'Use SE19 in SAPGUI or Eclipse ADT, or connect ARC-1 to a system that exposes the endpoint.';
 
 export const TTYP_WRITE_UNAVAILABLE_HINT =
   'Table type (TTYP) writes are not available on this system ' +

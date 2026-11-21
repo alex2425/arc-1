@@ -6,6 +6,15 @@ import { logger } from '../../../src/server/logger.js';
 import { DEFAULT_CONFIG } from '../../../src/server/types.js';
 
 describe('multi-target SAP error contract', () => {
+  it('retains confirmed creation and avoids retry instructions for unreadable assignment metadata', () => {
+    const error = new AdtApiError('Failure', 500, '/sap/bc/adt/aps/com/sod2/ztest', 'private-backend-detail');
+    const read = classifyMultiTargetSapError(error, 'A4H/001', 'SAPRead');
+    expect(read).toMatchObject({ retryable: false, message: expect.stringContaining('referenced API object') });
+    error.creationOutcome = 'confirmed';
+    const create = classifyMultiTargetSapError(error, 'A4H/001', 'SAPWrite', 'per-user', true);
+    expect(create).toMatchObject({ retryable: false, message: expect.stringContaining('SAP confirmed creation') });
+    expect(create?.message).not.toContain('private-backend-detail');
+  });
   it('treats a 401 as retryable SAP authentication failure', () => {
     const result = classifyMultiTargetSapError(
       new AdtApiError('Unauthorized', 401, '/sap/bc/adt/core/discovery', 'Unauthorized'),
@@ -120,6 +129,22 @@ describe('multi-target SAP error contract', () => {
     );
     expect(result).toMatchObject({ code: 'SAP_AUTHORIZATION_DENIED', event: 'sap_authorization_failed' });
   });
+
+  it.each(['shared', 'per-user'] as const)(
+    'classifies Gateway MED/170 as service setup for %s identity',
+    (identity) => {
+      const body = JSON.stringify({ error: { code: '/IWFND/MED/170', message: 'private-native-detail' } });
+      const result = classifyMultiTargetSapError(
+        new AdtApiError('Forbidden', 403, '/sap/opu/odata/sap/APL_LOG_MANAGEMENT_SRV/', body),
+        'A4H/001',
+        'SAPQuery',
+        identity,
+      );
+      expect(result).toMatchObject({ code: 'SAP_REQUEST_FAILED', event: 'sap_service_unavailable', retryable: false });
+      expect(result?.message).toContain('/IWFND/MAINT_SERVICE');
+      expect(result?.message).not.toMatch(/private-native-detail|credential|authentication|grant/i);
+    },
+  );
 
   it('distinguishes an inactive ICF service from authentication', () => {
     const body = '<html><head><title>Service cannot be reached</title></head><body>inactive</body></html>';
